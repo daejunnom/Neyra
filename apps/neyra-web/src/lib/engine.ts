@@ -8,14 +8,22 @@ type WorkerSlot = {
   status: RunStatus;
   snapshot: SearchSnapshot | null;
   incumbent: { candidate: Candidate; data: unknown } | null;
+  watching: boolean;
 };
 type OwnedCandidate = { slot: WorkerSlot; candidate: Candidate };
 
-/** Automatic mode leaves CPU headroom; an explicit count still respects the device. */
-export function workerCount(requested: number, hardware = navigator.hardwareConcurrency): number {
-  const cores = Number.isFinite(hardware) && hardware > 0 ? Math.floor(hardware) : 1;
-  const automatic = Math.max(1, Math.floor(cores / 2));
-  return Math.max(1, Math.min(4, cores, requested === 0 ? automatic : requested));
+export const MAX_WORKERS = 128;
+
+/** The browser can expose fewer logical processors than the operating system. */
+export function workerLimit(hardware = typeof navigator === 'undefined' ? 1 : navigator.hardwareConcurrency): number {
+  return Math.max(1, Math.min(MAX_WORKERS, Number.isFinite(hardware) && hardware > 0 ? Math.floor(hardware) : 1));
+}
+
+/** Automatic mode follows the browser; explicit counts can override its hint. */
+export function workerCount(requested: number, hardware = typeof navigator === 'undefined' ? 1 : navigator.hardwareConcurrency): number {
+  const cores = workerLimit(hardware);
+  const desired = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : cores;
+  return Math.max(1, Math.min(MAX_WORKERS, desired));
 }
 
 export function workerSeed(seed: number, index: number): number {
@@ -34,6 +42,12 @@ export function betterComplete(a: Candidate, b: Candidate): boolean {
     (atBudget(a) > atBudget(b) || (atBudget(a) === atBudget(b) && a.probability > b.probability)));
 }
 
+/** Certified unfinished routes use the same bounded spin-first score as Rust. */
+export function betterPartial(a: Candidate, b: Candidate): boolean {
+  return a.rankingScore > b.rankingScore || (a.rankingScore === b.rankingScore &&
+    (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)));
+}
+
 function complete(candidate: Candidate | null | undefined): candidate is Candidate {
   return !!candidate?.complete && candidate.qualified && candidate.verified && candidate.budgetPieces !== null;
 }
@@ -48,6 +62,7 @@ export class SearchClient {
   private lastProgressAt = 0;
   private progressTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingExports = new Map<string, { owner: number; view: CandidateView }>();
+  private pendingDetails = new Map<number, { requestId: string }>();
 
   constructor(private receive: (event: EngineEvent) => void) {}
 
@@ -67,7 +82,8 @@ export class SearchClient {
       let worker: Worker | undefined;
       try {
         worker = new Worker(new URL('./search.worker.ts', import.meta.url), { type: 'module' });
-        const slot: WorkerSlot = { id: index, worker, status: 'loading', snapshot: null, incumbent: null };
+        const id = this.slots.length;
+        const slot: WorkerSlot = { id, worker, status: 'loading', snapshot: null, incumbent: null, watching: id === 0 };
         worker.onmessage = (event: MessageEvent<EngineEvent>) => {
           if (this.runId !== runId || event.data.runId !== runId) return;
           this.handle(slot, event.data);
@@ -75,21 +91,30 @@ export class SearchClient {
         worker.onerror = (event) => {
           if (this.runId === runId) this.failed(slot, event.message || '탐색기를 불러오지 못했어요.');
         };
-        worker.postMessage({
-          type: 'start', runId,
-          config: { ...engineConfig, seed: workerSeed(config.seed, index), search_profile: index },
-          assetBase: `${location.origin}${base}/wasm/`, assetVersion: version
-        } satisfies EngineCommand);
         this.slots.push(slot);
       } catch (error) {
         worker?.terminate();
         creationFailure = error instanceof Error ? error.message : String(error);
       }
     }
+    // Divide the root work among the workers that were actually constructed.
+    // A synchronous creation failure must not leave a hole in the lane range.
+    for (const slot of this.slots) {
+      try {
+        slot.worker.postMessage({
+          type: 'start', runId,
+          config: { ...engineConfig, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
+            search_lane: slot.id, search_lanes: this.slots.length },
+          assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching
+        } satisfies EngineCommand);
+      } catch (error) {
+        this.failed(slot, error instanceof Error ? error.message : String(error));
+      }
+    }
     if (this.slots.length === 0) {
       this.status = 'failed';
       this.receive({ type: 'error', runId, message: creationFailure || '이 환경에서 탐색기를 시작할 수 없어요.' });
-    } else {
+    } else if (this.slots.some((slot) => slot.status !== 'failed')) {
       this.receive({ type: 'status', runId, status: 'loading' });
       if (creationFailure) this.receive({ type: 'warning', runId, message: `일부 탐색기를 시작하지 못해 ${this.slots.length}개로 진행합니다.` });
     }
@@ -117,10 +142,12 @@ export class SearchClient {
   }
 
   export(view: CandidateView = 'best') {
-    const owner = view === 'best' ? this.bestOwner() : this.currentCandidateOwner();
+    const owner = view === 'current' ? this.currentCandidateOwner() :
+      view === 'partial' ? this.partialOwner() : this.bestOwner() ?? this.partialOwner();
     if (!owner) return;
+    const selection: CandidateView = view === 'current' ? 'current' : owner.candidate.complete ? 'best' : 'partial';
     const requestId = crypto.randomUUID();
-    if (view === 'best' && owner.slot.incumbent?.candidate.id === owner.candidate.id) {
+    if (selection === 'best' && owner.slot.incumbent?.candidate.id === owner.candidate.id) {
       // A completed certificate remains usable even if its worker later fails.
       this.receive({ type: 'export', runId: this.runId, requestId, data: owner.slot.incumbent.data });
       return;
@@ -129,8 +156,8 @@ export class SearchClient {
       this.receive({ type: 'warning', runId: this.runId, message: '이 작업의 현재 후보를 저장할 수 없어요. 보관된 완주 결과는 계속 저장할 수 있습니다.' });
       return;
     }
-    this.pendingExports.set(requestId, { owner: owner.slot.id, view });
-    owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view } satisfies EngineCommand);
+    this.pendingExports.set(requestId, { owner: owner.slot.id, view: selection });
+    owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: selection } satisfies EngineCommand);
   }
 
   dispose() {
@@ -139,6 +166,7 @@ export class SearchClient {
     for (const slot of this.slots) slot.worker.terminate();
     this.slots = [];
     this.pendingExports.clear();
+    this.pendingDetails.clear();
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
     this.intent = 'cancelled';
@@ -154,8 +182,14 @@ export class SearchClient {
 
   private handle(slot: WorkerSlot, message: EngineEvent) {
     if (message.type === 'progress') {
-      slot.snapshot = message.snapshot;
+      this.updateSnapshot(slot, message.snapshot);
       this.publishProgress();
+    } else if (message.type === 'detail') {
+      const pending = this.pendingDetails.get(slot.id);
+      if (!pending || pending.requestId !== message.requestId) return;
+      this.pendingDetails.delete(slot.id);
+      this.updateSnapshot(slot, message.snapshot);
+      this.publishProgress(true);
     } else if (message.type === 'status') {
       // A start acknowledgement can arrive after pause/cancel was requested.
       // Keep waiting for the matching control acknowledgement from every worker.
@@ -177,7 +211,7 @@ export class SearchClient {
       if (message.type === 'export-error') {
         this.receive({ type: 'warning', runId: this.runId, message: message.message });
       } else {
-        if (message.snapshot) slot.snapshot = message.snapshot;
+        if (message.snapshot) this.updateSnapshot(slot, message.snapshot);
         if (request.view === 'current') {
           this.currentOwner = slot.id;
           this.nextFocusAt = performance.now() + 2000;
@@ -192,6 +226,7 @@ export class SearchClient {
     if (slot.status === 'failed') return;
     slot.status = 'failed';
     slot.worker.terminate();
+    this.pendingDetails.delete(slot.id);
     for (const [requestId, request] of this.pendingExports) {
       if (request.owner === slot.id) this.pendingExports.delete(requestId);
     }
@@ -237,6 +272,46 @@ export class SearchClient {
     return best;
   }
 
+  private partialOwner(): OwnedCandidate | null {
+    let best: OwnedCandidate | null = null;
+    for (const slot of this.slots) {
+      const candidate = slot.snapshot?.bestPartial;
+      if (slot.status !== 'failed' && candidate?.verified && candidate.qualified && !candidate.complete &&
+          (!best || betterPartial(candidate, best.candidate))) best = { slot, candidate };
+    }
+    return best;
+  }
+
+  private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
+    const merge = (next: Candidate | null, previous: Candidate | null | undefined) => {
+      if (next && next.frames.length === 0 && next.frameCount > 0 && previous?.id === next.id &&
+          previous.verified === next.verified && previous.placed === next.placed && previous.spins === next.spins &&
+          previous.rows.length === next.rows.length && previous.rows.every((row, y) => row === next.rows[y]) &&
+          previous.frames.length === next.frameCount) return { ...next, frames: previous.frames };
+      return next;
+    };
+    slot.snapshot = { ...snapshot,
+      current: merge(snapshot.current, slot.snapshot?.current),
+      best: merge(snapshot.best, slot.snapshot?.best),
+      bestPartial: merge(snapshot.bestPartial ?? null, slot.snapshot?.bestPartial) };
+  }
+
+  private watchCurrentOwner(owner: number | undefined) {
+    for (const slot of this.slots) {
+      const enabled = slot.id === owner;
+      if (slot.watching === enabled || slot.status === 'failed') continue;
+      slot.watching = enabled;
+      slot.worker.postMessage({ type: 'watch', runId: this.runId, enabled } satisfies EngineCommand);
+    }
+  }
+
+  private requestPartialDetail(item: OwnedCandidate | null) {
+    if (!item || item.candidate.frames.length >= item.candidate.frameCount || this.pendingDetails.has(item.slot.id)) return;
+    const requestId = crypto.randomUUID();
+    this.pendingDetails.set(item.slot.id, { requestId });
+    item.slot.worker.postMessage({ type: 'detail', runId: this.runId, requestId } satisfies EngineCommand);
+  }
+
   private currentCandidateOwner(): OwnedCandidate | null {
     const ready = this.slots.filter((slot) => slot.snapshot?.current && slot.status !== 'failed');
     if (ready.length === 0) return null;
@@ -270,6 +345,9 @@ export class SearchClient {
     if (values.length === 0) return;
     const current = this.currentCandidateOwner();
     const best = this.bestOwner();
+    const partial = this.partialOwner();
+    this.watchCurrentOwner(current?.slot.id);
+    if (!best) this.requestPartialDetail(partial);
     const sum = (read: (value: SearchSnapshot) => number) => values.reduce((value, next) => value + read(next), 0);
     const max = (read: (value: SearchSnapshot) => number) => Math.max(0, ...values.map(read));
     const selected = current?.slot.snapshot;
@@ -283,13 +361,14 @@ export class SearchClient {
       qualifiedBags: max((value) => value.qualifiedBags ?? 0),
       qualifiedSpins: max((value) => value.qualifiedSpins ?? 0),
       pruned: sum((value) => value.pruned ?? 0),
+      duplicates: sum((value) => value.duplicates ?? 0),
       bags: selected?.bags ?? 0,
       checked: selected?.checked ?? 0,
       success: selected?.success ?? 0,
       failed: selected?.failed ?? 0,
       frontier: sum((value) => value.frontier),
       finished: this.status === 'completed',
-      current: owned(current), best: owned(best),
+      current: owned(current), best: owned(best), bestPartial: owned(partial),
       workers: this.slots.filter((slot) => !['failed', 'completed', 'cancelled'].includes(slot.status)).length
     } });
   }

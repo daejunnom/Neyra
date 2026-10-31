@@ -36,6 +36,10 @@ pub struct SearchConfig {
     /// Independent geometric portfolio lane, never a supply/physics rule.
     #[serde(alias = "searchProfile")]
     pub search_profile: u8,
+    #[serde(alias = "searchLane")]
+    pub search_lane: u16,
+    #[serde(alias = "searchLanes")]
+    pub search_lanes: u16,
 }
 
 impl Default for SearchConfig {
@@ -48,6 +52,8 @@ impl Default for SearchConfig {
             seed: 1,
             beam_width: 64,
             search_profile: 0,
+            search_lane: 0,
+            search_lanes: 1,
         }
     }
 }
@@ -71,6 +77,9 @@ impl SearchConfig {
         if self.budget_start > self.max_pieces
             || !(4..=256).contains(&self.beam_width)
             || self.search_profile > 3
+            || self.search_lanes == 0
+            || self.search_lanes > 128
+            || self.search_lane >= self.search_lanes
         {
             return Err("탐색 시작 예산 또는 탐색 폭을 확인해 주세요.".into());
         }
@@ -78,7 +87,7 @@ impl SearchConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisplayFrame {
     pub rows: [u16; HEIGHT],
@@ -115,7 +124,39 @@ pub struct CandidateSummary {
     pub bag_count: u16,
     pub budget_pieces: Option<u16>,
     pub cdf: Vec<CdfPoint>,
+    pub ranking_score: f64,
+    pub frame_count: u16,
     pub frames: Vec<DisplayFrame>,
+}
+
+impl CandidateSummary {
+    fn for_snapshot(&self, include_frames: bool) -> Self {
+        Self {
+            id: self.id.clone(),
+            rows: self.rows,
+            spins: self.spins,
+            placed: self.placed,
+            probability: self.probability,
+            lower_probability: self.lower_probability,
+            upper_probability: self.upper_probability,
+            complete: self.complete,
+            qualified: self.qualified,
+            verified: self.verified,
+            checked: self.checked,
+            success: self.success,
+            failed: self.failed,
+            bag_count: self.bag_count,
+            budget_pieces: self.budget_pieces,
+            cdf: self.cdf.clone(),
+            ranking_score: self.ranking_score,
+            frame_count: self.frame_count,
+            frames: if include_frames {
+                self.frames.clone()
+            } else {
+                vec![]
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,9 +178,11 @@ pub struct ProgressSnapshot {
     pub finished: bool,
     pub current: Option<CandidateSummary>,
     pub best: Option<CandidateSummary>,
+    pub best_partial: Option<CandidateSummary>,
+    pub duplicates: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetOperation {
     pub piece: Piece,
@@ -154,8 +197,10 @@ struct SeedState {
     used: u8,
     deleted: u32,
     targets: Vec<TargetOperation>,
+    target_key: [u64; 7],
     frames: Vec<DisplayFrame>,
     score: f64,
+    quality: f64,
     pursuit: Option<Rc<SingleGoal>>,
     /// Newly buried cells created by quiet setup placements. Row deletion and
     /// actual filling pay this debt; merely opening a roof does not.
@@ -217,34 +262,65 @@ struct ExecutionGraph {
 
 #[derive(Default)]
 struct PhysicsCache {
-    locks: HashMap<(Board, Piece), Rc<Vec<Placement>>>,
+    locks: HashMap<(Board, Piece), CachedLocks>,
     targets: HashMap<(Board, Pose, bool), Option<Placement>>,
+}
+
+struct CachedLocks {
+    all: Rc<Vec<Placement>>,
+    proposals: Rc<Vec<Placement>>,
 }
 
 impl PhysicsCache {
     fn proposals(&mut self, board: Board, piece: Piece, broad: bool) -> Rc<Vec<Placement>> {
         if broad {
-            return self.locks(board, piece);
+            self.locks(board, piece);
+            return Rc::clone(&self.locks[&(board, piece)].proposals);
         }
         let mut placements = board.surface_locks(piece);
         for pose in single_targets(&board, piece.bit()) {
+            let key = lock_geometry(pose, true);
+            if placements
+                .iter()
+                .any(|p| p.spin && lock_geometry(p.pose, true) == key)
+            {
+                continue;
+            }
             if let Some(placement) = self.target(board, pose, true) {
-                if !placements.iter().any(|p| p.pose == pose && p.spin) {
-                    placements.push(placement);
-                }
+                // Only a successful witness claims this geometry. Another
+                // orientation must still be tried if the first one failed.
+                placements.push(placement);
             }
         }
         Rc::new(placements)
     }
     fn locks(&mut self, board: Board, piece: Piece) -> Rc<Vec<Placement>> {
         if let Some(locks) = self.locks.get(&(board, piece)) {
-            return Rc::clone(locks);
+            return Rc::clone(&locks.all);
         }
         if self.locks.len() >= 512 {
             self.locks.clear();
         }
         let locks = Rc::new(board.search_locks(piece));
-        self.locks.insert((board, piece), Rc::clone(&locks));
+        let proposals = if matches!(piece, Piece::I | Piece::S | Piece::Z) {
+            let mut seen = HashSet::with_capacity(locks.len());
+            Rc::new(
+                locks
+                    .iter()
+                    .filter(|p| seen.insert(lock_geometry(p.pose, p.spin)))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            Rc::clone(&locks)
+        };
+        self.locks.insert(
+            (board, piece),
+            CachedLocks {
+                all: Rc::clone(&locks),
+                proposals,
+            },
+        );
         locks
     }
 
@@ -255,6 +331,7 @@ impl PhysicsCache {
         if pose.piece != Piece::O || pose.rotation == 0 {
             if let Some(locks) = self.locks.get(&(board, pose.piece)) {
                 return locks
+                    .all
                     .iter()
                     .find(|p| p.pose == pose && (!spin || p.spin))
                     .cloned();
@@ -271,6 +348,14 @@ impl PhysicsCache {
         self.targets.insert(key, placement.clone());
         placement
     }
+}
+
+/// Equality only after lock: every following mino starts at spawn. The exact
+/// verifier still preserves all projected orientations and their kick paths.
+fn lock_geometry(pose: Pose, spin: bool) -> u64 {
+    let mut cells = pose.cells().map(|(x, y)| (y as u16 * 10 + x as u16) as u8);
+    cells.sort_unstable();
+    u32::from_le_bytes(cells) as u64 | (u64::from(spin) << 32)
 }
 
 fn piece_name(piece: Piece) -> String {
@@ -323,6 +408,24 @@ fn normalize_target(pose: Pose, deleted: u32) -> Option<TargetOperation> {
         piece: pose.piece,
         cells,
     })
+}
+
+/// Logical rows can reach 31 after clears in a 24-row physical field.
+/// The array slot identifies the piece; target cells are already sorted.
+fn target_code(target: &TargetOperation) -> u64 {
+    target
+        .cells
+        .iter()
+        .enumerate()
+        .fold(0, |code, (i, &(x, y))| {
+            code | ((x as u64 | (y as u64) << 4) << (i * 9))
+        })
+}
+
+/// All field, dependency and speculative-future terms share this one budget.
+/// A one-spin tradeoff is possible; a two-spin advantage always wins.
+fn spin_rank(spins: u8, quality: f64) -> f64 {
+    spins as f64 + 0.95 * quality / (120.0 + quality.abs())
 }
 
 fn projected_poses(target: &TargetOperation, deleted: u32) -> Vec<Pose> {
@@ -938,10 +1041,17 @@ impl ContinuationProbe {
             let paid = self.debt_count.saturating_sub(mask_count(&state.debt));
             // Use one coherent route. Do not sum incompatible pockets or
             // spend the same finisher several times for hypothetical rewards.
-            let score = state.spins as f64 * 60.0 - state.quiet as f64 * 10.0
+            let quality = -(state.quiet as f64) * 10.0
                 + paid as f64 * 6.0
                 + (facts.score() - self.base_score) * 0.25;
-            if self.best.placements.is_empty() || score > self.best.score {
+            let score = state.spins as f64 * 60.0 + quality;
+            if self.best.placements.is_empty()
+                || spin_rank(state.spins, quality)
+                    > spin_rank(
+                        self.best.spins,
+                        self.best.score - self.best.spins as f64 * 60.0,
+                    )
+            {
                 self.best = Continuation {
                     placements: state.placements.clone(),
                     score,
@@ -991,8 +1101,8 @@ impl RefinementJob {
             probe.step(cache);
             if probe.finished() {
                 seed.future = probe.best;
-                let unexplained = mask_count(&seed.debt).saturating_sub(seed.future.paid);
-                seed.score += seed.future.score - unexplained as f64 * 12.0;
+                seed.quality = boundary_quality(&seed.board, &seed.debt, &seed.future);
+                seed.score = spin_rank(seed.spins, seed.quality);
                 insert_seed(&mut self.complete, seed, 8);
             } else {
                 self.current = Some((seed, probe));
@@ -1024,7 +1134,7 @@ struct GenerationJob {
     start_spins: u8,
     start_pieces: u16,
     frontier: Vec<SeedState>,
-    next: Vec<SeedState>,
+    next_by_inventory: [Vec<SeedState>; 128],
     complete: Vec<SeedState>,
     state_index: usize,
     piece_index: usize,
@@ -1037,6 +1147,11 @@ struct GenerationJob {
     minimum_success: u16,
     broad: bool,
     pruned: u64,
+    duplicates: u64,
+    initial_used: u8,
+    lane: u16,
+    lanes: u16,
+    root_choice: usize,
 }
 
 impl GenerationJob {
@@ -1049,6 +1164,8 @@ impl GenerationJob {
         goal: u8,
         profile: u8,
         minimum_success: u16,
+        lane: u16,
+        lanes: u16,
     ) -> Self {
         let mut seed = SeedState {
             board: node.board,
@@ -1056,8 +1173,10 @@ impl GenerationJob {
             used: 0,
             deleted: 0,
             targets: vec![],
+            target_key: [0; 7],
             frames: vec![],
             score: 0.0,
+            quality: 0.0,
             pursuit: None,
             debt: node.debt,
             future: Continuation::default(),
@@ -1098,6 +1217,7 @@ impl GenerationJob {
                 seed.deleted = deleted;
                 seed.spins += result.lines;
                 seed.first_mask = first_mask;
+                seed.target_key[target.piece as usize] = target_code(&target);
                 seed.targets.push(target);
                 seed.frames.push(DisplayFrame {
                     rows: result.board.rows,
@@ -1109,8 +1229,10 @@ impl GenerationJob {
                 });
             }
         }
-        seed.score = board_score(&seed.board) + (seed.spins - node.spins) as f64 * 100.0;
+        seed.quality = board_score(&seed.board);
+        seed.score = spin_rank(seed.spins, seed.quality);
         let depth = seed.targets.len() as u8;
+        let initial_used = seed.used;
         let terminal = seed.spins >= goal;
         Self {
             parent,
@@ -1118,7 +1240,7 @@ impl GenerationJob {
             start_spins: node.spins,
             start_pieces: node.pieces,
             frontier: if terminal { vec![] } else { vec![seed.clone()] },
-            next: vec![],
+            next_by_inventory: std::array::from_fn(|_| Vec::new()),
             complete: if terminal { vec![seed] } else { vec![] },
             state_index: 0,
             piece_index: 0,
@@ -1131,6 +1253,11 @@ impl GenerationJob {
             minimum_success,
             broad: variant % 4 == 3,
             pruned: 0,
+            duplicates: 0,
+            initial_used,
+            lane,
+            lanes,
+            root_choice: 0,
         }
     }
 
@@ -1151,6 +1278,7 @@ impl GenerationJob {
                     .is_some_and(|state| state.targets.len() >= 3));
         if self.piece_index == 0
             && foundation_ready
+            && self.frontier[self.state_index].used != 0
             && self.frontier[self.state_index].pursuit.is_none()
         {
             let state = &mut self.frontier[self.state_index];
@@ -1175,12 +1303,23 @@ impl GenerationJob {
         if state.used & (1 << (piece as u8)) != 0 {
             return 0;
         }
-        let locks = cache.proposals(state.board, piece, self.broad);
+        let root_choice = self.start_pieces == 0 && state.used == 0;
+        // Every lane partitions the same first-lock geometry list. The rest
+        // of each bag is built locally; no worker shares a supply certificate.
+        let locks = cache.proposals(state.board, piece, self.broad && !root_choice);
+        let per_inventory = self.inventory_limit(state.used | piece.bit());
         let before_facts = BoardFacts::new(&state.board);
         let before_holes = before_facts.holes;
         let mut expanded = 0;
         for placement in locks.iter() {
             expanded += 1;
+            if root_choice {
+                let choice = self.root_choice;
+                self.root_choice += 1;
+                if (choice + self.variant as usize) % self.lanes as usize != self.lane as usize {
+                    continue;
+                }
+            }
             let Some(result) = state.board.apply(&placement) else {
                 continue;
             };
@@ -1232,6 +1371,8 @@ impl GenerationJob {
             };
             let spins = state.spins + result.lines;
             let mut targets = state.targets.clone();
+            let mut target_key = state.target_key;
+            target_key[piece as usize] = target_code(&target);
             targets.push(target);
             let mut frames = state.frames.clone();
             frames.push(DisplayFrame {
@@ -1277,36 +1418,40 @@ impl GenerationJob {
                     structural -= 16.0;
                 }
             }
-            let score = if self.setup {
+            let quality = if self.setup {
                 // The first bag must first leave independent landing slots
                 // for all seven pieces. A strong flatness/slot reward here
                 // spends the floor too early and destroys P7 robustness.
                 // Continuation refinement compares the completed foundations.
                 setup_score(&self.start, &targets) + structural * 0.06 + rng.unit() * 6.0
             } else {
-                structural
-                    + (spins - self.start_spins) as f64
-                        * if self.variant % 4 == 2 { 72.0 } else { 112.0 }
-                    + setup_score(&self.start, &targets) * 0.25
-                    + rng.unit() * 2.0
+                structural + setup_score(&self.start, &targets) * 0.25 + rng.unit() * 2.0
             };
+            let score = spin_rank(spins, quality);
             let next = SeedState {
                 board: result.board,
                 spins,
                 used: state.used | (1 << (piece as u8)),
                 deleted,
                 targets,
+                target_key,
                 frames,
                 score,
+                quality,
                 pursuit,
                 debt,
                 future: Continuation::default(),
                 first_mask,
             };
             if spins >= goal || next.used == ALL_PIECES {
-                insert_seed(&mut self.complete, next, 12);
+                self.duplicates += u64::from(insert_seed(&mut self.complete, next, 12));
             } else {
-                insert_seed(&mut self.next, next, self.width);
+                let inventory = next.used as usize;
+                self.duplicates += u64::from(insert_seed(
+                    &mut self.next_by_inventory[inventory],
+                    next,
+                    per_inventory,
+                ));
             }
         }
         expanded
@@ -1327,7 +1472,7 @@ impl GenerationJob {
         if self.state_index < self.frontier.len() {
             return false;
         }
-        self.frontier = std::mem::take(&mut self.next);
+        self.frontier = self.finish_inventory_layer();
         self.state_index = 0;
         self.piece_index = 0;
         self.depth += 1;
@@ -1355,10 +1500,37 @@ impl GenerationJob {
                 .or_else(|| refinement.current.as_ref().map(|(seed, _)| seed))
                 .or_else(|| refinement.pending.last());
         }
-        self.complete
-            .first()
-            .or_else(|| self.next.first())
-            .or_else(|| self.frontier.first())
+        self.complete.first()
+    }
+
+    fn inventory_limit(&self, used: u8) -> usize {
+        let n = 7 - self.initial_used.count_ones() as usize;
+        let k = (used & !self.initial_used).count_ones() as usize;
+        let mut masks = 1;
+        for i in 0..k.min(n - k) {
+            masks = masks * (n - i) / (i + 1);
+        }
+        self.width.div_ceil(masks).max(1)
+    }
+
+    fn finish_inventory_layer(&mut self) -> Vec<SeedState> {
+        // Keep one alternative for every remaining inventory, then spend the
+        // remaining total width on quality. Never multiply width by 35 masks.
+        let mut next = Vec::new();
+        let mut extra = Vec::new();
+        for bucket in &mut self.next_by_inventory {
+            if bucket.is_empty() {
+                continue;
+            }
+            let mut entries = std::mem::take(bucket).into_iter();
+            next.push(entries.next().unwrap());
+            extra.extend(entries);
+        }
+        extra.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let remaining = self.width.saturating_sub(next.len());
+        next.extend(extra.into_iter().take(remaining));
+        next.sort_by(|a, b| b.score.total_cmp(&a.score));
+        next
     }
 }
 
@@ -1388,10 +1560,10 @@ fn next_debt_with_holes(
     debt
 }
 
-fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
-    // This is a bounded proposal beam, not an exact transposition proof. Retain
-    // inventories and clear histories, and reserve distinct spin-count strata.
-    if let Some(index) = list.iter().position(|s| {
+fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) -> bool {
+    // Only identical fixed tilings with the same execution/evaluation context
+    // are duplicates. Capacity truncation is a separate selective heuristic.
+    let duplicate = list.iter().position(|s| {
         s.board == seed.board
             && s.used == seed.used
             && s.deleted == seed.deleted
@@ -1399,9 +1571,11 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
             && s.pursuit == seed.pursuit
             && s.debt == seed.debt
             && s.first_mask == seed.first_mask
-    }) {
+            && s.target_key == seed.target_key
+    });
+    if let Some(index) = duplicate {
         if list[index].score >= seed.score {
-            return;
+            return true;
         }
         list.remove(index);
     }
@@ -1411,19 +1585,9 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
         .unwrap_or(list.len());
     list.insert(at, seed);
     if list.len() > limit {
-        let quota = if limit >= 8 { 2 } else { 1 };
-        let victim = (0..list.len())
-            .rev()
-            .find(|index| {
-                list[..*index]
-                    .iter()
-                    .filter(|s| s.spins == list[*index].spins)
-                    .count()
-                    >= quota
-            })
-            .unwrap_or(list.len() - 1);
-        list.remove(victim);
+        list.pop();
     }
+    duplicate.is_some()
 }
 
 /// A proposal heuristic, deliberately not an impossibility test.
@@ -1504,6 +1668,7 @@ struct TreeNode {
     last_improved_attempt: u32,
     best_extension_spins: u8,
     best_extension_quality: f64,
+    revisit_after: u64,
 }
 
 #[derive(Clone)]
@@ -1599,6 +1764,7 @@ pub struct SearchSession {
     current: Option<Archived>,
     best: Option<Archived>,
     other_complete: Option<Archived>,
+    best_partial: Option<Archived>,
     finished: bool,
     last_checked: u16,
     last_success: u16,
@@ -1610,6 +1776,9 @@ pub struct SearchSession {
     qualified_bags: u16,
     qualified_spins: u8,
     preview_steps: u32,
+    duplicates: u64,
+    schedule_epoch: u64,
+    preview_generation: u64,
 }
 
 impl SearchSession {
@@ -1640,6 +1809,7 @@ impl SearchSession {
             last_improved_attempt: 0,
             best_extension_spins: 0,
             best_extension_quality: f64::NEG_INFINITY,
+            revisit_after: 0,
         };
         let lower_bound = cost_lower_bound(&Board::default(), 0, TARGET_SPINS);
         let active_budget = if config.budget_start == 0 {
@@ -1665,6 +1835,7 @@ impl SearchSession {
             current: None,
             best: None,
             other_complete: None,
+            best_partial: None,
             finished: false,
             last_checked: 0,
             last_success: 0,
@@ -1676,6 +1847,9 @@ impl SearchSession {
             qualified_bags: 0,
             qualified_spins: 0,
             preview_steps: 0,
+            duplicates: 0,
+            schedule_epoch: 0,
+            preview_generation: u64::MAX,
         })
     }
 
@@ -1709,8 +1883,10 @@ impl SearchSession {
             }
             if let Some(mut job) = self.generation.take() {
                 let prior_pruned = job.pruned;
+                let prior_duplicates = job.duplicates;
                 self.expanded += job.advance(&mut self.rng, self.goal, &mut self.physics_cache);
                 self.pruned += job.pruned - prior_pruned;
+                self.duplicates += job.duplicates - prior_duplicates;
                 if self.preview_steps % 16 == 0 {
                     self.update_generation_preview(&job);
                 }
@@ -1735,6 +1911,8 @@ impl SearchSession {
                         if self.remember_plan(parent, &plan) {
                             self.candidates += 1;
                             self.waiting_plans.push((parent, plan));
+                        } else {
+                            self.duplicates += 1;
                         }
                     }
                     if self.waiting_plans.is_empty() {
@@ -1760,6 +1938,12 @@ impl SearchSession {
                     self.begin_generation(parent);
                     continue;
                 }
+                let stale = self.tree[parent]
+                    .attempts
+                    .saturating_sub(self.tree[parent].last_improved_attempt);
+                self.tree[parent].revisit_after = self
+                    .schedule_epoch
+                    .saturating_add(1_u64 << (stale / 4).min(8));
                 self.focus = None;
             }
             if let Some((parent, plan)) = self.waiting_plans.pop() {
@@ -1817,10 +2001,13 @@ impl SearchSession {
             self.goal,
             self.config.search_profile,
             minimum,
+            self.config.search_lane,
+            self.config.search_lanes,
         ));
         self.tree[parent].attempts += 1;
-        self.tree[parent].last_selected = self.generation_rounds;
+        self.tree[parent].last_selected = self.schedule_epoch;
         self.generation_rounds += 1;
+        self.schedule_epoch += 1;
         if self.generation_rounds % 12 == 0 {
             self.active_budget = self
                 .active_budget
@@ -1835,8 +2022,14 @@ impl SearchSession {
             key.extend(row.to_le_bytes());
         }
         key.push(plan.start_spins);
+        key.extend(plan.start_pieces.to_le_bytes());
+        for row in plan.expected.rows {
+            key.extend(row.to_le_bytes());
+        }
+        key.extend([plan.expected_spins, u8::from(plan.terminal)]);
         // The same bag plan can qualify after a stronger probability prefix
         // even when it was rejected after a weaker route to the same board.
+        key.extend((self.tree[parent].counts.len() as u16).to_le_bytes());
         for count in &self.tree[parent].counts {
             key.extend(count.to_le_bytes());
         }
@@ -1855,17 +2048,22 @@ impl SearchSession {
         self.seen_plans.insert(key)
     }
 
-    fn select_node(&self) -> Option<usize> {
+    fn select_node(&mut self) -> Option<usize> {
         // Bounded best-first resumption between focused depth-first stretches.
         // The exact mass/cost bound prunes; this priority only schedules effort.
-        (0..self.tree.len())
+        let earliest = (0..self.tree.len())
             .filter(|&i| self.can_expand(i))
+            .map(|i| self.tree[i].revisit_after)
+            .min()?;
+        self.schedule_epoch = self.schedule_epoch.max(earliest);
+        (0..self.tree.len())
+            .filter(|&i| self.can_expand(i) && self.tree[i].revisit_after <= self.schedule_epoch)
             .max_by(|&a, &b| {
                 let priority = |i: usize| {
                     let node = &self.tree[i];
                     let bound = node.pieces + cost_lower_bound(&node.board, node.spins, self.goal);
                     let age = self
-                        .generation_rounds
+                        .schedule_epoch
                         .saturating_sub(node.last_selected)
                         .min(128);
                     let stale = node.attempts.saturating_sub(node.last_improved_attempt) as f64;
@@ -1879,11 +2077,14 @@ impl SearchSession {
                     // prefix lock again here permanently starves deeper setup
                     // boundaries even when their optimistic total cost is the
                     // same. Compare that total bound below, not raw depth.
-                    node.spins as f64 * 18.0 + quality * 0.25 + age as f64 * 0.30
-                        - stale * 1.5
-                        - ((node.attempts + 1) as f64).log2() * 8.0
-                        - bound.saturating_sub(self.active_budget) as f64 * 0.5
-                        - bound.saturating_sub(self.config.piece_goal) as f64 * 0.2
+                    spin_rank(
+                        node.spins,
+                        quality + age as f64 * 1.2
+                            - stale * 6.0
+                            - ((node.attempts + 1) as f64).log2() * 32.0
+                            - bound.saturating_sub(self.active_budget) as f64 * 2.0
+                            - bound.saturating_sub(self.config.piece_goal) as f64 * 0.8,
+                    )
                 };
                 priority(a).total_cmp(&priority(b))
             })
@@ -1915,6 +2116,20 @@ impl SearchSession {
         let Some(seed) = job.display_seed() else {
             return;
         };
+        // A candidate is a whole fixed bag (or an actual terminal prefix),
+        // never one of the internal per-inventory partial states.
+        debug_assert!(seed.used == ALL_PIECES || seed.spins >= self.goal);
+        if self.preview_generation == self.generation_rounds {
+            if let Some(current) = &mut self.current {
+                if current.pending_plan.as_ref().is_some_and(|plan| {
+                    plan.id == 0 && plan.targets == seed.targets && plan.seed_frames == seed.frames
+                }) {
+                    current.summary.ranking_score = seed.score;
+                    return;
+                }
+            }
+        }
+        self.preview_generation = self.generation_rounds;
         self.deepest_spins = self.deepest_spins.max(seed.spins);
         let parent = &self.tree[job.parent];
         let placed = job.start_pieces + seed.targets.len() as u16;
@@ -1923,7 +2138,7 @@ impl SearchSession {
         let upper = probability(&parent.counts);
         self.current = Some(Archived {
             summary: CandidateSummary {
-                id: format!("building-{}-{}", job.parent, self.expanded),
+                id: format!("building-{}-{}", self.generation_rounds, self.preview_steps),
                 rows: seed.board.rows,
                 spins: seed.spins,
                 placed,
@@ -1939,6 +2154,8 @@ impl SearchSession {
                 bag_count: parent.counts.len() as u16 + 1,
                 budget_pieces: None,
                 cdf: vec![],
+                ranking_score: seed.score,
+                frame_count: frames.len() as u16,
                 frames,
             },
             certificates: parent.certificates.clone(),
@@ -1965,6 +2182,17 @@ impl SearchSession {
         let prefix = probability(&parent.counts);
         let lower = prefix * job.success as f64 / P7_COUNT as f64;
         let upper = prefix * job.upper as f64 / P7_COUNT as f64;
+        if let Some(current) = &mut self.current {
+            if current.summary.id == id && !current.summary.verified {
+                current.summary.probability = lower;
+                current.summary.lower_probability = lower;
+                current.summary.upper_probability = upper;
+                current.summary.checked = job.checked as u16;
+                current.summary.success = job.success as u16;
+                current.summary.failed = (job.checked - job.success) as u16;
+                return;
+            }
+        }
         let mut frames = parent.frames.clone();
         frames.extend(job.plan.seed_frames.clone());
         self.current = Some(Archived {
@@ -1985,6 +2213,11 @@ impl SearchSession {
                 bag_count: parent.counts.len() as u16 + 1,
                 budget_pieces: None,
                 cdf: vec![],
+                ranking_score: spin_rank(
+                    job.plan.expected_spins,
+                    boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future),
+                ),
+                frame_count: frames.len() as u16,
                 frames,
             },
             certificates: parent.certificates.clone(),
@@ -2070,6 +2303,11 @@ impl SearchSession {
             bag_count: counts.len() as u16,
             budget_pieces: budget,
             cdf,
+            ranking_score: spin_rank(
+                last.spins,
+                boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future),
+            ),
+            frame_count: frames.len() as u16,
             frames: frames.clone(),
         };
         let archived = Archived {
@@ -2081,6 +2319,14 @@ impl SearchSession {
         if qualified {
             self.qualified_bags = self.qualified_bags.max(counts.len() as u16);
             self.qualified_spins = self.qualified_spins.max(summary.spins);
+            if !job.plan.terminal
+                && self
+                    .best_partial
+                    .as_ref()
+                    .is_none_or(|prior| better_partial(&summary, &prior.summary))
+            {
+                self.best_partial = Some(archived.clone());
+            }
         }
         if job.plan.terminal {
             if qualified
@@ -2129,6 +2375,7 @@ impl SearchSession {
                     last_improved_attempt: 0,
                     best_extension_spins: 0,
                     best_extension_quality: f64::NEG_INFINITY,
+                    revisit_after: 0,
                 };
                 let gain = new_node.spins - parent.spins;
                 let quality = new_node.quality;
@@ -2141,9 +2388,12 @@ impl SearchSession {
                         source.best_extension_spins = gain;
                         source.best_extension_quality = quality;
                         source.last_improved_attempt = source.attempts;
+                        source.revisit_after = self.schedule_epoch;
                     }
                     self.focus = Some(child);
                 }
+            } else {
+                self.duplicates += 1;
             }
         }
         let reward = if job.plan.terminal && qualified {
@@ -2179,9 +2429,7 @@ impl SearchSession {
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    n.spins as f64 * 8.0 + n.quality * 0.05
-                        - n.pieces as f64 * 0.1
-                        - (n.visits as f64).sqrt() * 0.1
+                    spin_rank(n.spins, n.quality)
                 };
                 score(*a).total_cmp(&score(*b))
             });
@@ -2195,6 +2443,14 @@ impl SearchSession {
     }
 
     pub fn snapshot(&self) -> ProgressSnapshot {
+        self.snapshot_with_frames(true)
+    }
+
+    pub fn snapshot_compact(&self) -> ProgressSnapshot {
+        self.snapshot_with_frames(false)
+    }
+
+    fn snapshot_with_frames(&self, include_frames: bool) -> ProgressSnapshot {
         ProgressSnapshot {
             phase: if self.finished {
                 "stopped"
@@ -2221,8 +2477,19 @@ impl SearchSession {
             failed: self.last_checked.saturating_sub(self.last_success),
             frontier: self.tree.len(),
             finished: self.finished,
-            current: self.current.as_ref().map(|a| a.summary.clone()),
-            best: self.best.as_ref().map(|a| a.summary.clone()),
+            current: self
+                .current
+                .as_ref()
+                .map(|a| a.summary.for_snapshot(include_frames)),
+            best: self
+                .best
+                .as_ref()
+                .map(|a| a.summary.for_snapshot(include_frames)),
+            best_partial: self
+                .best_partial
+                .as_ref()
+                .map(|a| a.summary.for_snapshot(include_frames)),
+            duplicates: self.duplicates,
         }
     }
 
@@ -2231,6 +2498,7 @@ impl SearchSession {
             .best
             .as_ref()
             .or(self.other_complete.as_ref())
+            .or(self.best_partial.as_ref())
             .or(self.current.as_ref());
         self.export_archive(archive)
     }
@@ -2239,6 +2507,7 @@ impl SearchSession {
         self.export_archive(match selection {
             "best" => self.best.as_ref(),
             "current" => self.current.as_ref(),
+            "partial" => self.best_partial.as_ref(),
             _ => None,
         })
     }
@@ -2257,6 +2526,12 @@ impl SearchSession {
             "interchange": false, "globalOptimalityProven": false
         }).to_string()
     }
+}
+
+fn better_partial(a: &CandidateSummary, b: &CandidateSummary) -> bool {
+    a.ranking_score > b.ranking_score
+        || (a.ranking_score == b.ranking_score
+            && (a.placed < b.placed || (a.placed == b.placed && a.probability > b.probability)))
 }
 
 fn better_complete(a: &CandidateSummary, b: &CandidateSummary) -> bool {
@@ -2321,6 +2596,8 @@ mod tests {
         assert!(SearchSession::new(config).is_ok());
         let mut a = CandidateSummary {
             id: "119".into(),
+            ranking_score: 40.0,
+            frame_count: 0,
             rows: [0; HEIGHT],
             spins: 40,
             placed: 119,

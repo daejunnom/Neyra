@@ -31,6 +31,11 @@ impl NeyraEngine {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    pub fn snapshot_compact(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.session.snapshot_compact())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     pub fn export_json(&self) -> String {
         self.session.export_json()
     }

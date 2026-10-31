@@ -3,7 +3,7 @@
   import BoardPreview from '$lib/BoardPreview.svelte';
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
-  import { SearchClient } from '$lib/engine';
+  import { SearchClient, workerLimit, MAX_WORKERS } from '$lib/engine';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
   import './styles.css';
 
@@ -25,6 +25,7 @@
   let visibleCandidateId = '';
   let savedMessage = '';
   let notice = '';
+  let availableWorkers = 1;
 
   // Clearra SolutionBoardPreview.svelte palette (MIT, pinned in THIRD_PARTY_NOTICES).
   const pieceColors: Record<string, string> = {
@@ -35,7 +36,8 @@
   const compactNumber = new Intl.NumberFormat('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
-  $: candidate = view === 'best' ? snapshot?.best ?? null : snapshot?.current ?? null;
+  $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
+  $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
   $: frames = candidate?.frames ?? [];
   $: selectedIndex = frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
   $: frame = frames[selectedIndex];
@@ -93,12 +95,18 @@
     }
   }
   onMount(() => {
+    availableWorkers = workerLimit();
     client = new SearchClient(receive);
     try {
       const stored = localStorage.getItem('neyra-config-v1');
       if (stored) {
         const values = JSON.parse(stored);
         const merged = { ...defaultConfig, ...values };
+        // A manual count intentionally overrides the browser's processor hint.
+        // Preserve it when that hint changes, subject to the application limit.
+        if (Number.isInteger(merged.worker_count) && merged.worker_count > 0) {
+          merged.worker_count = Math.min(merged.worker_count, MAX_WORKERS);
+        }
         if (validateConfig(merged) === '') config = merged;
       }
     } catch { /* A fresh configuration remains usable when storage is unavailable. */ }
@@ -145,7 +153,7 @@
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
     if (!Number.isSafeInteger(value.seed) || value.seed < 1 || value.seed > 4294967295) return '시드는 1–4,294,967,295 사이의 정수로 입력해 주세요.';
     if (![16, 32, 64, 128].includes(value.beam_width)) return '탐색 폭 설정을 다시 선택해 주세요.';
-    if (![0, 1, 2, 4].includes(value.worker_count)) return '동시 탐색 수를 다시 선택해 주세요.';
+    if (!Number.isInteger(value.worker_count) || value.worker_count < 0 || value.worker_count > MAX_WORKERS) return `동시 탐색 수는 자동(0) 또는 1–${MAX_WORKERS} 사이의 정수로 입력해 주세요.`;
     return '';
   }
   function openSettings() { draft = { ...config }; settingsError = ''; settings.showModal(); }
@@ -205,7 +213,7 @@
       <div class="panel-top">
         <div class="view-tabs" role="tablist" aria-label="필드 보기">
           <button role="tab" aria-selected={view === 'current'} class:selected={view === 'current'} onclick={() => view = 'current'}>탐색 중</button>
-          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} disabled={!snapshot?.best} onclick={() => view = 'best'}>최선 결과 {#if snapshot?.best}<span class="tab-dot"></span>{/if}</button>
+          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} disabled={!bestRoute} onclick={() => view = 'best'}>최선 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
         </div>
         <span class="board-dimensions">10 × 24</span>
       </div>
@@ -267,13 +275,18 @@
 
       <section class="best-section" aria-label="현재 최선 결과">
         <div class="section-heading"><h3><Icon name="spark" size={16} />현재 최선</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
-        {#if snapshot?.best}
+        {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
-            <div><strong>{snapshot.best.budgetPieces ?? snapshot.best.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
-            <p>{budgetCoverageLabel(snapshot.best)} 성공률 <Icon name="arrow" size={13} /></p>
+            {#if bestRoute.complete}
+              <div><strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
+              <p>{budgetCoverageLabel(bestRoute)} 성공률 <Icon name="arrow" size={13} /></p>
+            {:else}
+              <div><strong>{bestRoute.spins}<span> 스핀</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
+              <p>{bestRoute.placed}미노 · {coverageLabel(bestRoute)} 성공률 <Icon name="arrow" size={13} /></p>
+            {/if}
           </button>
         {:else}
-          <div class="best-empty"><span class="empty-line"></span><strong>완주 결과를 기다리고 있어요.</strong><p>조건을 만족하는 빌드를 찾으면 여기에 표시됩니다.</p></div>
+          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증을 통과한 최선 경로를 여기에 표시합니다.</p></div>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
@@ -298,7 +311,7 @@
     <details class="advanced-options"><summary>추가 설정 <span>동시 탐색 · 시드 · 범위</span></summary><div class="settings-grid">
       <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
-      <label class="full-row"><span>동시 탐색</span><select bind:value={draft.worker_count}><option value={0}>자동 · 기기에 맞게</option><option value={1}>1개</option><option value={2}>2개</option><option value={4}>4개</option></select><small>서로 다른 구조를 나누어 탐색합니다.</small></label>
+      <label class="full-row"><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
       <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div></label>
     </div></details>
     {#if active || status === 'paused'}<p class="settings-note">변경한 설정은 다음 탐색부터 적용됩니다.</p>{/if}
@@ -310,7 +323,7 @@
 <dialog class="help-dialog" bind:this={about}>
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
-  <p>왼쪽은 현재 후보, 오른쪽은 작업 진척도입니다. 완주 결과가 발견되면 <strong>최선 결과</strong>에서 배치를 확인하고 저장할 수 있어요.</p>
+  <p>왼쪽은 가방 단위의 후보, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>에서 검증을 통과한 배치를 확인하고 저장할 수 있어요. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
   <p>112개는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>

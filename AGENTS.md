@@ -36,3 +36,18 @@
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
+- Intermediate ranking must preserve the bounded spin contract: field quality
+  can reverse a one-spin difference, never a two-spin difference. Keep raw
+  evaluation separate and normalize once; no bonuses after normalization.
+  Temporary scheduling cooldowns must not change the archived best route.
+- Keep one bag's remaining inventories distinct inside the proposal frontier.
+  Public nonterminal paths and certified bestPartial are whole-bag boundaries;
+  a real terminal prefix may consume only part of its last bag.
+- Board equality does not imply the same fixed tiling. Candidate deduplication
+  must include piece-to-target assignment and execution context. Logical rows
+  through 31 remain valid after clears despite the 24-row physical ceiling.
+  Collapse identical post-lock geometry only in proposal lists; retain exact
+  orientation queries and ordered-kick replay for verification.
+- Worker lanes partition first-placement proposals, not every complete build.
+  Preserve independent P7 certificates, compact progress, correct replay
+  ownership, manual worker preferences and all-worker pause/cancel semantics.

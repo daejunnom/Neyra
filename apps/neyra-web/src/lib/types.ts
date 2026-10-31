@@ -5,12 +5,16 @@ export interface SearchConfig {
   budget_start: number;
   seed: number;
   beam_width: number;
-  /** Browser scheduling only; zero selects a conservative automatic count. */
+  /** Browser scheduling only; zero uses all reported logical processors. */
   worker_count: number;
 }
 
-export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count'> & { search_profile: number };
-export type CandidateView = 'current' | 'best';
+export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count'> & {
+  search_profile: number;
+  search_lane: number;
+  search_lanes: number;
+};
+export type CandidateView = 'current' | 'best' | 'partial';
 
 export interface BoardFrame {
   rows: number[];
@@ -39,6 +43,8 @@ export interface Candidate {
   budgetPieces: number | null;
   cdf: { pieces: number; probability: number }[];
   frames: BoardFrame[];
+  frameCount: number;
+  rankingScore: number;
 }
 
 export interface SearchSnapshot {
@@ -50,6 +56,7 @@ export interface SearchSnapshot {
   qualifiedBags: number;
   qualifiedSpins: number;
   pruned: number;
+  duplicates?: number;
   bags: number;
   checked: number;
   success: number;
@@ -58,6 +65,7 @@ export interface SearchSnapshot {
   finished: boolean;
   current: Candidate | null;
   best: Candidate | null;
+  bestPartial: Candidate | null;
   /** Added by the browser coordinator, not combined into any certificate. */
   workers?: number;
 }
@@ -71,12 +79,15 @@ export type EngineEvent =
   | { type: 'error'; runId: string; message: string }
   | { type: 'warning'; runId: string; message: string }
   | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown }
+  | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
   | { type: 'export'; runId: string; requestId: string; data: unknown; snapshot?: SearchSnapshot }
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
+  | { type: 'watch'; runId: string; enabled: boolean }
+  | { type: 'detail'; runId: string; requestId: string }
   | { type: 'export'; runId: string; requestId: string; view: CandidateView };
 
 export const defaultConfig: SearchConfig = {

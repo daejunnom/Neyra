@@ -36,13 +36,25 @@
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
-- Internal search ranking must preserve the bounded spin contract: field quality
+- Within the same bag depth, search ranking must preserve the bounded spin contract: field quality
   can reverse a one-spin difference, never a two-spin difference. Keep raw
   evaluation separate and normalize once; no bonuses after normalization.
   Temporary scheduling cooldowns must not change the archived best route.
-- The displayed partial record uses actual total spins, then fewer locks, then
-  higher probability; neither bag depth nor terrain score may lower it. Reset
-  only for a new run. Preserve each archived result's certificate ownership.
+- The displayed partial record uses spins/max(7, placed-7), then more total
+  spins, fewer locks and higher effective probability. Keep the total-spin
+  maximum as separate progress. Reset only for a new run; preserve certificate
+  ownership and compare records with the same function in Rust and TypeScript.
+- First-bag probability exclusion is opt-in and conditional on a constructible
+  first bag. Preserve its actual chance; zero successful starts never qualify.
+  First-bag reflection swaps J/L and S/Z together. Ordered 180 kicks and spawn
+  are not fully symmetric: certify shared reflected edges and keep the chosen
+  orientation for later bags. Restricted-policy failures are not a proof of
+  physical impossibility. Keep ordinary and reflection-safe policies distinct.
+- Share only monotonic verified same-depth spin benchmarks between workers.
+  Imported hints never create local progress or supply certificates. New
+  benchmarks revoke old scheduling leases; backpropagation must not refill
+  ancestor budgets. Reserve exploration for fresh starts, untried foundations
+  and older eligible deeper nodes, including when replacing full-tree leaves.
 - Productivity, pace and inaccessible-mass cuts are selective heuristics, not
   impossibility proofs or exact P7 failures. Preserve real terminal prefixes,
   widen a stalled soft budget, and do not cache heuristic misses as failures.

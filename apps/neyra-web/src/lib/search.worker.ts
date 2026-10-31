@@ -4,6 +4,7 @@ type WasmEngine = {
   advance(work: number): void;
   snapshot(): string;
   snapshot_compact(): string;
+  observe_benchmarks(values: string): void;
   export_selected_json(selection: string): string;
   free(): void;
 };
@@ -28,8 +29,22 @@ let incumbentId = '';
 let watchCurrent = false;
 let detailedCurrentKey = '';
 let modulePromise: Promise<WasmModule> | undefined;
+let bestSpinsByBag = Array<number>(101).fill(0);
 
 function send(message: EngineEvent) { scope.postMessage(message); }
+
+function observeBenchmarks(incoming: number[]) {
+  if (!Array.isArray(incoming)) return;
+  let changed = false;
+  for (let bag = 1; bag < Math.min(incoming.length, bestSpinsByBag.length); bag++) {
+    const spins = incoming[bag];
+    if (Number.isInteger(spins) && spins <= 40 && spins > bestSpinsByBag[bag]) {
+      bestSpinsByBag[bag] = spins;
+      changed = true;
+    }
+  }
+  if (changed && engine) engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
+}
 
 async function wasm(assetBase: string, build: string): Promise<WasmModule> {
   modulePromise ??= (async () => {
@@ -133,6 +148,7 @@ scope.onmessage = async ({ data }) => {
     incumbentId = '';
     watchCurrent = data.watchCurrent;
     detailedCurrentKey = '';
+    bestSpinsByBag.fill(0);
     runId = data.runId;
     const requestedId = runId;
     try {
@@ -140,6 +156,9 @@ scope.onmessage = async ({ data }) => {
       if (runId !== requestedId) return;
       // Pause/cancel can arrive while the async module is loading.
       engine = new module.NeyraEngine(JSON.stringify(data.config));
+      if (bestSpinsByBag.some((spins) => spins > 0)) {
+        engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
+      }
       running = requested === 'running';
       snapshot();
       send({ type: 'status', runId, status: requested });
@@ -148,6 +167,11 @@ scope.onmessage = async ({ data }) => {
     return;
   }
   if (data.runId !== runId) return;
+  if (data.type === 'benchmarks') {
+    try { if (requested !== 'cancelled') observeBenchmarks(data.bestSpinsByBag); }
+    catch (error) { fail(error); }
+    return;
+  }
   if (data.type === 'watch') {
     watchCurrent = data.enabled;
     try { if (watchCurrent) snapshot(true); } catch (error) { fail(error); }

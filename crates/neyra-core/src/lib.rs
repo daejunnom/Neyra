@@ -26,6 +26,14 @@ impl NeyraEngine {
         self.session.step(max_work.clamp(1, 64));
     }
 
+    pub fn observe_benchmarks(&mut self, values_json: &str) -> Result<(), JsValue> {
+        let values: Vec<u8> = serde_json::from_str(values_json)
+            .map_err(|error| JsValue::from_str(&format!("Invalid benchmarks: {error}")))?;
+        if values.len() > 101 { return Err(JsValue::from_str("Too many bag benchmarks")); }
+        self.session.observe_benchmarks(&values);
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<String, JsValue> {
         serde_json::to_string(&self.session.snapshot())
             .map_err(|e| JsValue::from_str(&e.to_string()))

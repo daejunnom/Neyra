@@ -1,5 +1,6 @@
 export interface SearchConfig {
   min_success_percent: number;
+  ignore_first_bag_probability: boolean;
   piece_goal: number;
   max_pieces: number;
   budget_start: number;
@@ -31,6 +32,9 @@ export interface Candidate {
   spins: number;
   placed: number;
   probability: number;
+  /** Actual first-bag chance, even when the displayed probability excludes it. */
+  firstBagProbability?: number | null;
+  firstBagSymmetry?: boolean;
   lowerProbability: number;
   upperProbability: number;
   complete: boolean;
@@ -55,6 +59,8 @@ export interface SearchSnapshot {
   deepestSpins: number;
   qualifiedBags: number;
   qualifiedSpins: number;
+  /** Verified same-depth benchmarks for scheduling; never a shared certificate. */
+  bestSpinsByBag?: number[];
   pruned: number;
   /** Selective productivity/terrain cuts, separate from proven bounds. */
   selectivePruned?: number;
@@ -88,12 +94,14 @@ export type EngineEvent =
 export type EngineCommand =
   | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
+  | { type: 'benchmarks'; runId: string; bestSpinsByBag: number[] }
   | { type: 'watch'; runId: string; enabled: boolean }
   | { type: 'detail'; runId: string; requestId: string }
   | { type: 'export'; runId: string; requestId: string; view: CandidateView };
 
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
+  ignore_first_bag_probability: false,
   piece_goal: 119,
   max_pieces: 140,
   budget_start: 0,

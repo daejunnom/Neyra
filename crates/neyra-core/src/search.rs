@@ -9,7 +9,8 @@ use crate::structure::{
     BoardFacts, CellMask, SingleGoal,
 };
 use crate::supply::{
-    decode_order, minimum_finish, permutation, LanguageNode, ALL_PIECES, P7_COUNT,
+    decode_order, minimum_finish, mirror_piece, mirror_queue, mirror_rank, permutation, symmetry_union_costs,
+    LanguageNode, SymmetryCoverage, ALL_PIECES, P7_COUNT,
 };
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
@@ -21,12 +22,15 @@ const GRAPH_LIMIT: usize = 4096;
 const SPIN_DELTA: u8 = 3;
 const RESIDUE_MARGIN: u16 = 12;
 const BUDGET_STALE_ROUNDS: u64 = 64;
+const EXPLORATION_INTERVAL: u64 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
     #[serde(alias = "minSuccessPercent")]
     pub min_success_percent: f64,
+    #[serde(alias = "ignoreFirstBagProbability")]
+    pub ignore_first_bag_probability: bool,
     #[serde(alias = "pieceGoal")]
     pub piece_goal: u16,
     #[serde(alias = "maxPieces")]
@@ -49,6 +53,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             min_success_percent: 100.0,
+            ignore_first_bag_probability: false,
             piece_goal: 119,
             max_pieces: 140,
             budget_start: 0,
@@ -118,6 +123,8 @@ pub struct CandidateSummary {
     pub probability: f64,
     pub lower_probability: f64,
     pub upper_probability: f64,
+    pub first_bag_probability: Option<f64>,
+    pub first_bag_symmetry: bool,
     pub complete: bool,
     pub qualified: bool,
     pub verified: bool,
@@ -142,6 +149,8 @@ impl CandidateSummary {
             probability: self.probability,
             lower_probability: self.lower_probability,
             upper_probability: self.upper_probability,
+            first_bag_probability: self.first_bag_probability,
+            first_bag_symmetry: self.first_bag_symmetry,
             complete: self.complete,
             qualified: self.qualified,
             verified: self.verified,
@@ -185,6 +194,8 @@ pub struct ProgressSnapshot {
     pub duplicates: u64,
     /// Selective productivity/terrain cuts, never exact P7 failures.
     pub selective_pruned: u64,
+    /// Verified same-depth maxima; peers may share these scheduling hints only.
+    pub best_spins_by_bag: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -227,6 +238,8 @@ struct Plan {
     targets: Vec<TargetOperation>,
     seed_frames: Vec<DisplayFrame>,
     terminal: bool,
+    /// A restricted policy whose every edge is replayable on both reflections.
+    reflection_safe: bool,
     /// A bounded, exact geometric continuation, not a supply certificate.
     #[serde(skip)]
     future: Continuation,
@@ -247,6 +260,7 @@ struct ExecutionEdge {
     piece: u8,
     child: usize,
     placement: Placement,
+    mirrored_placement: Option<Placement>,
     lines: u8,
 }
 
@@ -374,6 +388,30 @@ fn spawn_mask(board: &Board) -> u8 {
         } else {
             mask
         }
+    })
+}
+
+fn reflected_board(board: &Board) -> Board {
+    Board { rows: board.rows.map(|row| row.reverse_bits() >> 6) }
+}
+
+fn reflected_target(target: &TargetOperation) -> TargetOperation {
+    let mut cells = target.cells.map(|(x, y)| (9 - x, y));
+    cells.sort_unstable();
+    TargetOperation { piece: Piece::ALL[mirror_piece(target.piece as u8) as usize], cells }
+}
+
+/// The shared reflected language must also respect spawn BEFORE hold. SRS+
+/// kick ordering and spawn geometry are not assumed to be mirror symmetric.
+fn policy_spawn_mask(board: &Board, reflection_safe: bool) -> u8 {
+    let canonical = spawn_mask(board);
+    if !reflection_safe { return canonical; }
+    let reflected = spawn_mask(&reflected_board(board));
+    Piece::ALL.iter().fold(0, |mask, piece| {
+        let bit = piece.bit();
+        if canonical & bit != 0 && reflected & (1 << mirror_piece(*piece as u8)) != 0 {
+            mask | bit
+        } else { mask }
     })
 }
 
@@ -590,7 +628,7 @@ impl ExecutionGraph {
             .fold(0, |m, t| m | (1 << (t.piece as u8)));
         Self {
             nodes: vec![ExecutionNode {
-                spawn_mask: spawn_mask(&key.board),
+                spawn_mask: policy_spawn_mask(&key.board, plan.reflection_safe),
                 key,
                 edges: vec![],
                 accepting: false,
@@ -642,10 +680,44 @@ impl ExecutionGraph {
                 if result.lines == 1 && !result.spin {
                     continue;
                 }
-                valid = Some((placement, result));
+                let mirrored = if plan.reflection_safe {
+                    let board = reflected_board(&state.board);
+                    let target = reflected_target(target);
+                    let mut path = Vec::with_capacity(placement.path.len() + 1);
+                    if !matches!(target.piece, Piece::I | Piece::O) {
+                        // Actual 3x3 spawn is x=3; its reflected origin is x=4.
+                        path.push(Input::Right);
+                    }
+                    path.extend(placement.path.iter().map(|input| match input {
+                        Input::Left => Input::Right,
+                        Input::Right => Input::Left,
+                        Input::Cw => Input::Ccw,
+                        Input::Ccw => Input::Cw,
+                        other => *other,
+                    }));
+                    let valid = |path: &Placement| {
+                        normalize_target(path.pose, state.deleted).as_ref() == Some(&target)
+                            && board.apply(path).is_some_and(|other| {
+                                other.lines == result.lines
+                                    && other.cleared_rows == result.cleared_rows
+                                    && other.board == reflected_board(&result.board)
+                                    && (other.lines == 0 || other.spin)
+                            })
+                    };
+                    // Most edges need only a short replay. Search another
+                    // reflected input route only when ordered kicks differ.
+                    board.replay(target.piece, &path).filter(&valid).or_else(|| {
+                        projected_poses(&target, state.deleted).into_iter().find_map(|pose| {
+                            let path = cache.target(board, pose, result.lines == 1)?;
+                            valid(&path).then_some(path)
+                        })
+                    })
+                } else { None };
+                if plan.reflection_safe && mirrored.is_none() { continue; }
+                valid = Some((placement, mirrored, result));
                 break;
             }
-            let Some((placement, result)) = valid else {
+            let Some((placement, mirrored_placement, result)) = valid else {
                 continue;
             };
             let Some(deleted) = deleted_after(state.deleted, result.cleared_rows) else {
@@ -668,7 +740,7 @@ impl ExecutionGraph {
                 let child = self.nodes.len();
                 self.indices.insert(next.clone(), child);
                 self.nodes.push(ExecutionNode {
-                    spawn_mask: spawn_mask(&next.board),
+                    spawn_mask: policy_spawn_mask(&next.board, plan.reflection_safe),
                     key: next,
                     edges: vec![],
                     accepting: false,
@@ -679,6 +751,7 @@ impl ExecutionGraph {
                 piece,
                 child,
                 placement,
+                mirrored_placement,
                 lines: result.lines,
             });
         }
@@ -778,6 +851,19 @@ impl ExecutionGraph {
         }
         (frames, inputs)
     }
+
+    fn mirrored_witness(&self, code: u32, length: u8) -> Vec<Vec<Input>> {
+        let mut inputs = vec![];
+        let mut node = 0;
+        for piece in decode_order(code, length) {
+            let edge = self.nodes[node].edges.iter().find(|edge| edge.piece == piece)
+                .expect("certified reflected policy edge");
+            inputs.push(edge.mirrored_placement.as_ref()
+                .expect("reflected witness checked with policy edge").path.clone());
+            node = edge.child;
+        }
+        inputs
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -790,16 +876,26 @@ struct BagCertificate {
     end_spins: u8,
     targets: Vec<TargetOperation>,
     terminal: bool,
+    /// Missing edges in this restricted language do not prove physical failure.
+    reflection_safe: bool,
+    /// First-bag only. Canonical costs/codes below remain canonical evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symmetry_costs: Option<Vec<u8>>,
     success: u16,
+    effective_success: u16,
     checked: u16,
     /// Stable lexicographic P7 rank, I J L O S T Z.
     #[serde(serialize_with = "serialize_bit_words")]
     success_bits: Vec<u64>,
-    /// 0=unknown, 1..7=exact shortest accepting length, 255=proven impossible.
+    /// 0=unknown, 1..7=shortest in this language, 255=no accepting policy path.
     costs: Vec<u8>,
     order_codes: Vec<u32>,
     representative_queue: [u8; 7],
     representative_inputs: Vec<Vec<Input>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirrored_representative_queue: Option<[u8; 7]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirrored_representative_inputs: Option<Vec<Vec<Input>>>,
 }
 
 fn serialize_bit_words<S: serde::Serializer>(
@@ -822,10 +918,13 @@ struct VerificationJob {
     bits: Vec<u64>,
     upper: u16,
     prefix_checked: bool,
+    symmetry: Option<SymmetryCoverage>,
 }
 
 impl VerificationJob {
     fn new(parent: usize, plan: Plan) -> Self {
+        let symmetry = (plan.start_pieces == 0 && plan.start == Board::default() && plan.reflection_safe)
+            .then(SymmetryCoverage::default);
         Self {
             graph: ExecutionGraph::new(&plan),
             parent,
@@ -838,6 +937,7 @@ impl VerificationJob {
             bits: vec![0; 79],
             upper: P7_COUNT as u16,
             prefix_checked: false,
+            symmetry,
         }
     }
 
@@ -873,11 +973,24 @@ impl VerificationJob {
             } else {
                 self.costs[rank] = 255;
             }
+            if let Some(symmetry) = &mut self.symmetry {
+                symmetry.observe(rank, self.costs[rank] != 255);
+            }
         }
         self.checked = end;
         self.upper = self
             .upper
             .min((self.success + P7_COUNT - self.checked) as u16);
+    }
+
+    fn coverage_success(&self) -> u16 {
+        self.symmetry.as_ref().map_or(self.success as u16, SymmetryCoverage::success)
+    }
+
+    fn coverage_upper(&self) -> u16 {
+        self.symmetry.as_ref().map_or(self.upper, |symmetry| {
+            symmetry.upper().min(self.upper.saturating_mul(2).min(P7_COUNT as u16))
+        })
     }
 }
 
@@ -1241,6 +1354,9 @@ struct GenerationJob {
     best_bag_spins: u8,
     selective_pruned: u64,
     prune_budget: u16,
+    first_bag_symmetry: bool,
+    relaxed_setup: bool,
+    continuation_minimum_success: u16,
 }
 
 impl GenerationJob {
@@ -1350,6 +1466,9 @@ impl GenerationJob {
             best_bag_spins: 0,
             selective_pruned: 0,
             prune_budget: u16::MAX,
+            first_bag_symmetry: node.pieces == 0,
+            relaxed_setup: false,
+            continuation_minimum_success: minimum_success,
         }
     }
 
@@ -1463,8 +1582,11 @@ impl GenerationJob {
             } else {
                 first_mask
             };
-            if first_pair_upper(available, spawn_mask(&self.start), self.start_spins >= goal)
-                < self.minimum_success
+            let first_upper = first_pair_upper(available, spawn_mask(&self.start), self.start_spins >= goal);
+            let first_upper = if self.first_bag_symmetry {
+                first_upper.saturating_mul(2).min(P7_COUNT as u16)
+            } else { first_upper };
+            if first_upper < self.minimum_success
             {
                 self.pruned += 1;
                 continue;
@@ -1498,13 +1620,15 @@ impl GenerationJob {
             let mut target_key = state.target_key;
             target_key[piece as usize] = target_code(&target);
             targets.push(target);
-            if used == ALL_PIECES
-                && !complete
-                && geometric_two_lock_upper(&self.start, &targets, self.start_spins, goal)
-                    < self.minimum_success
-            {
-                self.pruned += 1;
-                continue;
+            if used == ALL_PIECES && !complete {
+                let upper = geometric_two_lock_upper(&self.start, &targets, self.start_spins, goal);
+                let upper = if self.first_bag_symmetry {
+                    upper.saturating_mul(2).min(P7_COUNT as u16)
+                } else { upper };
+                if upper < self.minimum_success {
+                    self.pruned += 1;
+                    continue;
+                }
             }
             let mut frames = state.frames.clone();
             frames.push(DisplayFrame {
@@ -1560,7 +1684,8 @@ impl GenerationJob {
                 // for all seven pieces. A strong flatness/slot reward here
                 // spends the floor too early and destroys P7 robustness.
                 // Continuation refinement compares the completed foundations.
-                setup_score(&self.start, &targets) + structural * 0.06 + rng.unit() * 6.0
+                setup_score(&self.start, &targets) * if self.relaxed_setup { 0.35 } else { 1.0 }
+                    + structural * 0.06 + rng.unit() * 6.0
             } else {
                 structural + setup_score(&self.start, &targets) * 0.25 + rng.unit() * 2.0
             };
@@ -1620,7 +1745,7 @@ impl GenerationJob {
                 self.refinement = Some(RefinementJob::new(
                     std::mem::take(&mut self.complete),
                     self.profile,
-                    self.minimum_success,
+                    self.continuation_minimum_success,
                 ));
                 false
             }
@@ -1800,6 +1925,7 @@ struct TreeNode {
     debt: CellMask,
     attempts: u32,
     allowance: u32,
+    lease_epoch: u64,
     last_selected: u64,
     quality: f64,
     last_improved_attempt: u32,
@@ -1965,6 +2091,33 @@ fn focused_rounds(last_bag_spins: u8, future_spins: u8, stale: u32) -> u32 {
     rounds.div_ceil(1 + (stale / 4).min(7)).max(1)
 }
 
+fn productive_locks(pieces: u16) -> u16 {
+    pieces.saturating_sub(7).max(7)
+}
+
+fn efficiency(spins: u8, pieces: u16) -> f64 {
+    f64::from(spins) * 7.0 / f64::from(productive_locks(pieces))
+}
+
+fn pace_lag(spins: u8, pieces: u16, goal: u8, budget: u16) -> f64 {
+    if pieces <= 7 { return 0.0; }
+    f64::from(goal) * f64::from(pieces - 7)
+        / f64::from(budget.saturating_sub(7).max(1)) - f64::from(spins)
+}
+
+fn productive_rounds(
+    spins: u8, pieces: u16, last_gain: u8, future_spins: u8,
+    stale: u32, goal: u8, budget: u16,
+) -> u32 {
+    // Being within the three-spin prune slack is not a reason for a large
+    // lease. Under-pace branches get one probe, then compete again.
+    if pieces > 7 && pace_lag(spins, pieces, goal, budget) >= 1.0 {
+        return 1;
+    }
+    if pieces <= 7 { return 1 + u32::from(future_spins != 0 && stale == 0); }
+    focused_rounds(last_gain, future_spins.min(1), stale).min(8)
+}
+
 pub struct SearchSession {
     config: SearchConfig,
     goal: u8,
@@ -2000,6 +2153,11 @@ pub struct SearchSession {
     best_spins_by_bag: Vec<u8>,
     selective_pruned: u64,
     last_budget_progress_round: u64,
+    benchmark_epoch: u64,
+    dispatches: u64,
+    focus_since_dispatch: u64,
+    last_exploration_dispatch: u64,
+    exploration_phase: u8,
 }
 
 impl SearchSession {
@@ -2025,6 +2183,7 @@ impl SearchSession {
             debt: [0; HEIGHT],
             attempts: 0,
             allowance: 4,
+            lease_epoch: 0,
             last_selected: 0,
             quality: 0.0,
             last_improved_attempt: 0,
@@ -2075,6 +2234,11 @@ impl SearchSession {
             best_spins_by_bag: vec![0; 101],
             selective_pruned: 0,
             last_budget_progress_round: 0,
+            benchmark_epoch: 0,
+            dispatches: 0,
+            focus_since_dispatch: 0,
+            last_exploration_dispatch: 0,
+            exploration_phase: 0,
         })
     }
 
@@ -2087,6 +2251,17 @@ impl SearchSession {
             }
             self.preview_steps = self.preview_steps.wrapping_add(1);
             if let Some(mut job) = self.verification.take() {
+                let pieces = job.plan.start_pieces + job.plan.targets.len() as u16;
+                if !job.plan.terminal && selective_reason(
+                    job.plan.expected.cell_count(), 0, pieces, job.plan.expected_spins,
+                    self.best_spins_by_bag[pieces as usize / 7], self.goal, self.active_budget,
+                ).is_some() {
+                    // A newer peer result may invalidate the search lease,
+                    // but unexamined supplies remain unknown, never failures.
+                    self.selective_pruned += 1;
+                    self.backpropagate(job.parent, 0.0);
+                    continue;
+                }
                 job.advance(self.goal, &mut self.physics_cache);
                 self.last_checked = job.checked as u16;
                 self.last_success = job.success as u16;
@@ -2100,6 +2275,7 @@ impl SearchSession {
                     self.finish_verification(job);
                 } else if !self.can_still_qualify(&job) {
                     self.pruned += 1;
+                    self.queue_reflected_alternative(&job);
                     self.backpropagate(job.parent, 0.0);
                 } else {
                     self.verification = Some(job);
@@ -2107,6 +2283,10 @@ impl SearchSession {
                 continue;
             }
             if let Some(mut job) = self.generation.take() {
+                // Imported or newly verified maxima take effect on the next
+                // work slice, including a generation already in flight.
+                job.best_bag_spins = self.best_spins_by_bag[(job.start_pieces as usize / 7) + 1];
+                job.prune_budget = self.active_budget;
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
                 let prior_selective = job.selective_pruned;
@@ -2150,6 +2330,8 @@ impl SearchSession {
                             targets: state.targets,
                             seed_frames: state.frames,
                             terminal: state.spins >= self.goal,
+                            reflection_safe: self.tree[parent].certificates.first()
+                                .is_some_and(|certificate| certificate.reflection_safe),
                             future: state.future,
                             debt: state.debt,
                         };
@@ -2168,16 +2350,20 @@ impl SearchSession {
                 }
                 continue;
             }
-            // A newly certified child is extended before its waiting siblings.
-            // Within a focus, finish its proposed bags before spending another
-            // generation round. A finite allowance eventually returns to peers.
+            if self.explore_once() { continue; }
+            // A lease survives only until a better verified benchmark or a
+            // bounded dispatch quantum. Descendants cannot refill ancestors.
             if let Some(parent) = self.focus {
-                if let Some(index) = self.waiting_plans.iter().rposition(|(p, _)| *p == parent) {
+                let lease_valid = self.tree[parent].lease_epoch == self.benchmark_epoch
+                    && self.dispatches.saturating_sub(self.focus_since_dispatch) < EXPLORATION_INTERVAL
+                    && self.node_selective_reason(parent).is_none();
+                if let Some(index) = self.best_waiting_plan(Some(parent)).filter(|_| lease_valid) {
                     let (_, plan) = self.waiting_plans.remove(index);
                     self.begin_verification(parent, plan);
                     continue;
                 }
                 if self.can_expand(parent)
+                    && lease_valid
                     && self.node_selective_reason(parent).is_none()
                     && self.tree[parent].attempts < self.tree[parent].allowance
                 {
@@ -2192,7 +2378,8 @@ impl SearchSession {
                     .saturating_add(1_u64 << (stale / 4).min(8));
                 self.focus = None;
             }
-            if let Some((parent, plan)) = self.waiting_plans.pop() {
+            if let Some(index) = self.best_waiting_plan(None) {
+                let (parent, plan) = self.waiting_plans.remove(index);
                 self.begin_verification(parent, plan);
                 continue;
             }
@@ -2212,15 +2399,13 @@ impl SearchSession {
                 break;
             };
             self.focus = Some(parent);
+            self.focus_since_dispatch = self.dispatches;
             let stale = self.tree[parent]
                 .attempts
                 .saturating_sub(self.tree[parent].last_improved_attempt);
-            let extra = focused_rounds(
-                self.last_bag_spins(parent),
-                self.tree[parent].future.spins,
-                stale,
-            );
+            let extra = self.node_rounds(parent, stale);
             self.tree[parent].allowance = self.tree[parent].attempts + extra;
+            self.tree[parent].lease_epoch = self.benchmark_epoch;
             self.begin_generation(parent);
         }
     }
@@ -2228,16 +2413,21 @@ impl SearchSession {
     fn begin_verification(&mut self, parent: usize, plan: Plan) {
         let pieces = plan.start_pieces + plan.targets.len() as u16;
         if !plan.terminal
-            && delta_lag(
+            && selective_reason(
+                plan.expected.cell_count(),
+                boundary_obstruction(&plan.expected, &plan.future),
+                pieces,
                 plan.expected_spins,
                 self.best_spins_by_bag[pieces as usize / 7],
-                0,
-            )
+                self.goal,
+                self.active_budget,
+            ).is_some()
         {
             self.selective_pruned += 1;
             return;
         }
         self.verification = Some(VerificationJob::new(parent, plan));
+        self.dispatches += 1;
         self.last_checked = 0;
         self.last_success = 0;
     }
@@ -2277,11 +2467,121 @@ impl SearchSession {
         })
     }
 
+    fn counted_counts<'a>(&self, counts: &'a [u16]) -> &'a [u16] {
+        if self.config.ignore_first_bag_probability && !counts.is_empty() {
+            &counts[1..]
+        } else { counts }
+    }
+
+    fn path_probability(&self, counts: &[u16]) -> f64 {
+        if counts.first() == Some(&0) { return 0.0; }
+        probability(self.counted_counts(counts))
+    }
+
+    fn path_qualifies(&self, counts: &[u16]) -> bool {
+        counts.first() != Some(&0)
+            && threshold_met(self.counted_counts(counts), self.config.min_success_percent)
+    }
+
+    fn queue_reflected_alternative(&mut self, job: &VerificationJob) {
+        if job.plan.start_pieces != 0 || job.plan.start != Board::default() || job.plan.reflection_safe
+            || self.config.ignore_first_bag_probability || job.success == P7_COUNT
+            || job.upper.saturating_mul(2).min(P7_COUNT as u16)
+                < required_success(&[], self.config.min_success_percent)
+        { return; }
+        let mut plan = job.plan.clone();
+        plan.id = self.next_id;
+        self.next_id += 1;
+        plan.reflection_safe = true;
+        if self.remember_plan(job.parent, &plan) {
+            self.candidates += 1;
+            self.waiting_plans.push((job.parent, plan));
+        }
+    }
+
+    fn node_rounds(&self, index: usize, stale: u32) -> u32 {
+        let node = &self.tree[index];
+        productive_rounds(node.spins, node.pieces, self.last_bag_spins(index),
+            node.future.spins, stale, self.goal, self.active_budget)
+    }
+
+    /// Peers share only verified performance benchmarks. These selective hints
+    /// never manufacture local progress, a board, or a supply certificate.
+    pub fn observe_benchmarks(&mut self, values: &[u8]) {
+        let mut changed = false;
+        for (depth, &spins) in values.iter().take(self.best_spins_by_bag.len()).enumerate().skip(1) {
+            if spins > self.goal || usize::from(spins) * 10 > depth * 28 { continue; }
+            if spins > self.best_spins_by_bag[depth] {
+                self.best_spins_by_bag[depth] = spins;
+                changed = true;
+            }
+        }
+        if changed {
+            self.benchmark_epoch += 1;
+            self.focus = None;
+        }
+    }
+
+    fn best_waiting_plan(&self, parent: Option<usize>) -> Option<usize> {
+        self.waiting_plans.iter().enumerate()
+            .filter(|(_, (p, _))| parent.is_none_or(|parent| parent == *p))
+            .max_by(|(_, (_, a)), (_, (_, b))| {
+                let priority = |plan: &Plan| {
+                    // Reuse the bounded probe result; do not flood every
+                    // pending board again whenever the scheduler compares it.
+                    let quality = plan.future.score
+                        - f64::from(mask_count(&plan.debt).saturating_sub(plan.future.paid)) * 12.0;
+                    efficiency(plan.expected_spins, plan.start_pieces + plan.targets.len() as u16)
+                        + 0.2 * quality / (120.0 + quality.abs())
+                };
+                priority(a).total_cmp(&priority(b)).then_with(|| b.id.cmp(&a.id))
+            }).map(|(index, _)| index)
+    }
+
+    fn explore_once(&mut self) -> bool {
+        if self.dispatches.saturating_sub(self.last_exploration_dispatch) < EXPLORATION_INTERVAL {
+            return false;
+        }
+        self.last_exploration_dispatch = self.dispatches;
+        let phase = self.exploration_phase;
+        self.exploration_phase = (phase + 1) % 3;
+        if phase == 0 {
+            if let Some(index) = self.best_waiting_plan(Some(0)) {
+                let (parent, plan) = self.waiting_plans.remove(index);
+                self.focus = None;
+                self.begin_verification(parent, plan);
+                return true;
+            }
+        }
+        let eligible = |i: usize| self.can_expand(i) && self.node_selective_reason(i).is_none();
+        let parent = if phase == 0 && eligible(0) { Some(0) }
+        else if phase == 1 {
+            (1..self.tree.len()).filter(|&i| eligible(i) && self.tree[i].pieces == 7
+                && self.tree[i].attempts == 0)
+                .max_by(|&a, &b| self.tree[a].quality.total_cmp(&self.tree[b].quality))
+        } else { None };
+        // Oldest eligible deeper nodes also get service; a short early burst
+        // must not make all lower-efficiency continuations wait forever.
+        let parent = parent.or_else(|| (0..self.tree.len()).filter(|&i| eligible(i))
+            .min_by_key(|&i| (self.tree[i].last_selected, i)));
+        let Some(parent) = parent else { return false; };
+        self.focus = Some(parent);
+        self.focus_since_dispatch = self.dispatches;
+        self.tree[parent].allowance = self.tree[parent].attempts + 1;
+        self.tree[parent].lease_epoch = self.benchmark_epoch;
+        self.begin_generation(parent);
+        true
+    }
+
     fn begin_generation(&mut self, parent: usize) {
         let attempt = self.tree[parent].attempts;
-        let minimum = required_success(&self.tree[parent].counts, self.config.min_success_percent);
+        let minimum = if parent == 0 && self.config.ignore_first_bag_probability { 1 }
+            else { required_success(self.counted_counts(&self.tree[parent].counts), self.config.min_success_percent) };
         // Re-search only selected boundaries more broadly; siblings start cheap.
-        let stage = (attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2);
+        let under_pace = self.tree[parent].pieces > 7
+            && pace_lag(self.tree[parent].spins, self.tree[parent].pieces, self.goal, self.active_budget) >= 1.0;
+        let stage = if under_pace { 0 }
+            else { (attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2) };
         let width = (self.config.beam_width >> (2 - stage)).max(4);
         let setup = parent == 0 && attempt % 4 != 3;
         let mut generation = GenerationJob::new(
@@ -2299,9 +2599,15 @@ impl SearchSession {
         generation.best_bag_spins =
             self.best_spins_by_bag[(self.tree[parent].pieces as usize / 7) + 1];
         generation.prune_budget = self.active_budget;
+        generation.first_bag_symmetry = parent == 0 && !self.config.ignore_first_bag_probability;
+        generation.relaxed_setup = parent == 0;
+        if parent == 0 {
+            generation.continuation_minimum_success = required_success(&[], self.config.min_success_percent);
+        }
         self.generation = Some(generation);
         self.tree[parent].attempts += 1;
-        self.tree[parent].last_selected = self.schedule_epoch;
+        self.tree[parent].last_selected = self.dispatches;
+        self.dispatches += 1;
         self.generation_rounds += 1;
         self.schedule_epoch += 1;
         if self
@@ -2327,7 +2633,7 @@ impl SearchSession {
         for row in plan.expected.rows {
             key.extend(row.to_le_bytes());
         }
-        key.extend([plan.expected_spins, u8::from(plan.terminal)]);
+        key.extend([plan.expected_spins, u8::from(plan.terminal), u8::from(plan.reflection_safe)]);
         // The same bag plan can qualify after a stronger probability prefix
         // even when it was rejected after a weaker route to the same board.
         key.extend((self.tree[parent].counts.len() as u16).to_le_bytes());
@@ -2368,7 +2674,7 @@ impl SearchSession {
                     let node = &self.tree[i];
                     let bound = node.pieces + cost_lower_bound(&node.board, node.spins, self.goal);
                     let age = self
-                        .schedule_epoch
+                        .dispatches
                         .saturating_sub(node.last_selected)
                         .min(128);
                     let stale = node.attempts.saturating_sub(node.last_improved_attempt) as f64;
@@ -2382,14 +2688,13 @@ impl SearchSession {
                     // prefix lock again here permanently starves deeper setup
                     // boundaries even when their optimistic total cost is the
                     // same. Compare that total bound below, not raw depth.
-                    spin_rank(
-                        node.spins,
-                        quality + age as f64 * 1.2
+                    let quality = quality + age as f64 * 1.2
                             - stale * 6.0
                             - ((node.attempts + 1) as f64).log2() * 32.0
                             - bound.saturating_sub(self.active_budget) as f64 * 2.0
-                            - bound.saturating_sub(self.config.piece_goal) as f64 * 0.8,
-                    )
+                            - bound.saturating_sub(self.config.piece_goal) as f64 * 0.8;
+                    efficiency(node.spins, node.pieces)
+                        + 0.2 * quality / (120.0 + quality.abs())
                 };
                 priority(a).total_cmp(&priority(b))
             })
@@ -2399,11 +2704,8 @@ impl SearchSession {
         loop {
             self.tree[index].visits += 1;
             self.tree[index].reward = self.tree[index].reward.max(reward);
-            if reward > 0.0 {
-                self.tree[index].allowance = self.tree[index]
-                    .allowance
-                    .max(self.tree[index].attempts + 2);
-            }
+            // A descendant's progress is a statistic, not a renewable lease
+            // for every ancestor. Only the scheduler allocates generation work.
             let Some(parent) = self.tree[index].parent else {
                 break;
             };
@@ -2413,8 +2715,8 @@ impl SearchSession {
 
     fn can_still_qualify(&self, job: &VerificationJob) -> bool {
         let mut counts = self.tree[job.parent].counts.clone();
-        counts.push(job.upper);
-        threshold_met(&counts, self.config.min_success_percent)
+        counts.push(job.coverage_upper());
+        self.path_qualifies(&counts)
     }
 
     fn update_generation_preview(&mut self, job: &GenerationJob) {
@@ -2440,7 +2742,7 @@ impl SearchSession {
         let placed = job.start_pieces + seed.targets.len() as u16;
         let mut frames = parent.frames.clone();
         frames.extend(seed.frames.clone());
-        let upper = probability(&parent.counts);
+        let upper = self.path_probability(&parent.counts);
         self.current = Some(Archived {
             summary: CandidateSummary {
                 id: format!("building-{}-{}", self.generation_rounds, self.preview_steps),
@@ -2450,6 +2752,8 @@ impl SearchSession {
                 probability: 0.0,
                 lower_probability: 0.0,
                 upper_probability: upper,
+                first_bag_probability: parent.counts.first().map(|count| f64::from(*count) / P7_COUNT as f64),
+                first_bag_symmetry: parent.certificates.first().is_some_and(|c| c.reflection_safe),
                 complete: seed.spins >= self.goal,
                 qualified: false,
                 verified: false,
@@ -2474,6 +2778,7 @@ impl SearchSession {
                 targets: seed.targets.clone(),
                 seed_frames: seed.frames.clone(),
                 terminal: seed.spins >= self.goal,
+                reflection_safe: parent.certificates.first().is_some_and(|c| c.reflection_safe),
                 future: seed.future.clone(),
                 debt: seed.debt,
             }),
@@ -2484,14 +2789,19 @@ impl SearchSession {
         self.deepest_spins = self.deepest_spins.max(job.plan.expected_spins);
         let parent = &self.tree[job.parent];
         let id = format!("plan-{}", job.plan.id);
-        let prefix = probability(&parent.counts);
-        let lower = prefix * job.success as f64 / P7_COUNT as f64;
-        let upper = prefix * job.upper as f64 / P7_COUNT as f64;
+        let mut lower_counts = parent.counts.clone();
+        lower_counts.push(job.coverage_success());
+        let mut upper_counts = parent.counts.clone();
+        upper_counts.push(job.coverage_upper());
+        let lower = self.path_probability(&lower_counts);
+        let upper = self.path_probability(&upper_counts);
         if let Some(current) = &mut self.current {
             if current.summary.id == id && !current.summary.verified {
                 current.summary.probability = lower;
                 current.summary.lower_probability = lower;
                 current.summary.upper_probability = upper;
+                current.summary.first_bag_probability = lower_counts.first()
+                    .map(|count| f64::from(*count) / P7_COUNT as f64);
                 current.summary.checked = job.checked as u16;
                 current.summary.success = job.success as u16;
                 current.summary.failed = (job.checked - job.success) as u16;
@@ -2509,6 +2819,8 @@ impl SearchSession {
                 probability: lower,
                 lower_probability: lower,
                 upper_probability: upper,
+                first_bag_probability: lower_counts.first().map(|count| f64::from(*count) / P7_COUNT as f64),
+                first_bag_symmetry: job.plan.reflection_safe,
                 complete: job.plan.terminal,
                 qualified: false,
                 verified: false,
@@ -2532,22 +2844,34 @@ impl SearchSession {
 
     fn finish_verification(&mut self, job: VerificationJob) {
         self.verified_candidates += 1;
+        self.queue_reflected_alternative(&job);
         let parent = &self.tree[job.parent];
         let mut counts = parent.counts.clone();
-        counts.push(job.success as u16);
-        let total_probability = probability(&counts);
+        counts.push(job.coverage_success());
+        let total_probability = self.path_probability(&counts);
+        let symmetry_costs = job.symmetry.as_ref().map(|_| symmetry_union_costs(&job.costs));
+        let effective_costs = symmetry_costs.as_deref().unwrap_or(&job.costs);
         let mut cdf = vec![];
         let mut budget = None;
         if job.plan.terminal {
             for m in 1..=7 {
-                let count = job.costs.iter().filter(|c| **c > 0 && **c <= m).count() as u16;
+                let count = effective_costs.iter().filter(|c| **c > 0 && **c <= m).count() as u16;
                 let mut at_budget = parent.counts.clone();
                 at_budget.push(count);
+                let conditional_start = self.config.ignore_first_bag_probability && parent.pieces == 0;
+                let cdf_probability = if conditional_start {
+                    f64::from(count) / f64::from(job.coverage_success().max(1))
+                } else { self.path_probability(&at_budget) };
+                let meets = if conditional_start {
+                    job.coverage_success() > 0 && u32::from(count) * 10_000
+                        >= u32::from(job.coverage_success())
+                            * (self.config.min_success_percent * 100.0).round() as u32
+                } else { self.path_qualifies(&at_budget) };
                 cdf.push(CdfPoint {
                     pieces: parent.pieces + m as u16,
-                    probability: probability(&at_budget),
+                    probability: cdf_probability,
                 });
-                if budget.is_none() && threshold_met(&at_budget, self.config.min_success_percent) {
+                if budget.is_none() && meets {
                     budget = Some(parent.pieces + m as u16);
                 }
             }
@@ -2555,14 +2879,15 @@ impl SearchSession {
         let qualified = if job.plan.terminal {
             budget.is_some_and(|n| n <= self.config.max_pieces)
         } else {
-            threshold_met(&counts, self.config.min_success_percent)
+            self.path_qualifies(&counts)
         };
         let desired = budget.map(|n| n - parent.pieces).unwrap_or(7) as u8;
-        let representative = job
-            .costs
-            .iter()
-            .position(|c| *c == desired)
-            .or_else(|| job.costs.iter().position(|c| *c > 0 && *c <= desired));
+        let canonical_choice = |rank: usize| job.symmetry.is_none()
+            || job.costs[rank] <= job.costs[mirror_rank(rank)];
+        let representative = job.costs.iter().enumerate()
+            .position(|(rank, c)| *c == desired && canonical_choice(rank))
+            .or_else(|| job.costs.iter().enumerate()
+                .position(|(rank, c)| *c > 0 && *c <= desired && canonical_choice(rank)));
         let Some(rank) = representative else {
             self.backpropagate(job.parent, 0.0);
             return;
@@ -2573,6 +2898,10 @@ impl SearchSession {
         let mut frames = parent.frames.clone();
         frames.extend(local_frames);
         let last = frames.last().unwrap();
+        let mirrored_representative_queue = job.plan.reflection_safe
+            .then(|| mirror_queue(&permutation(rank)));
+        let mirrored_representative_inputs = job.plan.reflection_safe
+            .then(|| job.graph.mirrored_witness(job.codes[rank], job.costs[rank]));
         let certificate = Rc::new(BagCertificate {
             id: format!("plan-{}", job.plan.id),
             start_rows: job.plan.start.rows,
@@ -2581,13 +2910,18 @@ impl SearchSession {
             end_spins: last.spins,
             targets: job.plan.targets.clone(),
             terminal: job.plan.terminal,
+            reflection_safe: job.plan.reflection_safe,
+            symmetry_costs,
             success: job.success as u16,
+            effective_success: *counts.last().unwrap(),
             checked: P7_COUNT as u16,
             success_bits: job.bits,
             costs: job.costs,
             order_codes: job.codes,
             representative_queue: permutation(rank),
             representative_inputs: inputs,
+            mirrored_representative_queue,
+            mirrored_representative_inputs,
         });
         let mut certificates = parent.certificates.clone();
         certificates.push(certificate);
@@ -2599,12 +2933,14 @@ impl SearchSession {
             probability: total_probability,
             lower_probability: total_probability,
             upper_probability: total_probability,
+            first_bag_probability: counts.first().map(|count| f64::from(*count) / P7_COUNT as f64),
+            first_bag_symmetry: job.plan.reflection_safe,
             complete: job.plan.terminal,
             qualified,
             verified: true,
             checked: P7_COUNT as u16,
-            success: job.success as u16,
-            failed: (P7_COUNT - job.success) as u16,
+            success: *counts.last().unwrap(),
+            failed: P7_COUNT as u16 - *counts.last().unwrap(),
             bag_count: counts.len() as u16,
             budget_pieces: budget,
             cdf,
@@ -2629,7 +2965,11 @@ impl SearchSession {
             self.qualified_spins = self.qualified_spins.max(summary.spins);
             if !job.plan.terminal {
                 let best = &mut self.best_spins_by_bag[counts.len()];
-                *best = (*best).max(summary.spins);
+                if summary.spins > *best {
+                    *best = summary.spins;
+                    self.benchmark_epoch += 1;
+                    self.focus = None;
+                }
             }
             if !job.plan.terminal
                 && self
@@ -2661,7 +3001,9 @@ impl SearchSession {
                 n.board == job.plan.expected
                     && n.spins == job.plan.expected_spins
                     && n.pieces == parent.pieces + 7
-                    && compare_probability(&n.counts, &counts) != std::cmp::Ordering::Less
+                    && n.certificates.first().is_some_and(|c| c.reflection_safe) == job.plan.reflection_safe
+                    && compare_probability(self.counted_counts(&n.counts), self.counted_counts(&counts))
+                        != std::cmp::Ordering::Less
             });
             if !duplicate {
                 let pieces = parent.pieces + 7;
@@ -2679,12 +3021,17 @@ impl SearchSession {
                     future: job.plan.future.clone(),
                     debt: job.plan.debt,
                     attempts: 0,
-                    allowance: focused_rounds(
+                    allowance: productive_rounds(
+                        job.plan.expected_spins,
+                        pieces,
                         job.plan.expected_spins.saturating_sub(parent.spins),
                         job.plan.future.spins,
                         0,
+                        self.goal,
+                        self.active_budget,
                     ),
-                    last_selected: self.generation_rounds,
+                    lease_epoch: self.benchmark_epoch,
+                    last_selected: self.dispatches,
                     quality: boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future),
                     last_improved_attempt: 0,
                     best_extension_spins: 0,
@@ -2706,6 +3053,7 @@ impl SearchSession {
                         source.revisit_after = self.schedule_epoch;
                     }
                     self.focus = Some(child);
+                    self.focus_since_dispatch = self.dispatches;
                 }
             } else {
                 self.duplicates += 1;
@@ -2734,20 +3082,28 @@ impl SearchSession {
         }
         // Stable slots keep pending jobs and ancestral certificates valid. Only
         // unreferenced leaves are replaced; completed incumbents live separately.
+        let mut foundations: Vec<_> = (1..self.tree.len()).filter(|&i| {
+            self.tree[i].pieces == 7 && self.tree[i].attempts == 0
+                && self.node_selective_reason(i).is_none()
+        }).collect();
+        foundations.sort_by(|&a, &b| self.tree[b].quality.total_cmp(&self.tree[a].quality));
+        foundations.truncate((self.config.beam_width / 4).clamp(2, 8));
+        let replaceable = |i: usize| {
+            i != parent && self.focus != Some(i) && self.tree[i].children.is_empty()
+                && !self.waiting_plans.iter().any(|(pending, _)| *pending == i)
+        };
         let victim = (1..self.tree.len())
             .filter(|i| {
-                *i != parent
-                    && self.focus != Some(*i)
-                    && self.tree[*i].children.is_empty()
-                    && !self.waiting_plans.iter().any(|(pending, _)| pending == i)
+                replaceable(*i) && !foundations.contains(i)
             })
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    spin_rank(n.spins, n.quality)
+                    efficiency(n.spins, n.pieces) + 0.2 * n.quality / (120.0 + n.quality.abs())
                 };
-                score(*a).total_cmp(&score(*b))
-            });
+                let eligible = |i| self.can_expand(i) && self.node_selective_reason(i).is_none();
+                eligible(*a).cmp(&eligible(*b)).then_with(|| score(*a).total_cmp(&score(*b)))
+            }).or_else(|| foundations.iter().rev().copied().find(|&i| replaceable(i)));
         let Some(index) = victim else { return None };
         if let Some(old_parent) = self.tree[index].parent {
             self.tree[old_parent].children.retain(|i| *i != index);
@@ -2806,6 +3162,7 @@ impl SearchSession {
                 .map(|a| a.summary.for_snapshot(include_frames)),
             duplicates: self.duplicates,
             selective_pruned: self.selective_pruned,
+            best_spins_by_bag: self.best_spins_by_bag.clone(),
         }
     }
 
@@ -2833,17 +3190,22 @@ impl SearchSession {
             .map(|a| a.certificates.iter().map(|c| c.as_ref()).collect())
             .unwrap_or_default();
         serde_json::json!({
-            "format": "neyra", "schemaVersion": 1, "engineVersion": env!("CARGO_PKG_VERSION"),
+            "format": "neyra", "schemaVersion": 2, "engineVersion": env!("CARGO_PKG_VERSION"),
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7NormalizedHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
             "candidate": archive.map(|a| &a.summary), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
             "interchange": false, "globalOptimalityProven": false,
+            "probabilityScope": if self.config.ignore_first_bag_probability { "AfterFirstBag" } else { "AllBags" },
+            "firstBagSymmetryPolicy": "ChooseLowerCostOnFirstQueue;canonicalOnTie;fixedOrientationAfterStart;reflectionSafeEdges",
+            "costsMeaning": "0=unknown;1..7=shortestInCertifiedLanguage;255=noPathInCertifiedLanguage",
+            "displayPartialRanking": "spins/max(7,placed-7);thenSpins;thenFewerLocks;thenProbability",
             "selectiveSearch": {
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
                 "activeBudget": self.active_budget,
                 "budgetStaleRounds": BUDGET_STALE_ROUNDS,
+                "explorationInterval": EXPLORATION_INTERVAL,
                 "cutsAreImpossibilityProofs": false
             }
         }).to_string()
@@ -2851,9 +3213,11 @@ impl SearchSession {
 }
 
 fn better_partial(a: &CandidateSummary, b: &CandidateSummary) -> bool {
-    a.spins > b.spins
+    let lhs = u32::from(a.spins) * u32::from(productive_locks(b.placed));
+    let rhs = u32::from(b.spins) * u32::from(productive_locks(a.placed));
+    lhs > rhs || (lhs == rhs && (a.spins > b.spins
         || (a.spins == b.spins
-            && (a.placed < b.placed || (a.placed == b.placed && a.probability > b.probability)))
+            && (a.placed < b.placed || (a.placed == b.placed && a.probability > b.probability)))))
 }
 
 fn better_complete(a: &CandidateSummary, b: &CandidateSummary) -> bool {
@@ -2926,6 +3290,8 @@ mod tests {
             probability: 1.0,
             lower_probability: 1.0,
             upper_probability: 1.0,
+            first_bag_probability: Some(1.0),
+            first_bag_symmetry: false,
             complete: true,
             qualified: true,
             verified: true,
@@ -2983,6 +3349,7 @@ mod tests {
             targets: vec![normalize_target(placement.pose, 0).unwrap()],
             seed_frames: vec![],
             terminal: true,
+            reflection_safe: false,
             future: Continuation::default(),
             debt: [0; HEIGHT],
         };
@@ -3041,6 +3408,7 @@ mod tests {
             targets: vec![normalize_target(placement.pose, 0).unwrap()],
             seed_frames: vec![],
             terminal: true,
+            reflection_safe: false,
             future: Continuation::default(),
             debt: [0; HEIGHT],
         };

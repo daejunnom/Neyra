@@ -43,10 +43,22 @@ export function betterComplete(a: Candidate, b: Candidate): boolean {
     (atBudget(a) > atBudget(b) || (atBudget(a) === atBudget(b) && a.probability > b.probability)));
 }
 
-/** The displayed record uses actual spins, independently of search evaluation. */
+/** First-bag preparation is excluded; at least one full bag is counted. */
+export function productivePieces(candidate: Candidate): number {
+  return Math.max(7, candidate.placed - 7);
+}
+
+export function spinsPerBag(candidate: Candidate): number {
+  return candidate.spins * 7 / productivePieces(candidate);
+}
+
+/** Compare the displayed efficiency record without floating-point division. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
-  return a.spins > b.spins || (a.spins === b.spins &&
-    (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)));
+  const aRate = a.spins * productivePieces(b);
+  const bRate = b.spins * productivePieces(a);
+  return aRate > bRate || (aRate === bRate &&
+    (a.spins > b.spins || (a.spins === b.spins &&
+      (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)))));
 }
 
 function complete(candidate: Candidate | null | undefined): candidate is Candidate {
@@ -68,6 +80,7 @@ export class SearchClient {
   private partialArchive: ArchivedCandidate | null = null;
   private pendingPartialArchive: { requestId: string; owner: number; candidateId: string } | null = null;
   private rejectedPartialArchives = new Set<string>();
+  private bestSpinsByBag = Array<number>(101).fill(0);
 
   constructor(private receive: (event: EngineEvent) => void) {}
 
@@ -181,6 +194,7 @@ export class SearchClient {
     this.partialArchive = null;
     this.pendingPartialArchive = null;
     this.rejectedPartialArchives.clear();
+    this.bestSpinsByBag.fill(0);
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
     this.intent = 'cancelled';
@@ -351,6 +365,28 @@ export class SearchClient {
       current: merge(snapshot.current, slot.snapshot?.current),
       best: merge(snapshot.best, slot.snapshot?.best),
       bestPartial: merge(snapshot.bestPartial ?? null, slot.snapshot?.bestPartial) };
+    this.mergeBenchmarks(snapshot.bestSpinsByBag);
+  }
+
+  private mergeBenchmarks(incoming: number[] | undefined) {
+    if (!Array.isArray(incoming)) return;
+    let changed = false;
+    for (let bag = 1; bag < Math.min(incoming.length, this.bestSpinsByBag.length); bag++) {
+      const spins = incoming[bag];
+      if (Number.isInteger(spins) && spins <= 40 && spins > this.bestSpinsByBag[bag]) {
+        this.bestSpinsByBag[bag] = spins;
+        changed = true;
+      }
+    }
+    if (!changed || this.intent === 'cancelled') return;
+    // Share only a small monotonic scheduling benchmark. Each worker keeps
+    // its own boards, plans, supply probabilities and replay certificates.
+    for (const slot of this.slots) {
+      if (!['failed', 'completed', 'cancelled'].includes(slot.status)) {
+        slot.worker.postMessage({ type: 'benchmarks', runId: this.runId,
+          bestSpinsByBag: [...this.bestSpinsByBag] } satisfies EngineCommand);
+      }
+    }
   }
 
   private watchCurrentOwner(owner: number | undefined) {
@@ -420,6 +456,7 @@ export class SearchClient {
       deepestSpins: max((value) => value.deepestSpins),
       qualifiedBags: max((value) => value.qualifiedBags ?? 0),
       qualifiedSpins: max((value) => value.qualifiedSpins ?? 0),
+      bestSpinsByBag: [...this.bestSpinsByBag],
       pruned: sum((value) => value.pruned ?? 0),
       selectivePruned: sum((value) => value.selectivePruned ?? 0),
       duplicates: sum((value) => value.duplicates ?? 0),

@@ -121,6 +121,8 @@ dialog::backdrop{background:#080e0bbf;backdrop-filter:blur(4px)}
 .settings-grid input,.settings-grid select{background:#142319;border:1px solid #40583a;border-radius:5px;min-width:0;width:100%;height:39px;padding:0 11px;color:#e0f0d2;font-size:13px;font-variant-numeric:tabular-nums}
 .settings-grid input:focus,.settings-grid select:focus{border-color:#9ac46d;outline:0;box-shadow:0 0 0 2px #98c76a16}
 .settings-grid label>small{font-size:9px;color:#89a674;line-height:1.4;font-weight:400}
+.settings-grid .checkbox-setting>span{justify-content:flex-start;gap:10px}
+.settings-grid .checkbox-setting input{width:16px;height:16px;flex:0 0 16px;padding:0;accent-color:#b5eb89}
 .full-row{grid-column:1/-1}
 .advanced-options{margin-top:24px;border-top:1px solid #3c5434;padding-top:17px}
 .advanced-options summary{font-size:11px;color:#b3cca0;cursor:pointer}

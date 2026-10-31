@@ -9,6 +9,11 @@ use crate::physics::{Board, Piece, Pose, FULL_ROW, HEIGHT, WIDTH};
 
 pub(crate) type CellMask = [u16; HEIGHT];
 
+// A smooth skyline is a weak convenience, not evidence of a usable spin
+// sequence. Bound only this preference; holes, access debt and roof towers
+// retain their own costs and cannot hide inside this cap.
+const SKYLINE_PREFERENCE_LIMIT: f64 = 6.0;
+
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
     mask.iter().map(|row| row.count_ones() as u16).sum()
 }
@@ -43,6 +48,9 @@ pub(crate) struct BoardFacts {
     pub cover_depth: u16,
     pub row_gap_runs: u16,
     pub split_gaps: u16,
+    /// Fragmented row gaps that each contain a buried obligation. Sky-open
+    /// surface steps are only a weak skyline preference, not cavity debt.
+    pub buried_split_gaps: u16,
     pub heights: [u8; WIDTH],
     pub roughness: u16,
     pub height: u8,
@@ -75,6 +83,7 @@ impl BoardFacts {
             cover_depth: 0,
             row_gap_runs: 0,
             split_gaps: 0,
+            buried_split_gaps: 0,
             heights: [0; WIDTH],
             roughness: 0,
             height: board.height(),
@@ -105,7 +114,7 @@ impl BoardFacts {
                 }
             }
         }
-        for &row in &board.rows {
+        for (y, &row) in board.rows.iter().enumerate() {
             if row == 0 {
                 continue;
             }
@@ -113,6 +122,16 @@ impl BoardFacts {
             let runs = (gaps & !(gaps << 1)).count_ones() as u16;
             facts.row_gap_runs += runs;
             facts.split_gaps += runs.saturating_sub(1);
+            let mut remaining = if runs > 1 && facts.holes[y] != 0 { gaps } else { 0 };
+            let mut buried_runs = 0_u16;
+            while remaining != 0 {
+                let left = remaining.trailing_zeros();
+                let width = (remaining >> left).trailing_ones();
+                let run = ((1_u16 << width) - 1) << left;
+                remaining &= !run;
+                buried_runs += u16::from(run & facts.holes[y] != 0);
+            }
+            facts.buried_split_gaps += buried_runs.saturating_sub(1);
         }
         facts.roughness = facts
             .heights
@@ -361,7 +380,7 @@ impl BoardFacts {
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
             + self.cover_depth as f64 * 0.25
-            + self.split_gaps as f64 * 2.0
+            + self.buried_split_gaps as f64 * 2.0
             + (self.height as f64).powi(2) * 0.06
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
@@ -373,8 +392,12 @@ impl BoardFacts {
                 & FULL_ROW,
             self.workspace_roof_top,
         ));
+        let surface_fragmentation = self.split_gaps.saturating_sub(self.buried_split_gaps)
+            as f64 * 0.25;
         let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
-            return -defects - self.roughness as f64 * 0.16;
+            return -defects
+                - (self.roughness as f64 * 0.05 + surface_fragmentation)
+                    .min(SKYLINE_PREFERENCE_LIMIT);
         };
         let footprint = usable_goal.map_or(self.workspace_columns, SingleGoal::working_columns);
         let mut linear = 0_u16;
@@ -402,11 +425,9 @@ impl BoardFacts {
             opening_width_cost(self.workspace_width)
                 + 3_u8.saturating_sub(self.workspace_depth) as f64 * 0.6
         };
-        -defects
-            - linear as f64 * 0.20
-            - squared as f64 * 0.045
-            - excess as f64 * 0.10
-            - opening_cost
+        let skyline = (linear as f64 * 0.08 + squared as f64 * 0.012 + surface_fragmentation)
+            .min(SKYLINE_PREFERENCE_LIMIT);
+        -defects - skyline - excess as f64 * 0.10 - opening_cost
     }
 }
 

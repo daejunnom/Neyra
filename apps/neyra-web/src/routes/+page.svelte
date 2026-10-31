@@ -3,7 +3,7 @@
   import BoardPreview from '$lib/BoardPreview.svelte';
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
-  import { SearchClient, workerLimit, MAX_WORKERS } from '$lib/engine';
+  import { SearchClient, spinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
   import './styles.css';
 
@@ -36,6 +36,7 @@
   const compactNumber = new Intl.NumberFormat('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
+  $: conditionalProbability = (snapshot !== null || hasSession ? runConfig : config).ignore_first_bag_probability;
   $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
   $: frames = candidate?.frames ?? [];
@@ -76,6 +77,17 @@
   function budgetCoverageLabel(item: Candidate) {
     const point = item.cdf.find((entry) => entry.pieces === item.budgetPieces);
     return point ? percent(point.probability) : coverageLabel(item);
+  }
+  function efficiencyLabel(item: Candidate) {
+    return spinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function verificationLabel(item: Candidate | null) {
+    if (!item) return '발견한 후보의 구축률을 여기에 표시합니다.';
+    if (!item.verified && item.checked === 0) return '선택한 후보 · 구축률 미검증';
+    const scope = conditionalProbability ? '2가방부터' : item.verified ? '선택한 후보 구축률' : '구축률 확인 중';
+    const first = conditionalProbability && item.firstBagProbability != null
+      ? ` · 첫 가방 ${percent(item.firstBagProbability)}` : '';
+    return `${scope} · ${coverageLabel(item)}${first}`;
   }
   function receive(event: EngineEvent) {
     if (event.type === 'progress') {
@@ -148,6 +160,7 @@
   function stop() { playing = false; client.cancel(); }
   function validateConfig(value: SearchConfig) {
     if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '성공률은 0% 초과, 100% 이하로 입력해 주세요.';
+    if (typeof value.ignore_first_bag_probability !== 'boolean') return '첫 가방 성공률 설정을 다시 선택해 주세요.';
     if (!Number.isInteger(value.piece_goal) || value.piece_goal < 1 || value.piece_goal > 1000) return '목표 미노 수는 1–1,000 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.max_pieces) || value.max_pieces < 1 || value.max_pieces > 700) return '탐색 상한은 1–700 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
@@ -244,7 +257,7 @@
         <h2>{status === 'idle' ? '가능성을 탐색하세요.' : status === 'paused' ? '잠시 쉬어가는 중.' : status === 'cancelled' ? '여기까지 탐색했어요.' : status === 'completed' ? '이번 탐색을 마쳤어요.' : status === 'failed' ? '다시 시작할 수 있어요.' : '다음 빌드를 찾는 중.'}</h2>
         <p class="run-description">{status === 'idle' ? '빈 필드에서 40번의 스핀 싱글을 완성할 새로운 구축을 찾습니다.' : status === 'paused' ? '지금까지의 결과는 그대로 유지됩니다.' : status === 'cancelled' || status === 'completed' ? '발견한 후보를 확인하거나 새 탐색을 시작하세요.' : status === 'failed' ? '아래 내용을 확인한 뒤 탐색을 다시 시작해 주세요.' : '발견한 구조와 검증 상황이 실시간으로 갱신됩니다.'}</p>
         <div class="goal-summary">
-          <div><span>성공률 기준</span><strong>{(hasSession ? runConfig : config).min_success_percent}%<small> 이상</small></strong></div>
+          <div><span>{conditionalProbability ? '2가방부터 성공률' : '성공률 기준'}</span><strong>{(hasSession ? runConfig : config).min_success_percent}%<small> 이상</small></strong></div>
           <div><span>개선 목표</span><strong>{(hasSession ? runConfig : config).piece_goal}<small> 미노</small></strong></div>
         </div>
         <div class="run-actions">
@@ -274,24 +287,24 @@
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 스핀 경로'}</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
+        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 효율 경로'}</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
         {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
             {#if bestRoute.complete}
               <div><strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
-              <p>{budgetCoverageLabel(bestRoute)} 성공률 <Icon name="arrow" size={13} /></p>
+              <p>{budgetCoverageLabel(bestRoute)} {conditionalProbability ? '2가방부터 성공률' : '성공률'} <Icon name="arrow" size={13} /></p>
             {:else}
-              <div><strong>{bestRoute.spins}<span> 스핀</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
-              <p>{bestRoute.placed}미노 · {coverageLabel(bestRoute)} 성공률 <Icon name="arrow" size={13} /></p>
+              <div><strong title="첫 준비 가방을 제외한 효율 · 최소 1가방">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
+              <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
             {/if}
           </button>
         {:else}
-          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증된 최대 스핀 경로를 여기에 표시합니다.</p></div>
+          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증된 스핀 효율이 높은 경로를 표시합니다.</p></div>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
         {/if}
-        <p class="verification-note">{candidate ? candidate.verified ? `선택한 후보 구축률 · ${coverageLabel(candidate)}` : candidate.checked > 0 ? `구축률 확인 중 · ${coverageLabel(candidate)}` : '선택한 후보 · 구축률 미검증' : '발견한 후보의 구축률을 여기에 표시합니다.'}</p>
+        <p class="verification-note">{verificationLabel(candidate)}</p>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
     </aside>
@@ -304,11 +317,12 @@
   <form onsubmit={saveSettings}>
     <div class="dialog-heading"><div><p class="eyebrow">SEARCH OPTIONS</p><h2>탐색 설정</h2></div><button class="icon-button" type="button" onclick={() => settings.close()} aria-label="설정 닫기"><Icon name="close" /></button></div>
     <div class="settings-grid">
-      <label><span>최소 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>전체 빌드의 성공률 기준</small></label>
+      <label><span>최소 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '첫 가방 구축 후의 성공률 기준' : '전체 빌드의 성공률 기준'}</small></label>
       <label><span>개선 목표 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>목표보다 긴 결과도 보관해요.</small></label>
       <label class="full-row"><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
     <details class="advanced-options"><summary>추가 설정 <span>동시 탐색 · 시드 · 범위</span></summary><div class="settings-grid">
+      <label class="full-row checkbox-setting" title="시작 가능한 첫 가방을 확인한 뒤, 2가방부터 성공률을 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">첫 가방이 구축된 뒤의 성공률을 기준으로 찾아요.</small></label>
       <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
       <label class="full-row"><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
@@ -323,7 +337,7 @@
 <dialog class="help-dialog" bind:this={about}>
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
-  <p>왼쪽은 가방 단위의 후보, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>에서 검증을 통과한 배치를 확인하고 저장할 수 있어요. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
-  <p>112개는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
+  <p>왼쪽은 가방 단위의 후보, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>는 첫 준비 가방을 제외한 스핀 효율로 비교합니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
+  <p>설정한 미노 수는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>

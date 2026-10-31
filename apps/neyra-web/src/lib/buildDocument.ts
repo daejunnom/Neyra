@@ -38,7 +38,7 @@ const HEIGHT = 24;
 const FULL_ROW = (1 << WIDTH) - 1;
 const pieces = new Set<string>(bagPieceOrder);
 const emptyCells = (): BoardCell[][] => Array.from({ length: HEIGHT }, () => Array<BoardCell>(WIDTH).fill('_'));
-const rowMask = (row: BoardCell[]): number => row.reduce((mask, cell, x) => mask | (cell === '_' ? 0 : 1 << x), 0);
+const emptyRows = Array<number>(HEIGHT).fill(0);
 const cellCount = (rows: number[]): number => rows.reduce((count, row) => {
   for (let value = row; value; value &= value - 1) count++;
   return count;
@@ -55,18 +55,23 @@ function grayCells(rows: number[]): BoardCell[][] {
 
 /** Reconstruct actual placed colors and apply exactly the recorded line clears.
  * Missing legacy coordinates stay gray. Occupancy deltas never guess a mino. */
-function applyFrame(cells: BoardCell[][], frame: BoardFrame, index: number, priorSpins: number): BoardCell[][] {
+function applyFrame(cells: BoardCell[][], frame: BoardFrame, index: number, prior?: BoardFrame): BoardCell[][] {
+  const priorRows = prior?.rows ?? emptyRows;
   if (!validRows(frame.rows) || frame.placed !== index + 1 || !pieces.has(frame.piece) ||
-      !Number.isInteger(frame.spins) || frame.spins !== priorSpins + frame.lines ||
+      !Number.isInteger(frame.spins) || frame.spins !== (prior?.spins ?? 0) + frame.lines ||
       (frame.lines !== 0 && frame.lines !== 1) || (frame.lines === 1 && !frame.spin)) {
     throw new BuildDocumentError();
   }
-  if (cellCount(frame.rows) !== cellCount(cells.map(rowMask)) + 4 - frame.lines * WIDTH) {
+  if (cellCount(frame.rows) !== cellCount(priorRows) + 4 - frame.lines * WIDTH) {
     throw new BuildDocumentError();
   }
   if (frame.placedCells === undefined) return grayCells(frame.rows);
   if (!Array.isArray(frame.placedCells) || frame.placedCells.length !== 4) throw new BuildDocumentError();
-  const next = cells.map(row => [...row]);
+  // Earlier playback frames share unchanged rows. Copy only rows touched by
+  // this placement; recorded row masks avoid rescanning colored cells.
+  const next = [...cells];
+  const masks = [...priorRows];
+  let changedRows = 0;
   const seen = new Set<number>();
   for (const cell of frame.placedCells) {
     if (!Array.isArray(cell) || cell.length !== 2) throw new BuildDocumentError();
@@ -74,13 +79,50 @@ function applyFrame(cells: BoardCell[][], frame: BoardFrame, index: number, prio
     if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT ||
         next[y][x] !== '_' || seen.has(y * WIDTH + x)) throw new BuildDocumentError();
     seen.add(y * WIDTH + x);
+    if (!(changedRows & (1 << y))) {
+      next[y] = [...next[y]];
+      changedRows |= 1 << y;
+    }
     next[y][x] = frame.piece as PieceColor;
+    masks[y] |= 1 << x;
   }
-  const remaining = next.filter(row => rowMask(row) !== FULL_ROW);
+  const remaining = next.filter((_, y) => masks[y] !== FULL_ROW);
+  const remainingMasks = masks.filter(row => row !== FULL_ROW);
   if (HEIGHT - remaining.length !== frame.lines) throw new BuildDocumentError();
-  while (remaining.length < HEIGHT) remaining.push(Array<BoardCell>(WIDTH).fill('_'));
-  if (!frame.rows.every((row, y) => row === rowMask(remaining[y]))) throw new BuildDocumentError();
+  while (remaining.length < HEIGHT) {
+    remaining.push(Array<BoardCell>(WIDTH).fill('_'));
+    remainingMasks.push(0);
+  }
+  if (!frame.rows.every((row, y) => row === remainingMasks[y])) throw new BuildDocumentError();
   return remaining;
+}
+
+/** One component-local trace cache. Worker histories are immutable; compact
+ * progress updates reuse their frame array. Seeking never replays a prefix
+ * already reconstructed, and a new trace releases the previous color history. */
+export function createPiecePlayback() {
+  let trace: readonly BoardFrame[] | null = null;
+  let views: BoardCell[][][] = [];
+  let invalidFrom = Infinity;
+  return (frames: readonly BoardFrame[], index: number): readonly (readonly BoardCell[])[] | undefined => {
+    if (frames !== trace) {
+      trace = frames;
+      views = [];
+      invalidFrom = Infinity;
+    }
+    if (!Number.isInteger(index) || index < 0 || index >= frames.length ||
+        frames.length > 700 || index >= invalidFrom) return undefined;
+    try {
+      for (let i = views.length; i <= index; i++) {
+        views.push(applyFrame(i === 0 ? emptyCells() : views[i - 1], frames[i], i, frames[i - 1]));
+      }
+      return views[index];
+    } catch {
+      // Keep earlier valid frames usable; unknown colors fall back to gray.
+      invalidFrom = views.length;
+      return undefined;
+    }
+  };
 }
 
 /** One real end-state per completed bag, plus an actual terminal partial bag.
@@ -90,14 +132,12 @@ export function getBagViews(candidate: Candidate | null): BagView[] {
   if (candidate.frameCount !== candidate.frames.length || candidate.frames.length > 700 ||
       candidate.placed !== candidate.frames.length || !validRows(candidate.rows)) throw new BuildDocumentError();
   let cells = emptyCells();
-  let priorSpins = 0;
   let bagStartSpins = 0;
   let inventory: PieceColor[] = [];
   const bags: BagView[] = [];
   for (let index = 0; index < candidate.frames.length; index++) {
     const frame = candidate.frames[index];
-    cells = applyFrame(cells, frame, index, priorSpins);
-    priorSpins = frame.spins;
+    cells = applyFrame(cells, frame, index, candidate.frames[index - 1]);
     if (inventory.includes(frame.piece as PieceColor)) throw new BuildDocumentError();
     inventory.push(frame.piece as PieceColor);
     const bagEnd = (index + 1) % 7 === 0;

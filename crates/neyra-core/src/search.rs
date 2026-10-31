@@ -28,12 +28,12 @@ const RESIDUE_MARGIN: u16 = 12;
 const BUDGET_STALE_ROUNDS: u64 = 64;
 const EXPLORATION_INTERVAL: u64 = 8;
 const LONG_HORIZON_PROBE_INTERVAL: u64 = 32;
-const PACE_NEAR_SLACK: u16 = 2;
+const PACE_NEAR_SLACK: u16 = 1;
 const PACE_DISTANCE_SLACK: u16 = 1;
-// Lower cumulative envelope of the published SAO and Sarcelle Naga diagrams.
-// Index 0 is the empty field; index 17 is 39, not an invented completed route.
+// Lower SAO/Sarcelle envelope before bag 10, then the continuous SAO route.
+// Sarcelle's loop rebuild and its inherited lag do not relax later progress.
 // These are progress references, not physics or supply certificates.
-const PACE_REFERENCE: [u8; 18] = [0, 0, 2, 4, 8, 10, 12, 15, 17, 19, 21, 24, 26, 29, 31, 33, 36, 39];
+const PACE_REFERENCE: [u8; 18] = [0, 0, 2, 4, 8, 10, 12, 15, 17, 19, 22, 25, 28, 30, 33, 36, 38, 40];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -536,19 +536,11 @@ fn first_pair_upper(available: u8, spawn: u8, accepting: bool) -> u16 {
     if accepting {
         return P7_COUNT as u16;
     }
-    let mut pairs = 0;
-    for first in 0..7 {
-        for next in 0..7 {
-            if first != next
-                && spawn & (1 << first) != 0
-                && (available & (1 << first) != 0
-                    || (spawn & available & (1 << next) != 0))
-            {
-                pairs += 1;
-            }
-        }
-    }
-    pairs * 120
+    let ready = (available & spawn & ALL_PIECES).count_ones() as u16;
+    let spawnable = (spawn & ALL_PIECES).count_ones() as u16;
+    // A ready first piece allows six next labels. Every other spawnable first
+    // piece needs one of the ready labels next. This counts the same 42 pairs.
+    ready * (6 + spawnable - ready) * 120
 }
 
 fn can_be_first(start: &Board, target: &TargetOperation) -> bool {
@@ -1427,7 +1419,8 @@ struct GenerationJob {
     broad: bool,
     pruned: u64,
     duplicates: u64,
-    initial_used: u8,
+    /// A witnessed route only orders alternatives; it never consumes inventory.
+    principal: Vec<PrincipalMove>,
     lane: u16,
     lanes: u16,
     root_choice: usize,
@@ -1442,13 +1435,87 @@ struct GenerationJob {
     hard_piece_cap: u16,
     /// Qualified complete-bag rank, compared only with an optimistic bag-end rank.
     bag_alpha: f64,
-    /// Prefix alternatives are comparable only at the same remaining inventory.
-    prefix_quality: Vec<[f64; 7]>,
+    /// Exact integer equivalent of the current whole-bag pace comparison.
+    pace_minimum: u8,
     /// Facts live only while this one parent is expanded over its remaining pieces.
     current_facts: Option<BoardFacts>,
     mino_bound_pruned: u64,
     mino_selective_pruned: u64,
     mino_capacity_pruned: u64,
+}
+
+struct PrincipalMove {
+    board: Board,
+    used: u8,
+    placement: Placement,
+}
+
+/// Scores for one parent's alternatives of one next piece. Heavy path/tiling
+/// copies are made only for the survivors of this sibling batch.
+struct PlacementDraft {
+    board: Board,
+    spins: u8,
+    optimistic_spins: u8,
+    deleted: u32,
+    target: TargetOperation,
+    debt: CellMask,
+    pursuit: Option<Rc<SingleGoal>>,
+    first_mask: u8,
+    score: f64,
+    quality: f64,
+    placed_cells: [(u8, u8); 4],
+    lines: u8,
+    spin: bool,
+}
+
+/// This is selective sibling futility, not dominance between future boards.
+/// Never let a weaker supply mask or lower remaining capacity kill an option.
+fn sibling_dominates(better: &PlacementDraft, other: &PlacementDraft, goal: u8) -> bool {
+    other.optimistic_spins < goal
+        && better.spins >= other.spins
+        && better.optimistic_spins >= other.optimistic_spins
+        && better.first_mask & other.first_mask == other.first_mask
+        && better.pursuit == other.pursuit
+        && if better.spins > other.spins {
+            better.quality > other.quality
+        } else {
+            better.quality > other.quality + 24.0
+        }
+}
+
+/// Actual goal finishes use their own complete-plan capacity. A later quiet
+/// alternative must not evict a finish through the smaller inventory bucket.
+fn insert_sibling_draft(
+    batches: &mut [Vec<PlacementDraft>; 2], draft: PlacementDraft,
+    goal: u8, continuing_limit: usize, selective: bool,
+) -> (u64, u64) {
+    let terminal = draft.spins >= goal;
+    let siblings = &mut batches[usize::from(terminal)];
+    let mut pruned = 0;
+    if selective {
+        if siblings.iter().any(|other| sibling_dominates(other, &draft, goal)) {
+            return (1, 0);
+        }
+        let before = siblings.len();
+        siblings.retain(|other| !sibling_dominates(&draft, other, goal));
+        pruned = (before - siblings.len()) as u64;
+    }
+    let at = siblings.iter().position(|other| other.score < draft.score).unwrap_or(siblings.len());
+    siblings.insert(at, draft);
+    let limit = if terminal { 12 } else { continuing_limit };
+    let capacity = siblings.len() > limit;
+    if capacity { siblings.pop(); }
+    (pruned, u64::from(capacity))
+}
+
+/// Put the witnessed next label first without removing any other inventory.
+fn ordered_piece(index: usize, preferred: Option<usize>) -> Piece {
+    let index = match preferred {
+        Some(preferred) if index == 0 => preferred,
+        Some(preferred) if index <= preferred => index - 1,
+        _ => index,
+    };
+    Piece::ALL[index]
 }
 
 impl GenerationJob {
@@ -1480,58 +1547,26 @@ impl GenerationJob {
             future: Continuation::default(),
             first_mask: ALL_PIECES,
         };
-        // The earlier bounded probe found these placements from this exact
-        // boundary. Use that coherent route as a geometric proposal prefix;
-        // the final bag still goes through the clear-only hold supply policy.
-        // Other rounds explore independently instead of fixing this prefix.
-        if !setup && variant % 3 != 2 {
+        // Retain every first choice. A prior continuation supplies move-order
+        // hints only, including a witnessed tuck absent from the fast list.
+        let mut principal = Vec::new();
+        if !setup {
+            let mut board = node.board;
+            let mut used = 0;
+            let mut spins = node.spins;
             for placement in &node.future.placements {
-                if seed.spins >= goal || seed.used & placement.pose.piece.bit() != 0 {
-                    break;
-                }
-                let Some(result) = seed.board.apply(placement) else {
-                    break;
-                };
-                if result.lines > 1 || (result.lines == 1 && !result.spin) {
-                    break;
-                }
-                let Some(target) = normalize_target(placement.pose, seed.deleted) else {
-                    break;
-                };
-                let Some(deleted) = deleted_after(seed.deleted, result.cleared_rows) else {
-                    break;
-                };
-                let first_mask = if can_be_first(&node.board, &target) {
-                    seed.first_mask
-                } else {
-                    seed.first_mask & !placement.pose.piece.bit()
-                };
-                if first_pair_upper(first_mask, start_spawn, false) < minimum_success {
-                    break;
-                }
-                seed.debt = next_debt(&seed, &result.board, result.cleared_rows);
-                seed.board = result.board;
-                seed.used |= placement.pose.piece.bit();
-                seed.deleted = deleted;
-                seed.spins += result.lines;
-                seed.first_mask = first_mask;
-                seed.target_key[target.piece as usize] = target_code(&target);
-                seed.targets.push(target);
-                seed.frames.push(DisplayFrame {
-                    rows: result.board.rows,
-                    piece: piece_name(placement.pose.piece),
-                    placed_cells: placement.pose.cells().map(|(x, y)| (x as u8, y as u8)),
-                    spins: seed.spins,
-                    placed: node.pieces + seed.targets.len() as u16,
-                    lines: result.lines,
-                    spin: result.spin,
-                });
+                if spins >= goal || used & placement.pose.piece.bit() != 0 { break; }
+                let Some(result) = board.apply(placement) else { break; };
+                if result.lines > 1 || (result.lines == 1 && !result.spin) { break; }
+                principal.push(PrincipalMove { board, used, placement: placement.clone() });
+                board = result.board;
+                used |= placement.pose.piece.bit();
+                spins += result.lines;
             }
         }
         seed.quality = board_score(&seed.board);
         seed.score = spin_rank(seed.spins, seed.quality);
         let depth = seed.targets.len() as u8;
-        let initial_used = seed.used;
         let terminal = seed.spins >= goal;
         Self {
             parent,
@@ -1554,7 +1589,7 @@ impl GenerationJob {
             broad: variant % 4 == 3,
             pruned: 0,
             duplicates: 0,
-            initial_used,
+            principal,
             lane,
             lanes,
             root_choice: 0,
@@ -1567,11 +1602,18 @@ impl GenerationJob {
             pace_fallback: false,
             hard_piece_cap: u16::MAX,
             bag_alpha: f64::NEG_INFINITY,
-            prefix_quality: vec![[f64::NEG_INFINITY; 7]; 128],
+            pace_minimum: 0,
             current_facts: None,
             mino_bound_pruned: 0,
             mino_selective_pruned: 0,
             mino_capacity_pruned: 0,
+        }
+    }
+
+    fn set_prune_budget(&mut self, goal: u8, budget: u16) {
+        if self.prune_budget != budget {
+            self.prune_budget = budget;
+            self.pace_minimum = min_pace_spins(goal, self.start_pieces + 7, budget);
         }
     }
 
@@ -1585,16 +1627,16 @@ impl GenerationJob {
         }
         let bounds = MinoBounds {
             start_pieces: self.start_pieces, best_bag_spins: self.best_bag_spins,
-            bag_alpha: self.bag_alpha, goal, budget: self.prune_budget,
+            bag_alpha: self.bag_alpha, goal, pace_minimum: self.pace_minimum,
             hard_piece_cap: self.hard_piece_cap,
         };
         let state = &self.frontier[self.state_index];
-        let cut = mino_cut(&state.board, state.used, state.spins, bounds);
-        let dominated = self.start_pieces != 0
-            && state.spins.saturating_add(remaining_bag_spins(&state.board, state.used)) < goal
-            && prefix_dominated(&self.prefix_quality, state.used,
-                state.spins.saturating_sub(self.start_spins), state.quality);
-        if cut.is_some() || dominated {
+        // The parent is unchanged while its remaining piece labels are visited.
+        // Every child still checks current bounds before entering a frontier.
+        let cut = if self.piece_index == 0 {
+            mino_cut(&state.board, state.used, state.spins, bounds)
+        } else { None };
+        if cut.is_some() {
             self.state_index += 1;
             self.piece_index = 0;
             self.current_facts = None;
@@ -1627,7 +1669,11 @@ impl GenerationJob {
             }
         }
         let state = &self.frontier[self.state_index];
-        let piece = Piece::ALL[self.piece_index];
+        let hint = self.principal.iter().find(|hint| {
+            hint.board == state.board && hint.used == state.used
+        }).map(|hint| &hint.placement);
+        let preferred = hint.map(|hint| hint.pose.piece as usize);
+        let piece = ordered_piece(self.piece_index, preferred);
         self.piece_index += 1;
         if self.piece_index == 7 {
             self.piece_index = 0;
@@ -1645,13 +1691,25 @@ impl GenerationJob {
         let locks = if self.setup && !self.broad {
             Rc::new(state.board.surface_locks(piece))
         } else { cache.proposals(state.board, piece, self.broad && !root_choice) };
+        let hint = hint.filter(|placement| placement.pose.piece == piece);
+        if locks.is_empty() && hint.is_none() {
+            if self.piece_index == 0 { self.current_facts = None; }
+            return 0;
+        }
+        let hint_key = hint.map(|placement| lock_geometry(placement.pose, placement.spin));
         let per_inventory = self.inventory_limit(state.used | piece.bit());
         let before_facts = self.current_facts.get_or_insert_with(|| BoardFacts::new(&state.board));
         let before_holes = before_facts.holes;
         let mut expanded = 0;
+        let mut siblings = [Vec::<PlacementDraft>::new(), Vec::new()];
         // Witnessed spins establish a useful local window before quiet moves.
         // The root list is unchanged (the empty field has no spin single).
-        for placement in locks.iter().filter(|p| p.spin).chain(locks.iter().filter(|p| !p.spin)) {
+        for placement in hint.into_iter()
+            .chain(locks.iter().filter(|p| p.spin
+                && hint_key.is_none_or(|key| lock_geometry(p.pose, p.spin) != key)))
+            .chain(locks.iter().filter(|p| !p.spin
+                && hint_key.is_none_or(|key| lock_geometry(p.pose, p.spin) != key)))
+        {
             expanded += 1;
             if root_choice {
                 let choice = self.root_choice;
@@ -1671,20 +1729,6 @@ impl GenerationJob {
             // long before its supply flexibility can be measured.
             if self.setup && result.lines != 0 {
                 continue;
-            }
-            if result.lines == 0 {
-                if let Some(pursuit) = &state.pursuit {
-                    // Preserve a concrete finisher footprint while preparing
-                    // it. Unrelated side-stack placements remain available.
-                    if placement
-                        .pose
-                        .cells()
-                        .iter()
-                        .any(|&(x, y)| pursuit.required_empty[y as usize] & (1 << x) != 0)
-                    {
-                        continue;
-                    }
-                }
             }
             let Some(target) = normalize_target(placement.pose, state.deleted) else {
                 continue;
@@ -1724,7 +1768,9 @@ impl GenerationJob {
                 self.mino_bound_pruned += 1;
                 continue;
             }
-            if let Some(cut) = mino_cut(&result.board, used, spins, bounds) {
+            let potential = bag_potential(&result.board, used);
+            let optimistic_spins = spins.saturating_add(potential.0);
+            if let Some(cut) = mino_cut_with_potential(spins, potential, bounds) {
                 if cut == MinoCut::Cost { self.mino_bound_pruned += 1; self.pruned += 1; }
                 else { self.mino_selective_pruned += 1; self.selective_pruned += 1; }
                 continue;
@@ -1751,11 +1797,10 @@ impl GenerationJob {
                 self.mino_capacity_pruned += 1;
                 continue;
             }
-            let mut targets = state.targets.clone();
-            let mut target_key = state.target_key;
-            target_key[piece as usize] = target_code(&target);
-            targets.push(target);
             if used == ALL_PIECES && !complete {
+                let targets: [TargetOperation; 7] = std::array::from_fn(|index| {
+                    state.targets.get(index).unwrap_or(&target).clone()
+                });
                 let upper = geometric_two_lock_upper(&self.start, &targets, self.start_spins, goal);
                 let upper = if self.first_bag_symmetry {
                     upper.saturating_mul(2).min(P7_COUNT as u16)
@@ -1767,9 +1812,13 @@ impl GenerationJob {
             }
             let pursuit = if result.lines == 0 {
                 state.pursuit.as_ref().and_then(|pursuit| {
-                    // Once a non-setup bag spends its intended finisher,
-                    // release that footprint and prepare another usable spin.
-                    (self.setup || (state.used | piece.bit()) & pursuit.pose.piece.bit() == 0)
+                    // A speculative footprint is guidance, not an obligation.
+                    // Release it if this alternative fills its air cells or
+                    // spends the non-setup bag's intended finisher.
+                    ((self.setup || used & pursuit.pose.piece.bit() == 0)
+                        && !placement.pose.cells().iter().any(|&(x, y)| {
+                            pursuit.required_empty[y as usize] & (1 << x) != 0
+                        }))
                         .then(|| Rc::clone(pursuit))
                 })
             } else {
@@ -1798,34 +1847,20 @@ impl GenerationJob {
             if let Some(pursuit) = &pursuit {
                 structural -= pursuit.remaining(&result.board) as f64 * 8.0;
                 structural -= facts.unplanned_holes(&pursuit.required_empty) as f64 * 4.0;
-                // Spending the intended finisher quietly may still be needed
-                // to finish a fixed bag. Keep the footprint for a later bag,
-                // but do not value it as an available same-bag spin.
-                if !self.setup && (state.used | piece.bit()) & pursuit.pose.piece.bit() != 0 {
-                    structural -= 16.0;
-                }
             }
             let quality = if self.setup {
                 // The first bag must first leave independent landing slots
                 // for all seven pieces. A strong flatness/slot reward here
                 // spends the floor too early and destroys P7 robustness.
                 // Continuation refinement compares the completed foundations.
-                setup_score(&self.start, &targets) * if self.relaxed_setup { 0.35 } else { 1.0 }
+                setup_score(&self.start, state.targets.iter().chain(std::iter::once(&target)))
+                    * if self.relaxed_setup { 0.35 } else { 1.0 }
                     + structural * 0.06
             } else {
-                structural + setup_score(&self.start, &targets) * 0.25
+                structural + setup_score(&self.start, state.targets.iter().chain(std::iter::once(&target))) * 0.25
             };
             // Jitter only orders proposals; it is not evidence of better terrain.
             let score = spin_rank(spins, quality + rng.unit() * if self.setup { 6.0 } else { 2.0 });
-            if self.start_pieces != 0 && !complete
-                && spins.saturating_add(remaining_bag_spins(&result.board, used)) < goal
-                && prefix_dominated(&self.prefix_quality, used,
-                    spins.saturating_sub(self.start_spins), quality)
-            {
-                self.mino_selective_pruned += 1;
-                self.selective_pruned += 1;
-                continue;
-            }
             let (bucket, limit) = if used == ALL_PIECES {
                 (&self.complete, 12)
             } else { (&self.next_by_inventory[used as usize], per_inventory) };
@@ -1835,34 +1870,53 @@ impl GenerationJob {
                 self.mino_capacity_pruned += 1;
                 continue;
             }
-            let gain = usize::from(spins.saturating_sub(self.start_spins));
-            self.prefix_quality[used as usize][gain] = self.prefix_quality[used as usize][gain].max(quality);
+            let draft = PlacementDraft {
+                board: result.board, spins, optimistic_spins, deleted, target,
+                debt, pursuit, first_mask, score, quality,
+                placed_cells: placement.pose.cells().map(|(x, y)| (x as u8, y as u8)),
+                lines: result.lines, spin: result.spin,
+            };
+            let (selective, capacity) = insert_sibling_draft(
+                &mut siblings, draft, goal,
+                if used == ALL_PIECES { 12 } else { per_inventory }, self.start_pieces != 0,
+            );
+            self.mino_selective_pruned += selective;
+            self.selective_pruned += selective;
+            self.mino_capacity_pruned += capacity;
+        }
+        // All placements of this next piece have competed before their copies
+        // or descendants are allocated. Different parents never share a window.
+        for draft in siblings.into_iter().flatten() {
+            let mut targets = state.targets.clone();
+            let mut target_key = state.target_key;
+            target_key[piece as usize] = target_code(&draft.target);
+            targets.push(draft.target);
             let mut frames = state.frames.clone();
             frames.push(DisplayFrame {
-                rows: result.board.rows,
+                rows: draft.board.rows,
                 piece: piece_name(piece),
-                placed_cells: placement.pose.cells().map(|(x, y)| (x as u8, y as u8)),
-                spins,
+                placed_cells: draft.placed_cells,
+                spins: draft.spins,
                 placed: self.start_pieces + targets.len() as u16,
-                lines: result.lines,
-                spin: result.spin,
+                lines: draft.lines,
+                spin: draft.spin,
             });
             let next = SeedState {
-                board: result.board,
-                spins,
+                board: draft.board,
+                spins: draft.spins,
                 used: state.used | (1 << (piece as u8)),
-                deleted,
+                deleted: draft.deleted,
                 targets,
                 target_key,
                 frames,
-                score,
-                quality,
-                pursuit,
-                debt,
+                score: draft.score,
+                quality: draft.quality,
+                pursuit: draft.pursuit,
+                debt: draft.debt,
                 future: Continuation::default(),
-                first_mask,
+                first_mask: draft.first_mask,
             };
-            if spins >= goal || next.used == ALL_PIECES {
+            if next.spins >= goal || next.used == ALL_PIECES {
                 self.duplicates += u64::from(insert_seed(&mut self.complete, next, 12));
             } else {
                 let inventory = next.used as usize;
@@ -1925,13 +1979,8 @@ impl GenerationJob {
     }
 
     fn inventory_limit(&self, used: u8) -> usize {
-        let n = 7 - self.initial_used.count_ones() as usize;
-        let k = (used & !self.initial_used).count_ones() as usize;
-        let mut masks = 1;
-        for i in 0..k.min(n - k) {
-            masks = masks * (n - i) / (i + 1);
-        }
-        self.width.div_ceil(masks).max(1)
+        const MASKS: [usize; 8] = [1, 7, 21, 35, 35, 21, 7, 1];
+        self.width.div_ceil(MASKS[used.count_ones() as usize]).max(1)
     }
 
     fn finish_inventory_layer(&mut self) -> Vec<SeedState> {
@@ -1953,16 +2002,6 @@ impl GenerationJob {
         next.sort_by(|a, b| b.score.total_cmp(&a.score));
         next
     }
-}
-
-fn next_debt(state: &SeedState, board: &Board, cleared_rows: u32) -> CellMask {
-    next_debt_with_holes(
-        state,
-        board,
-        cleared_rows,
-        &BoardFacts::new(&state.board).holes,
-        &BoardFacts::new(board).holes,
-    )
 }
 
 fn next_debt_with_holes(
@@ -2020,9 +2059,12 @@ fn board_score(board: &Board) -> f64 {
 /// Direct-drop interference and missing base support expose fragile setup bags
 /// cheaply. Actual rotation, OR support and hold possibilities remain the exact
 /// execution verifier's responsibility.
-fn setup_score(base: &Board, targets: &[TargetOperation]) -> f64 {
+fn setup_score<'a>(
+    base: &Board,
+    targets: impl Iterator<Item = &'a TargetOperation> + Clone,
+) -> f64 {
     let unsupported = targets
-        .iter()
+        .clone()
         .filter(|target| {
             !projected_poses(target, 0)
                 .into_iter()
@@ -2030,8 +2072,8 @@ fn setup_score(base: &Board, targets: &[TargetOperation]) -> f64 {
         })
         .count();
     let mut incoming = [0_u8; 7];
-    for a in targets {
-        for b in targets {
+    for a in targets.clone() {
+        for b in targets.clone() {
             if a.piece == b.piece {
                 continue;
             }
@@ -2053,13 +2095,13 @@ fn setup_score(base: &Board, targets: &[TargetOperation]) -> f64 {
     // empty board this favors narrow floor contacts before a low, wide skyline
     // greedily consumes all ten columns and forces several dependent pieces.
     let foundation_used = targets
-        .iter()
+        .clone()
         .flat_map(|target| target.cells.iter())
         .filter(|(x, y)| *y == 0 || base.occupied(*x as i8, *y as i8 - 1))
         .count();
     let remaining_foundation: usize = Piece::ALL
         .iter()
-        .filter(|piece| !targets.iter().any(|target| target.piece == **piece))
+        .filter(|piece| !targets.clone().any(|target| target.piece == **piece))
         .map(|piece| if *piece == Piece::O { 2 } else { 1 })
         .sum();
     -(unsupported as f64) * 18.0
@@ -2207,11 +2249,6 @@ fn bag_potential(board: &Board, used: u8) -> (u8, u16) {
     (singles, cells + fresh - u16::from(singles) * 10)
 }
 
-/// O contributes material but is never credited with a spin.
-fn remaining_bag_spins(board: &Board, used: u8) -> u8 {
-    bag_potential(board, used).0
-}
-
 fn quiet_first_covered(available: u8, reflected: bool) -> bool {
     let covered = if reflected { available | crate::supply::mirror_mask(available) } else { available };
     covered == ALL_PIECES
@@ -2259,7 +2296,7 @@ struct MinoBounds {
     best_bag_spins: u8,
     bag_alpha: f64,
     goal: u8,
-    budget: u16,
+    pace_minimum: u8,
     hard_piece_cap: u16,
 }
 
@@ -2271,7 +2308,13 @@ enum MinoCut { Cost, Selective }
 /// not a lower bound on the number of locks that a supply may actually need.
 fn mino_cut(board: &Board, used: u8, spins: u8, bounds: MinoBounds) -> Option<MinoCut> {
     if spins >= bounds.goal { return None; }
-    let (more, optimistic_cells) = bag_potential(board, used);
+    mino_cut_with_potential(spins, bag_potential(board, used), bounds)
+}
+
+fn mino_cut_with_potential(
+    spins: u8, (more, optimistic_cells): (u8, u16), bounds: MinoBounds,
+) -> Option<MinoCut> {
+    if spins >= bounds.goal { return None; }
     let upper = spins.saturating_add(more);
     if upper >= bounds.goal { return None; }
     let end = bounds.start_pieces + 7;
@@ -2279,17 +2322,25 @@ fn mino_cut(board: &Board, used: u8, spins: u8, bounds: MinoBounds) -> Option<Mi
     let after = left.max((left * 10).saturating_sub(optimistic_cells).div_ceil(4));
     if end.saturating_add(after) > bounds.hard_piece_cap { return Some(MinoCut::Cost); }
     if delta_lag(spins, bounds.best_bag_spins, more)
-        || pace_cut(upper, end, bounds.goal, bounds.budget)
+        || upper < bounds.pace_minimum
         || (bounds.start_pieces != 0 && f64::from(upper) + 0.95 <= bounds.bag_alpha)
     { return Some(MinoCut::Selective); }
     None
 }
 
-/// A selective alpha window among actual prefixes with identical inventory.
-/// These are proposal references, never an impossibility or P7 certificate.
-fn prefix_dominated(windows: &[[f64; 7]], used: u8, gain: u8, quality: f64) -> bool {
-    windows[used as usize].iter().skip(usize::from(gain) + 1)
-        .any(|&better| better > quality)
+/// Pace is monotone in actual spin count. Cache this exact integer threshold
+/// once per bag/horizon, rather than repeat interpolation at every placement.
+fn min_pace_spins(goal: u8, pieces: u16, budget: u16) -> u8 {
+    let (mut low, mut high) = (0, goal);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if pace_cut(middle, pieces, goal, budget) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 /// The quality contribution is strictly below 0.95. This shortcut only skips
@@ -2416,8 +2467,9 @@ fn productive_rounds(
     spins: u8, pieces: u16, last_gain: u8, future_spins: u8,
     stale: u32, goal: u8, budget: u16,
 ) -> u32 {
-    // Strong piece-level cuts should leave enough work for surviving branches,
-    // including a quiet reconstruction before a productive following bag.
+    // Fresh productive boundaries keep substantial work after piece-level cuts.
+    // Repeated unsuccessful generations do not retain this minimum lease.
+    if stale >= 4 { return 1; }
     if pieces <= 7 { return 2 + u32::from(future_spins != 0 && stale < 2); }
     let rounds = focused_rounds(last_gain, future_spins.min(1), stale).clamp(3, 8);
     if under_pace(spins, pieces, goal, budget) { rounds.min(4) } else { rounds }
@@ -2613,7 +2665,7 @@ impl SearchSession {
                 // Imported or newly verified maxima take effect on the next
                 // work slice, including a generation already in flight.
                 job.best_bag_spins = self.best_spins_by_bag[(job.start_pieces as usize / 7) + 1];
-                job.prune_budget = self.proposal_budget(job.pace_fallback);
+                job.set_prune_budget(self.goal, self.proposal_budget(job.pace_fallback));
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
                 let prior_selective = job.selective_pruned;
@@ -2920,7 +2972,8 @@ impl SearchSession {
         let node = &self.tree[index];
         if self.node_quality_dominated(index) { return 1; }
         productive_rounds(node.spins, node.pieces, self.last_bag_spins(index),
-            node.future.spins, stale, self.goal, self.preferred_pace_budget())
+            node.future.spins, if index == 0 { 0 } else { stale }, self.goal,
+            self.preferred_pace_budget())
     }
 
     /// Peers share only verified performance benchmarks. These selective hints
@@ -3033,10 +3086,16 @@ impl SearchSession {
             self.first_bag_minimum().max(if self.config.ignore_first_bag_probability { 1 }
                 else { required_success(&[], self.config.min_success_percent) })
         } else { required_success(self.counted_counts(&self.tree[parent].counts), self.config.min_success_percent) };
-        // Re-search only selected boundaries more broadly; siblings start cheap.
-        let narrow = pace_fallback || self.node_quality_dominated(parent);
+        let stale = attempt.saturating_sub(self.tree[parent].last_improved_attempt);
+        // Failed attempts alone do not earn a wider retry. Fresh productive
+        // boundaries keep the full width; stale ones retain only a narrow probe.
+        let narrow = pace_fallback || self.node_quality_dominated(parent)
+            || (parent != 0 && stale >= 4);
+        let productive = self.last_bag_spins(parent) >= 2
+            || self.tree[parent].best_extension_spins >= 2;
         let stage = if narrow { 0 }
-            else { (1 + attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2) };
+            else if parent == 0 { (1 + attempt / 4).min(2) }
+            else { 1 + u32::from(productive) };
         let width = (self.config.beam_width >> (2 - stage)).max(4);
         let setup = parent == 0 && attempt % 4 != 3;
         let mut generation = GenerationJob::new(
@@ -3058,7 +3117,7 @@ impl SearchSession {
             .map(|(spins, &quality)| spin_rank(spins as u8, quality))
             .fold(f64::NEG_INFINITY, f64::max);
         generation.hard_piece_cap = self.cost_cap();
-        generation.prune_budget = self.proposal_budget(pace_fallback);
+        generation.set_prune_budget(self.goal, self.proposal_budget(pace_fallback));
         generation.pace_fallback = pace_fallback;
         // Quiet placements must remain supply-safe even when start probability
         // is excluded and its numeric floor is disabled.
@@ -3686,7 +3745,7 @@ impl SearchSession {
         let selective_search = serde_json::json!({
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
                 "paceNearSlack": PACE_NEAR_SLACK, "paceDistanceSlack": PACE_DISTANCE_SLACK,
-                "paceModel": "LowerSaoSarcelleEnvelope;17BagHorizonInterpolation;ReferenceGoal40",
+                "paceModel": "LowerPreLoopSaoSarcelle;SaoFromBag10;17BagHorizonInterpolation;ReferenceGoal40",
                 "paceReferenceCumulativeSpins": PACE_REFERENCE,
                 "paceIncludesSetup": true,
                 "qualityResearchInterval": 0, "qualityPruned": self.quality_pruned,
@@ -3694,10 +3753,16 @@ impl SearchSession {
                 "minoSelectivePruned": self.mino_selective_pruned,
                 "minoCapacityPruned": self.mino_capacity_pruned,
                 "minoBoundMeaning": "necessaryWholeBagCostOrQuietFirstAvailability;possibleTerminalPrefixExempt",
-                "minoSelectiveMeaning": "optimisticBagEndPaceAndRank;sameInventoryActualSpinAndQualityWindow",
+                "minoSelectiveMeaning": "optimisticBagEndPaceAndRank;sameParentAndNextPieceSpinQualityCapacitySupplyWindow",
                 "minoCapacityMeaning": "cannotEnterCurrentBoundedProposalBucket;notGlobalImpossibility",
-                "minoPruning": "rowDeficitUpper;wholeBagPaceUpper;sameInventoryPrefixWindow;boundedBeamAdmission",
+                "minoPruning": "rowDeficitUpper;wholeBagPaceUpper;samePieceSiblingWindow;boundedBeamAdmission",
                 "normalGenerationRounds": [3, 8],
+                "staleGenerationRounds": 1,
+                "staleAfterUnimprovedAttempts": 4,
+                "generationInventory": "AllSevenFromBagStart;principalContinuationOrdersOnly",
+                "siblingWindow": "SameParentNextPiece;noLessActualOrOptimisticSpins;supplyMaskSuperset;samePursuit",
+                "equalSpinSiblingQualityMargin": 24,
+                "proposalScope": "FastSurfaceAndWitnessedSingles;periodicBroadSonicLocks;notExhaustive",
                 "qualityReferencesSurviveBudgetWidening": true,
                 "qualityPreparationRounds": 1,
                 "preferredPaceBudget": self.preferred_pace_budget(),

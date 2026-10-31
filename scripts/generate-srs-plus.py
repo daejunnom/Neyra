@@ -4,7 +4,8 @@
 No network access or JavaScript execution is needed. The fixture is extracted
 by Clearra's scripts/tools/extract-tetrio-srs-plus.py from a separately pinned
 TETR.IO bundle. Keep this generator, its fixture and its Rust output together.
-Use --check in CI to detect stale or manually edited generated data.
+Use --check only when changing the fixture, generator, or rotation semantics.
+Unrelated search and display changes do not need another source-authority audit.
 """
 
 import argparse

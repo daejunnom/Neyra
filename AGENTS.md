@@ -9,9 +9,12 @@
   Neyra consumes the same reviewed fixture through scripts/generate-srs-plus.py.
   Do not maintain a second handwritten kick table or silently change the
   interpretation of O rotations and I half turns.
-- Use focused verification for the changed behavior. Check generated rule data
-  with `python3 scripts/generate-srs-plus.py --check` and use the committed
-  lockfiles when testing Rust and building the Svelte/WASM site.
+- Use focused verification for the changed behavior and committed lockfiles.
+  Repeat SRS+ authority checks only when the fixture, generator, or rotation
+  semantics change. Keep one-time audits, new experiment scripts and their
+  results outside the repository; do not run unchanged physics/supply suites
+  for a search-order, terrain-weight or display-only edit. The Pages gate keeps
+  one actual search execution check plus type checking and the production build.
 - The user has authorized the assistant to deploy completed requested Neyra
   changes. After verification, publish the normal non-force main update, follow
   the existing Test and deploy Pages workflow, and verify the deployed result.
@@ -102,12 +105,22 @@
   O supplies cells but is never a finisher. Do not confuse that optimistic
   capacity with proof that any spin is reachable. Within-bag pace compares the
   optimistic bag-end total, not an interpolated quota on the current lock.
-  Prefix spin/quality comparisons must use the same remaining inventory.
+  Selective prefix spin/quality comparisons must use the same exact parent
+  and next piece, with no weaker supply mask or optimistic spin capacity.
+  Inventory buckets remain bounded-beam capacity limits, not cross-parent
+  dominance proofs. Begin every bag with all seven labels available; a prior
+  continuation may order placements, never consume a mandatory prefix.
   Keep necessary cost cuts, selective pace/rank cuts and bounded-beam admission
   distinct. None of the latter proves a board impossible or a P7 supply failed.
-  Pace uses the lower SAO/Sarcelle diagram envelope over 17 bags, scaled to the
-  selected goal and horizon, with slack 2 + remaining/horizon. The diagrams are
-  progress references, not certificates for the clear-only hold policy.
+  Pace uses the lower SAO/Sarcelle envelope through bag 9 and the continuous SAO
+  route from bag 10, scaled to the selected goal and horizon, with slack
+  1 + remaining/horizon. Sarcelle's loop rebuild must not grant additional
+  preparation allowance. The diagrams are progress references, not certificates
+  for the clear-only hold policy.
+- Four rounds without improvement reduce a non-root boundary's next lease
+  to one narrow generation. Failed retries alone must not widen its frontier;
+  productive or improved boundaries retain larger budgets. Fresh root
+  foundations keep their separate exploration allowance.
 - Increase unexplained-hole cost only as a static ordering preference. Only an
   actual spin witness may exempt its required-empty cells from the extra 0.5
   cost; a speculative goal cannot claim that exemption. Preserve open channels
@@ -123,7 +136,7 @@
 - Worker lanes partition first-placement proposals, not every complete build.
   Preserve independent P7 certificates, compact progress, correct replay
   ownership, manual worker preferences and all-worker pause/cancel semantics.
-- Default to the latest retained route and render a monochrome board without
+- Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
   Keep desktop controls within an ordinary Chrome viewport and label an exact

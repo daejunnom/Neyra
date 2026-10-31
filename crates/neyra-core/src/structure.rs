@@ -72,6 +72,10 @@ pub(crate) struct BoardFacts {
     service_air: CellMask,
     obstructed_cells: CellMask,
     workspace_roof_top: u8,
+    lower_floor: u8,
+    lower_narrow: [u16; 3],
+    lower_slits: [u16; 3],
+    workspace_reward: f64,
 }
 
 impl BoardFacts {
@@ -100,6 +104,14 @@ impl BoardFacts {
             service_air: [0; HEIGHT],
             obstructed_cells: [0; HEIGHT],
             workspace_roof_top: 0,
+            lower_floor: board
+                .rows
+                .iter()
+                .position(|row| *row != 0 && *row != FULL_ROW)
+                .unwrap_or(0) as u8,
+            lower_narrow: [0; 3],
+            lower_slits: [0; 3],
+            workspace_reward: 0.0,
         };
         for x in 0..WIDTH {
             let bit = 1 << x;
@@ -167,13 +179,16 @@ impl BoardFacts {
         let mut reached = [0_u16; HEIGHT];
         let mut queue = [0_u8; WIDTH * HEIGHT];
         let (mut read, mut len) = (0, 0);
-        let top = HEIGHT - 2;
+        // Every row above the skyline is empty. Mark its stencils together
+        // and start the flood at the skyline, avoiding a repeated traversal
+        // of the unchanged sky. Near the real ceiling keep the original seed.
+        let top = (self.height as usize).min(HEIGHT - 2);
         if self.hole_count == 0 {
             // With no overhang every free column extends to the sky, so every
             // fitting stencil has a direct vertical route. Avoid the flood.
             reached = slots;
         } else {
-            reached[top] = slots[top];
+            reached[top..HEIGHT - 1].copy_from_slice(&slots[top..HEIGHT - 1]);
         }
         if self.hole_count != 0 && reached[top] != 0 {
             queue[len] = top as u8;
@@ -235,6 +250,22 @@ impl BoardFacts {
                 self.obstructed_cells[y] = board.rows[y];
                 self.obstructed_mass += board.rows[y].count_ones() as u16;
             }
+            let level = y.saturating_sub(self.lower_floor as usize);
+            if y >= self.lower_floor as usize && level < 3 {
+                let mut gaps = free[y];
+                while gaps != 0 {
+                    let left = gaps.trailing_zeros();
+                    let width = (gaps >> left).trailing_ones();
+                    let run = ((1_u16 << width) - 1) << left;
+                    gaps &= !run;
+                    if width <= 2 && two_banks(board.rows[y], run) {
+                        self.lower_narrow[level] |= run;
+                        if width == 1 {
+                            self.lower_slits[level] |= run;
+                        }
+                    }
+                }
+            }
         }
         let mut best = f64::NEG_INFINITY;
         for y in 0..self.height as usize {
@@ -249,7 +280,8 @@ impl BoardFacts {
                 }
                 let mut connected = columns;
                 let mut depth = 1;
-                for above in y + 1..self.height as usize {
+                // Only the first four connected levels affect ordering.
+                for above in y + 1..(y + 4).min(self.height as usize) {
                     let mut alternatives = self.body_air[above];
                     let mut next = 0;
                     while alternatives != 0 {
@@ -271,16 +303,20 @@ impl BoardFacts {
                     connected = next;
                     depth += 1;
                 }
-                // A four-cell mouth is only slightly preferred to the common
-                // three-cell spin pocket. Wider is not unboundedly better.
-                let value =
-                    depth.min(4) as f64 * 2.0 - opening_width_cost(width as u8) - y as f64 * 0.05;
+                // A wide mouth high above an unresolved bottom is not a
+                // usable low working pocket. Reward only body-clearance
+                // connected openings near the lowest unfinished row.
+                let level = y.saturating_sub(self.lower_floor as usize);
+                let reward = lower_weight(level)
+                    * (opening_width_reward(width as u8) + (depth - 1) as f64 * 0.6);
+                let value = reward - level as f64 * 0.4;
                 if value > best {
                     best = value;
                     self.workspace_columns = columns;
                     self.workspace_width = width as u8;
                     self.workspace_depth = depth as u8;
                     self.workspace_roof_top = (y + 4).min(HEIGHT) as u8;
+                    self.workspace_reward = reward;
                 }
             }
         }
@@ -292,12 +328,27 @@ impl BoardFacts {
             .sum()
     }
 
+    fn lower_gap_cost(&self, witnessed_goal: Option<&SingleGoal>) -> f64 {
+        (0..3)
+            .map(|level| {
+                let y = self.lower_floor as usize + level;
+                let protected = witnessed_goal
+                    .filter(|_| y < HEIGHT)
+                    .map_or(0, |goal| goal.required_empty[y]);
+                let narrow = self.lower_narrow[level] & !protected;
+                let slit = self.lower_slits[level] & !protected;
+                lower_weight(level)
+                    * (narrow.count_ones() as f64 * 0.8 + slit.count_ones() as f64 * 1.2)
+            })
+            .sum()
+    }
+
     // Flood only buried cells. Any adjacent empty non-hole cell has an open
     // vertical path to the ceiling, so a second whole-board air flood is unneeded.
     fn find_components(&mut self, board: &Board) {
         let mut visited = [0_u16; HEIGHT];
         let mut queue = [(0_u8, 0_u8); WIDTH * HEIGHT];
-        for y in 0..HEIGHT {
+        for y in 0..self.height as usize {
             let mut starts = self.holes[y] & !visited[y];
             while starts != 0 {
                 let x = starts.trailing_zeros() as usize;
@@ -350,7 +401,7 @@ impl BoardFacts {
             .sum()
     }
 
-    /// Defect ordering only. Enclosures and almost-full rows earn no reward.
+    /// Static workspace and defect ordering, not a spin-feasibility claim.
     pub(crate) fn score(&self) -> f64 {
         self.terrain_score(None)
     }
@@ -397,7 +448,8 @@ impl BoardFacts {
             + (self.height as f64).powi(2) * 0.06
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
-            + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35;
+            + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35
+            + self.lower_gap_cost(if witnessed { goal } else { None });
         let usable_goal =
             goal.filter(|g| witnessed || self.goal_access_cost(&g.required_empty) == 0);
         let dynamic = (self.workspace_columns != 0).then_some((
@@ -441,20 +493,10 @@ impl BoardFacts {
             };
             sum + above * above
         });
-        let opening_cost = if self.workspace_width == 0 {
-            0.0
-        } else {
-            opening_width_cost(self.workspace_width)
-                + 3_u8.saturating_sub(self.workspace_depth) as f64 * 0.6
-        };
         let skyline = (linear as f64 * 0.08 + squared as f64 * 0.012 + surface_fragmentation)
             .min(SKYLINE_PREFERENCE_LIMIT);
-        -defects
-            - skyline
-            - repair_pressure
-            - rim_pressure as f64 * 0.45
-            - excess as f64 * 0.10
-            - opening_cost
+        -defects - skyline - repair_pressure - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
+            + self.workspace_reward
     }
 
     /// Ordinary bank steps only affect the capped skyline preference. Large
@@ -537,13 +579,23 @@ fn two_banks(row: u16, opening: u16) -> bool {
     row & ((1_u16 << left) - 1) != 0 && row & (FULL_ROW << right) != 0
 }
 
-fn opening_width_cost(width: u8) -> f64 {
+fn lower_weight(level: usize) -> f64 {
+    match level {
+        0 => 1.0,
+        1 => 0.6,
+        2 => 0.3,
+        _ => 0.0,
+    }
+}
+
+fn opening_width_reward(width: u8) -> f64 {
     match width {
-        4 => 0.0,
-        3 => 0.6,
-        5 => 1.8,
-        2 => 3.6,
-        _ => (width.abs_diff(4) as f64).powi(2) * 1.35,
+        4 => 4.8,
+        3 => 4.2,
+        5 => 3.2,
+        6 => 2.4,
+        2 => -2.4,
+        _ => 0.0,
     }
 }
 
@@ -1042,6 +1094,7 @@ pub(crate) fn single_goals_for(
             let rank = (
                 debt(board, &filled, clauses.slice()) * 4
                     + facts.goal_access_cost(&empty) * 8
+                    + u16::from(clear_row.saturating_sub(facts.lower_floor.saturating_add(1))) * 3
                     + goal_profile_cost(pose, profile, facts.workspace_columns),
                 support_height(clauses.slice(), &heights),
                 clear_row,

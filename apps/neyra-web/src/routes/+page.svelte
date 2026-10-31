@@ -5,6 +5,7 @@
   import Icon from '$lib/Icon.svelte';
   import { SearchClient, spinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
   import { encodeBuildDocument } from '$lib/exportFormats';
+  import { createPiecePlayback } from '$lib/buildDocument';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
   import './styles.css';
 
@@ -46,6 +47,7 @@
 
   const number = new Intl.NumberFormat('ko-KR');
   const compactNumber = new Intl.NumberFormat('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
+  const piecePlayback = createPiecePlayback();
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
   $: conditionalProbability = (snapshot !== null || hasSession ? runConfig : config).ignore_first_bag_probability;
@@ -56,6 +58,7 @@
   $: selectedIndex = frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
   $: frame = frames[selectedIndex];
   $: boardRows = frame?.rows ?? candidate?.rows ?? [];
+  $: boardColors = piecePlayback(frames, selectedIndex);
   $: boardSpins = frame?.spins ?? candidate?.spins ?? 0;
   $: boardPlaced = frame?.placed ?? candidate?.placed ?? 0;
   $: verifying = status === 'running' && snapshot?.phase === 'verifying';
@@ -342,7 +345,7 @@
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} ariaLabel={view === 'best' ? '최신 경로 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최신 경로 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
         <div class="field-summary">
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>

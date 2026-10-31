@@ -11,6 +11,7 @@ type WorkerSlot = {
   watching: boolean;
 };
 type OwnedCandidate = { slot: WorkerSlot; candidate: Candidate };
+type ArchivedCandidate = OwnedCandidate & { data: unknown };
 
 export const MAX_WORKERS = 128;
 
@@ -42,9 +43,9 @@ export function betterComplete(a: Candidate, b: Candidate): boolean {
     (atBudget(a) > atBudget(b) || (atBudget(a) === atBudget(b) && a.probability > b.probability)));
 }
 
-/** Certified unfinished routes use the same bounded spin-first score as Rust. */
+/** The displayed record uses actual spins, independently of search evaluation. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
-  return a.rankingScore > b.rankingScore || (a.rankingScore === b.rankingScore &&
+  return a.spins > b.spins || (a.spins === b.spins &&
     (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)));
 }
 
@@ -63,6 +64,10 @@ export class SearchClient {
   private progressTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingExports = new Map<string, { owner: number; view: CandidateView }>();
   private pendingDetails = new Map<number, { requestId: string }>();
+  private partialPeak: OwnedCandidate | null = null;
+  private partialArchive: ArchivedCandidate | null = null;
+  private pendingPartialArchive: { requestId: string; owner: number; candidateId: string } | null = null;
+  private rejectedPartialArchives = new Set<string>();
 
   constructor(private receive: (event: EngineEvent) => void) {}
 
@@ -152,8 +157,13 @@ export class SearchClient {
       this.receive({ type: 'export', runId: this.runId, requestId, data: owner.slot.incumbent.data });
       return;
     }
+    if (selection === 'partial' && this.partialArchive?.slot.id === owner.slot.id &&
+        this.partialArchive.candidate.id === owner.candidate.id) {
+      this.receive({ type: 'export', runId: this.runId, requestId, data: this.partialArchive.data });
+      return;
+    }
     if (owner.slot.status === 'failed') {
-      this.receive({ type: 'warning', runId: this.runId, message: '이 작업의 현재 후보를 저장할 수 없어요. 보관된 완주 결과는 계속 저장할 수 있습니다.' });
+      this.receive({ type: 'warning', runId: this.runId, message: '이 경로의 기록을 받기 전에 탐색기가 중단됐어요. 이미 보관한 결과는 계속 저장할 수 있습니다.' });
       return;
     }
     this.pendingExports.set(requestId, { owner: owner.slot.id, view: selection });
@@ -167,6 +177,10 @@ export class SearchClient {
     this.slots = [];
     this.pendingExports.clear();
     this.pendingDetails.clear();
+    this.partialPeak = null;
+    this.partialArchive = null;
+    this.pendingPartialArchive = null;
+    this.rejectedPartialArchives.clear();
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
     this.intent = 'cancelled';
@@ -205,6 +219,29 @@ export class SearchClient {
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
     } else if (message.type === 'export' || message.type === 'export-error') {
+      const archive = this.pendingPartialArchive;
+      if (archive?.requestId === message.requestId) {
+        if (archive.owner !== slot.id) return;
+        this.pendingPartialArchive = null;
+        if (message.type === 'export') {
+          if (message.snapshot) this.updateSnapshot(slot, message.snapshot);
+          const candidate = (message.data as { candidate?: Candidate } | null)?.candidate;
+          if (candidate?.verified && candidate.qualified && !candidate.complete &&
+              candidate.frames.length === candidate.frameCount) {
+            // The engine can improve between request and reply. Keep that newer
+            // certificate, but a late reply cannot overwrite a higher record.
+            if (!this.partialArchive || betterPartial(candidate, this.partialArchive.candidate)) {
+              this.partialArchive = { slot, candidate, data: message.data };
+            }
+          } else {
+            this.rejectedPartialArchives.add(`${slot.id}:${archive.candidateId}`);
+          }
+        } else {
+          this.rejectedPartialArchives.add(`${slot.id}:${archive.candidateId}`);
+        }
+        this.publishProgress(true);
+        return;
+      }
       const request = this.pendingExports.get(message.requestId);
       if (!request || request.owner !== slot.id) return;
       this.pendingExports.delete(message.requestId);
@@ -227,6 +264,7 @@ export class SearchClient {
     slot.status = 'failed';
     slot.worker.terminate();
     this.pendingDetails.delete(slot.id);
+    if (this.pendingPartialArchive?.owner === slot.id) this.pendingPartialArchive = null;
     for (const [requestId, request] of this.pendingExports) {
       if (request.owner === slot.id) this.pendingExports.delete(requestId);
     }
@@ -273,13 +311,32 @@ export class SearchClient {
   }
 
   private partialOwner(): OwnedCandidate | null {
-    let best: OwnedCandidate | null = null;
+    let best = this.partialPeak;
     for (const slot of this.slots) {
       const candidate = slot.snapshot?.bestPartial;
-      if (slot.status !== 'failed' && candidate?.verified && candidate.qualified && !candidate.complete &&
-          (!best || betterPartial(candidate, best.candidate))) best = { slot, candidate };
+      if (candidate?.verified && candidate.qualified && !candidate.complete &&
+          (!best || betterPartial(candidate, best.candidate) ||
+            (best.slot.id === slot.id && best.candidate.id === candidate.id &&
+              best.candidate.spins === candidate.spins && best.candidate.placed === candidate.placed &&
+              best.candidate.probability === candidate.probability &&
+              candidate.frames.length >= best.candidate.frames.length))) best = { slot, candidate };
     }
+    const archived = this.partialArchive;
+    if (archived && (!best || betterPartial(archived.candidate, best.candidate) ||
+        (best.slot.id === archived.slot.id && best.candidate.id === archived.candidate.id))) best = archived;
+    this.partialPeak = best;
     return best;
+  }
+
+  private archivePartial(item: OwnedCandidate | null) {
+    if (!item || item.slot.status === 'failed' || this.pendingPartialArchive ||
+        (this.partialArchive && !betterPartial(item.candidate, this.partialArchive.candidate)) ||
+        this.rejectedPartialArchives.has(`${item.slot.id}:${item.candidate.id}`)) return;
+    const requestId = crypto.randomUUID();
+    this.pendingPartialArchive = { requestId, owner: item.slot.id, candidateId: item.candidate.id };
+    // Archive only the new global record. Ordinary progress stays compact and
+    // this internal request never triggers a download in the user's browser.
+    item.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: 'partial' } satisfies EngineCommand);
   }
 
   private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
@@ -306,7 +363,7 @@ export class SearchClient {
   }
 
   private requestPartialDetail(item: OwnedCandidate | null) {
-    if (!item || item.candidate.frames.length >= item.candidate.frameCount || this.pendingDetails.has(item.slot.id)) return;
+    if (!item || item.slot.status === 'failed' || item.candidate.frames.length >= item.candidate.frameCount || this.pendingDetails.has(item.slot.id)) return;
     const requestId = crypto.randomUUID();
     this.pendingDetails.set(item.slot.id, { requestId });
     item.slot.worker.postMessage({ type: 'detail', runId: this.runId, requestId } satisfies EngineCommand);
@@ -347,7 +404,10 @@ export class SearchClient {
     const best = this.bestOwner();
     const partial = this.partialOwner();
     this.watchCurrentOwner(current?.slot.id);
-    if (!best) this.requestPartialDetail(partial);
+    if (!best) {
+      this.archivePartial(partial);
+      if (!this.pendingPartialArchive) this.requestPartialDetail(partial);
+    }
     const sum = (read: (value: SearchSnapshot) => number) => values.reduce((value, next) => value + read(next), 0);
     const max = (read: (value: SearchSnapshot) => number) => Math.max(0, ...values.map(read));
     const selected = current?.slot.snapshot;
@@ -361,6 +421,7 @@ export class SearchClient {
       qualifiedBags: max((value) => value.qualifiedBags ?? 0),
       qualifiedSpins: max((value) => value.qualifiedSpins ?? 0),
       pruned: sum((value) => value.pruned ?? 0),
+      selectivePruned: sum((value) => value.selectivePruned ?? 0),
       duplicates: sum((value) => value.duplicates ?? 0),
       bags: selected?.bags ?? 0,
       checked: selected?.checked ?? 0,

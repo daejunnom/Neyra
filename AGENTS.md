@@ -1,7 +1,7 @@
 # Neyra development and delivery
 
 - Keep the user's fixed-bag, Sonic Drop, adjustable success threshold, and
-  minimum-lock objective. The 112-piece goal is an aspiration, not a rejection
+  minimum-lock objective. The default 119-piece goal is an aspiration, not a rejection
   threshold. The v2 design remains implementation work until its acceptance
   criteria are demonstrated by real search results.
 - The SRS+ authority is the ordered data and first-origin rotation behavior in
@@ -36,10 +36,18 @@
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
-- Intermediate ranking must preserve the bounded spin contract: field quality
+- Internal search ranking must preserve the bounded spin contract: field quality
   can reverse a one-spin difference, never a two-spin difference. Keep raw
   evaluation separate and normalize once; no bonuses after normalization.
   Temporary scheduling cooldowns must not change the archived best route.
+- The displayed partial record uses actual total spins, then fewer locks, then
+  higher probability; neither bag depth nor terrain score may lower it. Reset
+  only for a new run. Preserve each archived result's certificate ownership.
+- Productivity, pace and inaccessible-mass cuts are selective heuristics, not
+  impossibility proofs or exact P7 failures. Preserve real terminal prefixes,
+  widen a stalled soft budget, and do not cache heuristic misses as failures.
+  Static air clearance is not exact mino reachability; actual spin witnesses
+  may override its roof/access penalties. Keep code and documents explicit.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.

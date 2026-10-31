@@ -56,6 +56,8 @@ export interface SearchSnapshot {
   qualifiedBags: number;
   qualifiedSpins: number;
   pruned: number;
+  /** Selective productivity/terrain cuts, separate from proven bounds. */
+  selectivePruned?: number;
   duplicates?: number;
   bags: number;
   checked: number;
@@ -92,7 +94,7 @@ export type EngineCommand =
 
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
-  piece_goal: 112,
+  piece_goal: 119,
   max_pieces: 140,
   budget_start: 0,
   seed: 1,

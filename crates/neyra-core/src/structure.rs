@@ -47,6 +47,20 @@ pub(crate) struct BoardFacts {
     pub roughness: u16,
     pub height: u8,
     pub cells: u16,
+    /// Empty obligations without nearby two-cell body clearance. This is a
+    /// geometric warning, not an exact reachability or permanence claim.
+    pub access_deficit: u16,
+    /// Occupied cells on rows tied to those low-clearance obligations.
+    /// Clears and kicks can recover them; never use this as a proven bound.
+    pub obstructed_mass: u16,
+    /// A connected working opening chosen from the board, never fixed columns.
+    pub workspace_columns: u16,
+    pub workspace_width: u8,
+    pub workspace_depth: u8,
+    body_air: CellMask,
+    service_air: CellMask,
+    obstructed_cells: CellMask,
+    workspace_roof_top: u8,
 }
 
 impl BoardFacts {
@@ -65,6 +79,15 @@ impl BoardFacts {
             roughness: 0,
             height: board.height(),
             cells: board.cell_count(),
+            access_deficit: 0,
+            obstructed_mass: 0,
+            workspace_columns: 0,
+            workspace_width: 0,
+            workspace_depth: 0,
+            body_air: [0; HEIGHT],
+            service_air: [0; HEIGHT],
+            obstructed_cells: [0; HEIGHT],
+            workspace_roof_top: 0,
         };
         for x in 0..WIDTH {
             let bit = 1 << x;
@@ -97,7 +120,150 @@ impl BoardFacts {
             .map(|w| w[0].abs_diff(w[1]) as u16)
             .sum();
         facts.find_components(board);
+        facts.find_working_air(board);
         facts
+    }
+
+    /// Flood a two-by-two clearance stencil, not a point and not a mino.
+    /// The small fringe accommodates final spin tips and necessary roofs.
+    /// A stencil miss only lowers heuristic quality: rotation kicks and later
+    /// clears are deliberately left to the exact move/continuation verifier.
+    fn find_working_air(&mut self, board: &Board) {
+        let free: CellMask = std::array::from_fn(|y| FULL_ROW & !board.rows[y]);
+        let pairs: CellMask = std::array::from_fn(|y| free[y] & (free[y] >> 1));
+        let slots: CellMask = std::array::from_fn(|y| {
+            if y + 1 < HEIGHT {
+                pairs[y] & pairs[y + 1]
+            } else {
+                0
+            }
+        });
+        let mut reached = [0_u16; HEIGHT];
+        let mut queue = [0_u8; WIDTH * HEIGHT];
+        let (mut read, mut len) = (0, 0);
+        let top = HEIGHT - 2;
+        if self.hole_count == 0 {
+            // With no overhang every free column extends to the sky, so every
+            // fitting stencil has a direct vertical route. Avoid the flood.
+            reached = slots;
+        } else {
+            reached[top] = slots[top];
+        }
+        if self.hole_count != 0 && reached[top] != 0 {
+            queue[len] = top as u8;
+            len += 1;
+        }
+        while read < len {
+            let y = queue[read] as usize;
+            read += 1;
+            let mut row = reached[y];
+            loop {
+                let expanded = row | ((row << 1 | row >> 1) & slots[y]);
+                if row == expanded {
+                    break;
+                }
+                row = expanded;
+            }
+            reached[y] = row;
+            for adjacent in [y.checked_sub(1), (y + 1 < HEIGHT - 1).then_some(y + 1)] {
+                if let Some(next) = adjacent {
+                    let added = row & slots[next] & !reached[next];
+                    if added != 0 {
+                        reached[next] |= added;
+                        // Every enqueue adds at least one of the <240 slots.
+                        queue[len] = next as u8;
+                        len += 1;
+                    }
+                }
+            }
+        }
+        for (y, &row) in reached.iter().enumerate().take(HEIGHT - 1) {
+            let cells = row | row << 1;
+            self.body_air[y] |= cells;
+            self.body_air[y + 1] |= cells;
+        }
+        self.service_air = self.body_air;
+        for _ in 0..2 {
+            let previous = self.service_air;
+            for y in 0..HEIGHT {
+                let vertical = if y > 0 { previous[y - 1] } else { 0 }
+                    | if y + 1 < HEIGHT { previous[y + 1] } else { 0 };
+                self.service_air[y] =
+                    (previous[y] | previous[y] << 1 | previous[y] >> 1 | vertical)
+                        & free[y]
+                        & !self.sealed[y];
+            }
+        }
+        for y in 0..self.height as usize {
+            // Buried cavities and long, narrow shafts both need a specific
+            // access plan. Broad empty space beside one bank is not bad mass.
+            let constrained = self.holes[y]
+                | if board.rows[y].count_ones() >= 6 {
+                    free[y]
+                } else {
+                    0
+                };
+            let deficit = constrained & !self.service_air[y];
+            self.access_deficit += deficit.count_ones() as u16;
+            if deficit != 0 {
+                self.obstructed_cells[y] = board.rows[y];
+                self.obstructed_mass += board.rows[y].count_ones() as u16;
+            }
+        }
+        let mut best = f64::NEG_INFINITY;
+        for y in 0..self.height as usize {
+            let mut air = self.body_air[y];
+            while air != 0 {
+                let left = air.trailing_zeros() as usize;
+                let width = (air >> left).trailing_ones() as usize;
+                let columns = ((1_u16 << width) - 1) << left;
+                air &= !columns;
+                if !(2..=6).contains(&width) || !two_banks(board.rows[y], columns) {
+                    continue;
+                }
+                let mut connected = columns;
+                let mut depth = 1;
+                for above in y + 1..self.height as usize {
+                    let mut alternatives = self.body_air[above];
+                    let mut next = 0;
+                    while alternatives != 0 {
+                        let start = alternatives.trailing_zeros() as usize;
+                        let span = (alternatives >> start).trailing_ones() as usize;
+                        let run = ((1_u16 << span) - 1) << start;
+                        alternatives &= !run;
+                        if span <= 6
+                            && (run & connected).count_ones() >= 2
+                            && two_banks(board.rows[above], run)
+                        {
+                            next = run;
+                            break;
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    connected = next;
+                    depth += 1;
+                }
+                // A four-cell mouth is only slightly preferred to the common
+                // three-cell spin pocket. Wider is not unboundedly better.
+                let value =
+                    depth.min(4) as f64 * 2.0 - opening_width_cost(width as u8) - y as f64 * 0.05;
+                if value > best {
+                    best = value;
+                    self.workspace_columns = columns;
+                    self.workspace_width = width as u8;
+                    self.workspace_depth = depth as u8;
+                    self.workspace_roof_top = (y + 4).min(HEIGHT) as u8;
+                }
+            }
+        }
+    }
+
+    fn goal_access_cost(&self, goal: &CellMask) -> u16 {
+        (0..HEIGHT)
+            .map(|y| (goal[y] & !self.service_air[y]).count_ones() as u16)
+            .sum()
     }
 
     // Flood only buried cells. Any adjacent empty non-hole cell has an open
@@ -169,17 +335,48 @@ impl BoardFacts {
     /// exemption ends one support cell above the goal's highest actual cell.
     /// This is an ordering preference, never a reachability certificate.
     pub(crate) fn terrain_score(&self, goal: Option<&SingleGoal>) -> f64 {
+        self.terrain_score_inner(goal, false)
+    }
+
+    /// Only an actually executed spin may override the clearance relaxation.
+    /// Its required roof is preserved even when no 2x2 stencil can reach it.
+    pub(crate) fn terrain_score_witnessed(&self, goal: Option<&SingleGoal>) -> f64 {
+        self.terrain_score_inner(goal, true)
+    }
+
+    fn terrain_score_inner(&self, goal: Option<&SingleGoal>, witnessed: bool) -> f64 {
+        let witnessed_access = if witnessed {
+            goal.map_or(0, |g| self.goal_access_cost(&g.required_empty))
+        } else {
+            0
+        };
+        let witnessed_mass = if witnessed {
+            goal.map_or(0, |g| {
+                self.obstructed_cells[g.clear_row as usize].count_ones() as u16
+            })
+        } else {
+            0
+        };
         let defects = self.hole_count as f64 * 2.0
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
             + self.cover_depth as f64 * 0.25
             + self.split_gaps as f64 * 2.0
             + (self.height as f64).powi(2) * 0.06
-            + self.cells as f64 * 0.04;
-        let Some((working, roof_top)) = goal.and_then(working_region) else {
+            + self.cells as f64 * 0.04
+            + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
+            + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35;
+        let usable_goal =
+            goal.filter(|g| witnessed || self.goal_access_cost(&g.required_empty) == 0);
+        let dynamic = (self.workspace_columns != 0).then_some((
+            (self.workspace_columns | self.workspace_columns << 1 | self.workspace_columns >> 1)
+                & FULL_ROW,
+            self.workspace_roof_top,
+        ));
+        let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
             return -defects - self.roughness as f64 * 0.16;
         };
-        let footprint = goal.map_or(0, SingleGoal::working_columns);
+        let footprint = usable_goal.map_or(self.workspace_columns, SingleGoal::working_columns);
         let mut linear = 0_u16;
         let mut squared = 0_u16;
         for x in 0..WIDTH - 1 {
@@ -199,7 +396,33 @@ impl BoardFacts {
             };
             sum + above * above
         });
-        -defects - linear as f64 * 0.20 - squared as f64 * 0.045 - excess as f64 * 0.10
+        let opening_cost = if self.workspace_width == 0 {
+            0.0
+        } else {
+            opening_width_cost(self.workspace_width)
+                + 3_u8.saturating_sub(self.workspace_depth) as f64 * 0.6
+        };
+        -defects
+            - linear as f64 * 0.20
+            - squared as f64 * 0.045
+            - excess as f64 * 0.10
+            - opening_cost
+    }
+}
+
+fn two_banks(row: u16, opening: u16) -> bool {
+    let left = opening.trailing_zeros();
+    let right = 16 - opening.leading_zeros();
+    row & ((1_u16 << left) - 1) != 0 && row & (FULL_ROW << right) != 0
+}
+
+fn opening_width_cost(width: u8) -> f64 {
+    match width {
+        4 => 0.0,
+        3 => 0.6,
+        5 => 1.8,
+        2 => 3.6,
+        _ => (width.abs_diff(4) as f64).powi(2) * 1.35,
     }
 }
 
@@ -642,21 +865,28 @@ fn support_height(clauses: &[CellMask], heights: &[u8; WIDTH]) -> u16 {
 
 type GoalRank = (u16, u16, u8, Pose);
 
-fn goal_profile_cost(pose: Pose, profile: u8) -> u16 {
+fn goal_profile_cost(pose: Pose, profile: u8, opening: u16) -> u16 {
     let cells = pose.cells();
     let left = cells.iter().map(|p| p.0).min().unwrap();
     let right = cells.iter().map(|p| p.0).max().unwrap();
     let center_twice = left + right;
+    let (center, left_bias, right_bias) = if opening == 0 {
+        (9, 5, 13)
+    } else {
+        let start = opening.trailing_zeros() as i8;
+        let end = 15 - opening.leading_zeros() as i8;
+        (start + end, start * 2, end * 2)
+    };
     match profile % 4 {
         // Preferences participate before per-piece shortlisting. Applying
         // these after a shortlist dominated by wall-supported goals would
         // leave the workers exploring essentially the same geometry.
-        0 => center_twice.abs_diff(9) as u16 * 2,
-        1 => center_twice.abs_diff(5) as u16 * 2,
-        2 => center_twice.abs_diff(13) as u16 * 2,
+        0 => center_twice.abs_diff(center) as u16 * 2,
+        1 => center_twice.abs_diff(left_bias) as u16 * 2,
+        2 => center_twice.abs_diff(right_bias) as u16 * 2,
         // A wider working pocket, including horizontal I use, with a weak
         // central preference. No lane bans a displaced or narrower fallback.
-        _ => (4 - (right - left + 1)) as u16 * 5 + center_twice.abs_diff(9) as u16 / 3,
+        _ => (4 - (right - left + 1)) as u16 * 5 + center_twice.abs_diff(center) as u16 / 3,
     }
 }
 
@@ -676,13 +906,8 @@ pub(crate) fn single_goals_for(
     }
     let per_piece = limit.div_ceil(finishers).max(2);
     let mut pools: [Vec<(GoalRank, SingleGoal)>; 7] = std::array::from_fn(|_| Vec::new());
-    let heights = std::array::from_fn(|x| {
-        board
-            .rows
-            .iter()
-            .rposition(|row| row & (1 << x) != 0)
-            .map_or(0, |y| y as u8 + 1)
-    });
+    let facts = BoardFacts::new(board);
+    let heights = facts.heights;
     row_poses(board, inventory, true, |pose, clear_row, empty| {
         let mut filled = [0; HEIGHT];
         filled[clear_row as usize] = FULL_ROW & !empty[clear_row as usize];
@@ -694,7 +919,9 @@ pub(crate) fn single_goals_for(
                 return;
             }
             let rank = (
-                debt(board, &filled, clauses.slice()) * 4 + goal_profile_cost(pose, profile),
+                debt(board, &filled, clauses.slice()) * 4
+                    + facts.goal_access_cost(&empty) * 8
+                    + goal_profile_cost(pose, profile, facts.workspace_columns),
                 support_height(clauses.slice(), &heights),
                 clear_row,
                 pose,

@@ -18,6 +18,9 @@ use std::rc::Rc;
 
 const TARGET_SPINS: u8 = 40;
 const GRAPH_LIMIT: usize = 4096;
+const SPIN_DELTA: u8 = 3;
+const RESIDUE_MARGIN: u16 = 12;
+const BUDGET_STALE_ROUNDS: u64 = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,7 +49,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             min_success_percent: 100.0,
-            piece_goal: 112,
+            piece_goal: 119,
             max_pieces: 140,
             budget_start: 0,
             seed: 1,
@@ -180,6 +183,8 @@ pub struct ProgressSnapshot {
     pub best: Option<CandidateSummary>,
     pub best_partial: Option<CandidateSummary>,
     pub duplicates: u64,
+    /// Selective productivity/terrain cuts, never exact P7 failures.
+    pub selective_pruned: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -503,6 +508,72 @@ fn can_be_first(start: &Board, target: &TargetOperation) -> bool {
     })
 }
 
+/// Optimistic two-lock supply bound before a complete bag occupies a scarce
+/// refinement slot. Geometry and spin shape are necessary; input reachability
+/// is deliberately omitted. Each held/current/next triple represents 4! queues.
+fn geometric_two_lock_upper(
+    start: &Board,
+    targets: &[TargetOperation],
+    start_spins: u8,
+    goal: u8,
+) -> u16 {
+    let inventory = targets.iter().fold(0, |mask, target| mask | target.piece.bit());
+    // Early acceptance takes precedence over spawn. Leave terminal/partial
+    // plans to the exact graph instead of imposing two mandatory locks on them.
+    if targets.len() != 7 || inventory != ALL_PIECES || start_spins.saturating_add(2) >= goal {
+        return P7_COUNT as u16;
+    }
+    let mut second = [0_u8; 7];
+    let mut next_spawn = [0_u8; 7];
+    for first in targets {
+        let geometry = projected_poses(first, 0).into_iter().find_map(|pose| {
+            start.place_geometry(pose).filter(|result| {
+                result.lines == 0 || (result.lines == 1 && start.spin_at(pose))
+            })
+        });
+        let Some(geometry) = geometry else { continue };
+        let Some(deleted) = deleted_after(0, geometry.cleared_rows) else {
+            return P7_COUNT as u16;
+        };
+        let index = first.piece as usize;
+        next_spawn[index] = spawn_mask(&geometry.board);
+        // All valid projected orientations occupy the same cells and leave
+        // the same board; union spin eligibility before choosing that board.
+        for target in targets {
+            if target.piece == first.piece {
+                continue;
+            }
+            if projected_poses(target, deleted).into_iter().any(|pose| {
+                geometry.board.place_geometry(pose).is_some_and(|result| {
+                    result.lines == 0 || (result.lines == 1 && geometry.board.spin_at(pose))
+                })
+            }) {
+                second[index] |= target.piece.bit();
+            }
+        }
+    }
+    let initial_spawn = spawn_mask(start);
+    let mut prefixes = 0;
+    for held in 0..7 {
+        for current in 0..7 {
+            if held == current || initial_spawn & (1 << current) == 0 {
+                continue;
+            }
+            for next in 0..7 {
+                if next == held || next == current {
+                    continue;
+                }
+                let current_first = next_spawn[current] & (1 << next) != 0
+                    && second[current] & ((1 << held) | (1 << next)) != 0;
+                let held_first = next_spawn[held] & (1 << next) != 0
+                    && second[held] & ((1 << current) | (1 << next)) != 0;
+                prefixes += u16::from(current_first || held_first);
+            }
+        }
+    }
+    prefixes * 24
+}
+
 impl ExecutionGraph {
     fn new(plan: &Plan) -> Self {
         let key = ExecutionKey {
@@ -817,6 +888,8 @@ struct Continuation {
     paid: u16,
     spins: u8,
     anchor: Option<Rc<SingleGoal>>,
+    /// Obstruction left by this one replayed continuation, not an exact bound.
+    obstructed_mass: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -825,6 +898,7 @@ struct ProbeState {
     inventory: u8,
     debt: CellMask,
     quiet: u8,
+    quiet_since_spin: u8,
     spins: u8,
     placements: Vec<Placement>,
     pursuit: Option<Rc<SingleGoal>>,
@@ -844,7 +918,7 @@ enum ProbeTask {
 /// it never changes the exact P7 failure language or the cost lower bound.
 struct ContinuationProbe {
     tasks: Vec<ProbeTask>,
-    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>, u32, u8)>,
+    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>, u32, u8, u8)>,
     work: u16,
     debt_count: u16,
     base_score: f64,
@@ -863,6 +937,7 @@ impl ContinuationProbe {
                 inventory: ALL_PIECES,
                 debt,
                 quiet: 0,
+                quiet_since_spin: 0,
                 spins: 0,
                 placements: vec![],
                 pursuit: None,
@@ -894,13 +969,17 @@ impl ContinuationProbe {
         let Some(task) = self.tasks.pop() else { return };
         match task {
             ProbeTask::Expand(state) => {
-                if state.placements.len() >= 4 || state.inventory == 0 {
+                let lock_limit = if state.spins == 0 { 4 } else { 7 };
+                if state.placements.len() >= lock_limit || state.inventory == 0 {
                     return;
                 }
                 // A one- or two-piece preparation may create the corner,
                 // floor, or row cells needed by a final rotation. Looking only
                 // for currently grounded spin slots would miss these plans.
-                if state.quiet < 2 && state.placements.len() < 3 {
+                if state.quiet < 4
+                    && state.quiet_since_spin < 2
+                    && state.placements.len() + 1 < lock_limit
+                {
                     let goals = if let Some(goal) = &state.pursuit {
                         vec![Rc::clone(goal)]
                     } else {
@@ -1034,6 +1113,7 @@ impl ContinuationProbe {
         state.debt = remaining_cells(&map_after_clear(&state.debt, cleared_rows), &board);
         state.spins += u8::from(spin);
         state.quiet += u8::from(!spin);
+        state.quiet_since_spin = if spin { 0 } else { state.quiet_since_spin + 1 };
         state.placements.push(placement);
         state.pursuit = pursuit;
         if state.spins != 0 {
@@ -1058,7 +1138,12 @@ impl ContinuationProbe {
                     paid,
                     spins: state.spins,
                     anchor: state.anchor.clone(),
+                    obstructed_mass: Some(facts.obstructed_mass),
                 };
+                // Spend more only after an actual coherent spin witness.
+                // The total remains bounded even if many support tasks exist.
+                self.budget =
+                    (if self.profile == 3 { 96 } else { 64 }) + u16::from(state.spins.min(4)) * 32;
             }
         }
         let key = (
@@ -1068,6 +1153,7 @@ impl ContinuationProbe {
             state.pursuit.clone(),
             state.deleted,
             state.first_mask,
+            state.quiet_since_spin,
         );
         if !self.seen.contains(&key) {
             self.seen.push(key);
@@ -1152,6 +1238,9 @@ struct GenerationJob {
     lane: u16,
     lanes: u16,
     root_choice: usize,
+    best_bag_spins: u8,
+    selective_pruned: u64,
+    prune_budget: u16,
 }
 
 impl GenerationJob {
@@ -1258,6 +1347,9 @@ impl GenerationJob {
             lane,
             lanes,
             root_choice: 0,
+            best_bag_spins: 0,
+            selective_pruned: 0,
+            prune_budget: u16::MAX,
         }
     }
 
@@ -1267,6 +1359,17 @@ impl GenerationJob {
             return 0;
         }
         if self.state_index >= self.frontier.len() {
+            return 0;
+        }
+        let state = &self.frontier[self.state_index];
+        if delta_lag(
+            state.spins,
+            self.best_bag_spins,
+            remaining_bag_spins(&state.board, state.used),
+        ) {
+            self.state_index += 1;
+            self.piece_index = 0;
+            self.selective_pruned += 1;
             return 0;
         }
         let foundation_ready = !self.setup
@@ -1370,10 +1473,39 @@ impl GenerationJob {
                 continue;
             };
             let spins = state.spins + result.lines;
+            let used = state.used | piece.bit();
+            if spins < goal
+                && (delta_lag(
+                    spins,
+                    self.best_bag_spins,
+                    remaining_bag_spins(&result.board, used),
+                ) || (used == ALL_PIECES
+                    && selective_reason(
+                        result.board.cell_count(),
+                        0, // Obstruction is checked after its continuation witness.
+                        self.start_pieces + 7,
+                        spins,
+                        self.best_bag_spins,
+                        goal,
+                        self.prune_budget,
+                    )
+                    .is_some()))
+            {
+                self.selective_pruned += 1;
+                continue;
+            }
             let mut targets = state.targets.clone();
             let mut target_key = state.target_key;
             target_key[piece as usize] = target_code(&target);
             targets.push(target);
+            if used == ALL_PIECES
+                && !complete
+                && geometric_two_lock_upper(&self.start, &targets, self.start_spins, goal)
+                    < self.minimum_success
+            {
+                self.pruned += 1;
+                continue;
+            }
             let mut frames = state.frames.clone();
             frames.push(DisplayFrame {
                 rows: result.board.rows,
@@ -1384,7 +1516,12 @@ impl GenerationJob {
                 spin: result.spin,
             });
             let pursuit = if result.lines == 0 {
-                state.pursuit.clone()
+                state.pursuit.as_ref().and_then(|pursuit| {
+                    // Once a non-setup bag spends its intended finisher,
+                    // release that footprint and prepare another usable spin.
+                    (self.setup || (state.used | piece.bit()) & pursuit.pose.piece.bit() == 0)
+                        .then(|| Rc::clone(pursuit))
+                })
             } else {
                 None
             };
@@ -1669,6 +1806,8 @@ struct TreeNode {
     best_extension_spins: u8,
     best_extension_quality: f64,
     revisit_after: u64,
+    /// Static obstruction discounted by one actual coherent continuation.
+    obstructed_mass: u16,
 }
 
 #[derive(Clone)]
@@ -1726,8 +1865,13 @@ fn required_success(counts: &[u16], percent: f64) -> u16 {
 
 fn boundary_quality(board: &Board, debt: &CellMask, future: &Continuation) -> f64 {
     let unexplained = mask_count(debt).saturating_sub(future.paid);
-    BoardFacts::new(board).terrain_score(future.anchor.as_deref()) * 2.0 + future.score
+    BoardFacts::new(board).terrain_score_witnessed(future.anchor.as_deref()) * 2.0 + future.score
         - unexplained as f64 * 12.0
+}
+
+fn boundary_obstruction(board: &Board, future: &Continuation) -> u16 {
+    let mass = BoardFacts::new(board).obstructed_mass;
+    future.obstructed_mass.map_or(mass, |after| mass.min(after))
 }
 
 fn compare_probability(a: &[u16], b: &[u16]) -> std::cmp::Ordering {
@@ -1745,6 +1889,80 @@ fn cost_lower_bound(board: &Board, spins: u8, goal: u8) -> u16 {
             .saturating_sub(board.cell_count())
             .div_ceil(4),
     )
+}
+
+/// An optimistic within-bag opportunity count, including material supplied by O
+/// but never crediting O with a spin. Used only to avoid cutting preparations
+/// that can still close the requested gap to a certified same-depth result.
+fn remaining_bag_spins(board: &Board, used: u8) -> u8 {
+    let remaining = ALL_PIECES & !used;
+    let finishers = (remaining & !Piece::O.bit()).count_ones() as u16;
+    let material = board.cell_count() + remaining.count_ones() as u16 * 4;
+    finishers.min(material / 10) as u8
+}
+
+fn delta_lag(spins: u8, best_at_bag: u8, optimistic_more: u8) -> bool {
+    spins
+        .saturating_add(optimistic_more)
+        .saturating_add(SPIN_DELTA)
+        <= best_at_bag
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectiveReason {
+    BagDelta,
+    Pace,
+    Residue,
+}
+
+/// User-requested selective pruning. None of these comparisons proves that a
+/// board is impossible or changes a fixed plan's exact supply language.
+fn selective_reason(
+    cells: u16,
+    obstructed_mass: u16,
+    pieces: u16,
+    spins: u8,
+    best_at_bag: u8,
+    goal: u8,
+    budget: u16,
+) -> Option<SelectiveReason> {
+    // A genuine terminal prefix needs neither a productive future nor a
+    // preferred residue. Same-depth delta still compares completed first bags.
+    if spins >= goal {
+        return None;
+    }
+    if delta_lag(spins, best_at_bag, 0) {
+        return Some(SelectiveReason::BagDelta);
+    }
+    if pieces <= 7 {
+        return None;
+    }
+    // Cumulative required pace after seven setup locks, with three spins of
+    // slack. Cross multiplication preserves the exact threshold without
+    // rounding a per-bag average or forcing each bag to clear a quota.
+    if u32::from(goal) * u32::from(pieces - 7)
+        >= (u32::from(spins) + u32::from(SPIN_DELTA)) * u32::from(budget.saturating_sub(7).max(1))
+    {
+        return Some(SelectiveReason::Pace);
+    }
+    let remaining_spins = u16::from(goal - spins);
+    let residue = (u32::from(cells) + u32::from(budget.saturating_sub(pieces)) * 4)
+        .saturating_sub(u32::from(remaining_spins) * 10);
+    if u32::from(obstructed_mass) > residue + u32::from(RESIDUE_MARGIN) {
+        return Some(SelectiveReason::Residue);
+    }
+    None
+}
+
+fn focused_rounds(last_bag_spins: u8, future_spins: u8, stale: u32) -> u32 {
+    let gain = u32::from(last_bag_spins.min(4));
+    let witnessed = if stale < 4 {
+        u32::from(future_spins.min(3))
+    } else {
+        0
+    };
+    let rounds = (1 + gain * gain + witnessed).min(16);
+    rounds.div_ceil(1 + (stale / 4).min(7)).max(1)
 }
 
 pub struct SearchSession {
@@ -1779,6 +1997,9 @@ pub struct SearchSession {
     duplicates: u64,
     schedule_epoch: u64,
     preview_generation: u64,
+    best_spins_by_bag: Vec<u8>,
+    selective_pruned: u64,
+    last_budget_progress_round: u64,
 }
 
 impl SearchSession {
@@ -1810,10 +2031,11 @@ impl SearchSession {
             best_extension_spins: 0,
             best_extension_quality: f64::NEG_INFINITY,
             revisit_after: 0,
+            obstructed_mass: 0,
         };
         let lower_bound = cost_lower_bound(&Board::default(), 0, TARGET_SPINS);
         let active_budget = if config.budget_start == 0 {
-            lower_bound
+            config.piece_goal.max(lower_bound)
         } else {
             config.budget_start.max(lower_bound)
         }
@@ -1850,6 +2072,9 @@ impl SearchSession {
             duplicates: 0,
             schedule_epoch: 0,
             preview_generation: u64::MAX,
+            best_spins_by_bag: vec![0; 101],
+            selective_pruned: 0,
+            last_budget_progress_round: 0,
         })
     }
 
@@ -1884,15 +2109,35 @@ impl SearchSession {
             if let Some(mut job) = self.generation.take() {
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
+                let prior_selective = job.selective_pruned;
                 self.expanded += job.advance(&mut self.rng, self.goal, &mut self.physics_cache);
                 self.pruned += job.pruned - prior_pruned;
                 self.duplicates += job.duplicates - prior_duplicates;
+                self.selective_pruned += job.selective_pruned - prior_selective;
                 if self.preview_steps % 16 == 0 {
                     self.update_generation_preview(&job);
                 }
                 if job.next_layer() {
                     let parent = job.parent;
                     for state in job.complete.into_iter().rev() {
+                        let pieces = job.start_pieces + state.targets.len() as u16;
+                        if state.spins < self.goal
+                            && selective_reason(
+                                state.board.cell_count(),
+                                boundary_obstruction(&state.board, &state.future),
+                                pieces,
+                                state.spins,
+                                self.best_spins_by_bag[pieces as usize / 7],
+                                self.goal,
+                                self.active_budget,
+                            )
+                            .is_some()
+                        {
+                            // Do not remember a selective rejection: wider
+                            // later budgets may make this proposal eligible.
+                            self.selective_pruned += 1;
+                            continue;
+                        }
                         let id = self.next_id;
                         self.next_id += 1;
                         let plan = Plan {
@@ -1933,6 +2178,7 @@ impl SearchSession {
                     continue;
                 }
                 if self.can_expand(parent)
+                    && self.node_selective_reason(parent).is_none()
                     && self.tree[parent].attempts < self.tree[parent].allowance
                 {
                     self.begin_generation(parent);
@@ -1950,7 +2196,18 @@ impl SearchSession {
                 self.begin_verification(parent, plan);
                 continue;
             }
-            let Some(parent) = self.select_node() else {
+            let parent = loop {
+                if let Some(parent) = self.select_node() {
+                    break Some(parent);
+                }
+                if self.active_budget >= self.config.max_pieces {
+                    break None;
+                }
+                // Reconsider retained boundaries under the relaxed horizon.
+                self.active_budget = (self.active_budget + 7).min(self.config.max_pieces);
+                self.last_budget_progress_round = self.generation_rounds;
+            };
+            let Some(parent) = parent else {
                 self.finished = true;
                 break;
             };
@@ -1958,13 +2215,28 @@ impl SearchSession {
             let stale = self.tree[parent]
                 .attempts
                 .saturating_sub(self.tree[parent].last_improved_attempt);
-            let extra = 1 + u32::from(self.tree[parent].future.spins != 0 && stale < 4) * 2;
+            let extra = focused_rounds(
+                self.last_bag_spins(parent),
+                self.tree[parent].future.spins,
+                stale,
+            );
             self.tree[parent].allowance = self.tree[parent].attempts + extra;
             self.begin_generation(parent);
         }
     }
 
     fn begin_verification(&mut self, parent: usize, plan: Plan) {
+        let pieces = plan.start_pieces + plan.targets.len() as u16;
+        if !plan.terminal
+            && delta_lag(
+                plan.expected_spins,
+                self.best_spins_by_bag[pieces as usize / 7],
+                0,
+            )
+        {
+            self.selective_pruned += 1;
+            return;
+        }
         self.verification = Some(VerificationJob::new(parent, plan));
         self.last_checked = 0;
         self.last_success = 0;
@@ -1985,14 +2257,34 @@ impl SearchSession {
             && node.pieces + cost_lower_bound(&node.board, node.spins, self.goal) <= self.cost_cap()
     }
 
+    fn node_selective_reason(&self, index: usize) -> Option<SelectiveReason> {
+        let node = &self.tree[index];
+        selective_reason(
+            node.board.cell_count(),
+            node.obstructed_mass,
+            node.pieces,
+            node.spins,
+            self.best_spins_by_bag[node.pieces as usize / 7],
+            self.goal,
+            self.active_budget,
+        )
+    }
+
+    fn last_bag_spins(&self, index: usize) -> u8 {
+        let node = &self.tree[index];
+        node.parent.map_or(0, |parent| {
+            node.spins.saturating_sub(self.tree[parent].spins)
+        })
+    }
+
     fn begin_generation(&mut self, parent: usize) {
         let attempt = self.tree[parent].attempts;
         let minimum = required_success(&self.tree[parent].counts, self.config.min_success_percent);
         // Re-search only selected boundaries more broadly; siblings start cheap.
-        let stage = (attempt / 4).min(2);
+        let stage = (attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2);
         let width = (self.config.beam_width >> (2 - stage)).max(4);
         let setup = parent == 0 && attempt % 4 != 3;
-        self.generation = Some(GenerationJob::new(
+        let mut generation = GenerationJob::new(
             parent,
             &self.tree[parent],
             width,
@@ -2003,16 +2295,25 @@ impl SearchSession {
             minimum,
             self.config.search_lane,
             self.config.search_lanes,
-        ));
+        );
+        generation.best_bag_spins =
+            self.best_spins_by_bag[(self.tree[parent].pieces as usize / 7) + 1];
+        generation.prune_budget = self.active_budget;
+        self.generation = Some(generation);
         self.tree[parent].attempts += 1;
         self.tree[parent].last_selected = self.schedule_epoch;
         self.generation_rounds += 1;
         self.schedule_epoch += 1;
-        if self.generation_rounds % 12 == 0 {
+        if self
+            .generation_rounds
+            .saturating_sub(self.last_budget_progress_round)
+            >= BUDGET_STALE_ROUNDS
+        {
             self.active_budget = self
                 .active_budget
                 .saturating_add(7)
                 .min(self.config.max_pieces);
+            self.last_budget_progress_round = self.generation_rounds;
         }
     }
 
@@ -2052,12 +2353,16 @@ impl SearchSession {
         // Bounded best-first resumption between focused depth-first stretches.
         // The exact mass/cost bound prunes; this priority only schedules effort.
         let earliest = (0..self.tree.len())
-            .filter(|&i| self.can_expand(i))
+            .filter(|&i| self.can_expand(i) && self.node_selective_reason(i).is_none())
             .map(|i| self.tree[i].revisit_after)
             .min()?;
         self.schedule_epoch = self.schedule_epoch.max(earliest);
         (0..self.tree.len())
-            .filter(|&i| self.can_expand(i) && self.tree[i].revisit_after <= self.schedule_epoch)
+            .filter(|&i| {
+                self.can_expand(i)
+                    && self.node_selective_reason(i).is_none()
+                    && self.tree[i].revisit_after <= self.schedule_epoch
+            })
             .max_by(|&a, &b| {
                 let priority = |i: usize| {
                     let node = &self.tree[i];
@@ -2318,7 +2623,14 @@ impl SearchSession {
         self.current = Some(archived.clone());
         if qualified {
             self.qualified_bags = self.qualified_bags.max(counts.len() as u16);
+            if summary.spins > self.qualified_spins {
+                self.last_budget_progress_round = self.generation_rounds;
+            }
             self.qualified_spins = self.qualified_spins.max(summary.spins);
+            if !job.plan.terminal {
+                let best = &mut self.best_spins_by_bag[counts.len()];
+                *best = (*best).max(summary.spins);
+            }
             if !job.plan.terminal
                 && self
                     .best_partial
@@ -2367,15 +2679,18 @@ impl SearchSession {
                     future: job.plan.future.clone(),
                     debt: job.plan.debt,
                     attempts: 0,
-                    allowance: 2
-                        + u32::from(job.plan.future.spins.min(2)) * 2
-                        + u32::from(job.plan.expected_spins > parent.spins) * 2,
+                    allowance: focused_rounds(
+                        job.plan.expected_spins.saturating_sub(parent.spins),
+                        job.plan.future.spins,
+                        0,
+                    ),
                     last_selected: self.generation_rounds,
                     quality: boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future),
                     last_improved_attempt: 0,
                     best_extension_spins: 0,
                     best_extension_quality: f64::NEG_INFINITY,
                     revisit_after: 0,
+                    obstructed_mass: boundary_obstruction(&job.plan.expected, &job.plan.future),
                 };
                 let gain = new_node.spins - parent.spins;
                 let quality = new_node.quality;
@@ -2490,6 +2805,7 @@ impl SearchSession {
                 .as_ref()
                 .map(|a| a.summary.for_snapshot(include_frames)),
             duplicates: self.duplicates,
+            selective_pruned: self.selective_pruned,
         }
     }
 
@@ -2523,14 +2839,20 @@ impl SearchSession {
             "candidate": archive.map(|a| &a.summary), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
-            "interchange": false, "globalOptimalityProven": false
+            "interchange": false, "globalOptimalityProven": false,
+            "selectiveSearch": {
+                "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
+                "activeBudget": self.active_budget,
+                "budgetStaleRounds": BUDGET_STALE_ROUNDS,
+                "cutsAreImpossibilityProofs": false
+            }
         }).to_string()
     }
 }
 
 fn better_partial(a: &CandidateSummary, b: &CandidateSummary) -> bool {
-    a.ranking_score > b.ranking_score
-        || (a.ranking_score == b.ranking_score
+    a.spins > b.spins
+        || (a.spins == b.spins
             && (a.placed < b.placed || (a.placed == b.placed && a.probability > b.probability)))
 }
 

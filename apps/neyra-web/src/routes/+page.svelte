@@ -274,7 +274,7 @@
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />현재 최선</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
+        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 스핀 경로'}</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
         {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
             {#if bestRoute.complete}
@@ -286,7 +286,7 @@
             {/if}
           </button>
         {:else}
-          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증을 통과한 최선 경로를 여기에 표시합니다.</p></div>
+          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증된 최대 스핀 경로를 여기에 표시합니다.</p></div>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>

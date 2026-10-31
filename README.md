@@ -6,6 +6,8 @@
 
 Rust/Wasm 탐색기와 Svelte 화면으로 구성됩니다. 빈 필드에서 40번의 스핀 싱글을 목표로 탐색하며, 계산은 브라우저의 Web Worker에서 실행합니다.
 
+![Neyra 실제 탐색 화면](docs/preview.jpg)
+
 ## MVP 범위
 
 - **10×24 필드**, 중력 대기와 한 칸 낙하 없이 이동·회전·Sonic Drop으로 도달하는 배치.

@@ -140,25 +140,27 @@ search_config의 board_score 필드에 'cached in TT' 주석이 있지만, 검�
 | --- | --- | --- | --- |
 | P0 | execution / p7 / rules | exact board와 logical rows, SRS+ fingerprint, C-/C+, 최종 CDF 보존 | Neyra의 증명 계약을 우선 유지 |
 | P1 | solver / telemetry | root부터 재시작하지 않는 resumable frontier, candidate cursor, runId/revision, 완료 결과 원자 반영 | CC subtree/arena 재사용, fusion completed snapshot |
-| P1 | execution / reachability | exact board/piece/profile 물리 질의 coalescing, in-flight reservation, 이미 끝난 witness 재사용 | CC marked leaf, CC2 종류별 movegen 공유 |
+| 조건부 | execution / reachability | worker 내부 exact board/piece/profile 질의의 실제 재사용을 확인한 뒤 제한된 공유 선택 | CC marked leaf, CC2 종류별 movegen 공유 |
 | P1 | structure / goals | productive pocket은 소비 후 successor를 평가하고 미지정 holes와 분리 | CC의 자원 한도 T-slot cutout 평가를 all-spin 계약으로 일반화 |
 | P2 | solver | 가방 macro 후보 quota를 점진 확대하되 미처리 후보는 Deferred로 보존 | fusion iterative widening을 complete 후보 stream 위에 적용 |
-| P2 | reachability | 충돌 anchor mask와 최종 회전 predecessor query 캐시 | CC2 collision maps |
-| P2 | solver / bounds | 동일 exact boundary의 label와 후속 인증 결과 공유; 상태 equality와 proof scope 유지 | CC DAG, CC2 hash-only 동일성은 배제 |
+| 조건부 | reachability | 질의 밀도가 사전 계산 비용을 상쇄할 때 충돌 anchor mask 사용 | CC2 collision maps |
+| 기본 해제 | solver / bounds | 가방 경계·worker 간 공유는 중복률과 유지 비용을 확인한 뒤 검토; 상태 equality와 proof scope 유지 | CC DAG, CC2 hash-only 동일성은 배제 |
 | P3 | goals / solver | 마감이 있는 pocket obligation만 제한적 extension | fusion quiescence의 목적을 Neyra에 맞게 수정 |
-| 보류 | learned ordering | 충분한 자체 탐색 자료가 생기면 rank/policy 개선 | CC 확률 선택·fusion NN은 우선순위 보조로만 사용 |
+| 제외 | learned evaluation | NNUE·학습 의존 평가기 대신 명시적인 정적 특징과 구조 계약 사용 | 대전 평가의 목적을 그대로 이식하지 않음 |
 
 ### 실제 추천 scheduler
 
 주 제어기는 v2의 가방 경계 branch-and-bound를 유지한다. 각 경계 상태는 '새 후보를 조금 더 생성', '기존 후보의 모호한 P7 edge 검증', '인증된 다음 가방으로 내려가기'의 재개 가능한 작업을 가진다.
 
 - 첫 순서는 현재 incumbent의 유효 접두 수순, 싼 구조 평가, 기대 검증 비용으로 정한다.
-- 검증은 같은 정확한 보드·미노 질의를 묶는다.
+- 검증은 같은 후보 내부의 실행 상태를 우선 공유한다. 추가 메모이제이션은 조회·복사·할당·메모리 비용까지 보고 선택한다.
 - 좋지 않은 순위는 Deferred이며 완전성 증명으로 처리하지 않는다.
 - 예산 contour가 바뀌어도 기하 후보·물리 witness·P7 certificate는 fingerprint가 같으면 재사용한다.
 - 각 work quantum은 작은 개수의 목표/간선을 처리한 뒤 UI와 취소 메시지에 양보한다.
 
 많은 target 질의가 같은 보드·미노에 모이면 단일 reverse query를 반복하는 것보다 strict24 정방향 reachable table 한 번이 더 싼 교차점이 있을 수 있다. 이는 계측 후 선택할 내부 실행 방식이다. 아직 타깃이 없는 모든 보드에서 무조건 전체 movegen을 호출하는 전단으로 돌아가지는 않는다.
+
+독립 worker가 서로 다른 경계 상태를 담당한다면 동일 보드가 충분히 재등장하지 않을 수 있다. 위 공유 원리는 도입을 보장하는 성능 근거가 아니며, work stealing이나 전역 동기화 캐시를 기본으로 계획하지 않는다. 불필요한 회전·동일 기하 후보를 먼저 줄이는 최적화와 캐시 추가는 구분한다.
 
 ## 6. 측정과 인증 경계
 

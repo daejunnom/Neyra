@@ -6,7 +6,7 @@
 검토 대상 Neyra: 2baf90f97eb60994b35f570198c5e25d64ad0606  
 Clearra 최초 비교 기준: 5c98563332706a718330bc7ae8e403d2583afe9d
 
-공식 SRS+ 정정: [6232031](https://github.com/daejunnom/Clearra/commit/6232031047ea93a139ec2bc86819fb42e5c4ceff)
+공식 SRS+ 대조와 등가 최적화 유지: [f504c8f](https://github.com/daejunnom/Clearra/commit/f504c8f02d771da518000f901d2b8704a1d6830b)
 
 ## 1. 결정
 
@@ -30,7 +30,7 @@ Alpha–Beta에서 가져오는 것은 하한·상한에 의한 조기 중단, �
 
 | 항목 | 계약 |
 | --- | --- |
-| 목표 | 허용된 Spin Single 40회. 무클리어 배치는 허용하고 비스핀 싱글·멀티라인은 배제한다. |
+| 목표 | O를 제외한 허용 Spin Single 40회. 무클리어 배치는 허용하고 비스핀 싱글·멀티라인은 배제한다. |
 | 신규 빌드 | 기존 오프너나 리플레이를 필수 접두 수순으로 넣지 않는다. 알려진 빌드는 검증 자료로만 사용한다. |
 | 비용 | 실제 lock 수가 우선이다. 키 입력 수는 같은 비용·성공률 후보의 보조 기준이다. |
 | 112개 | 조절 가능한 희망 목표다. 이를 초과한 유효 완주를 반려하지 않는다. |
@@ -112,30 +112,23 @@ Alpha–Beta에서 가져오는 것은 하한·상한에 의한 조기 중단, �
 
 ## 5. 정확한 물리 계약
 
-### 5.1 공식 tetrio.js를 기준으로 Clearra Rust 프로필을 고정
+### 5.1 공식 규칙 자료와 탐색용 등가 최적화를 구분
 
-최상위 기준은 [공식 tetrio.js](https://tetr.io/js/tetrio.js)의 SRS+ 데이터와 ComputeKick의 원점 우선 처리다. 2026-10-31에 확보한 원문 SHA-256은 다음과 같다.
+최상위 물리 기준은 [공식 tetrio.js](https://tetr.io/js/tetrio.js)의 SRS+ 데이터와 ComputeKick의 원점 우선 처리다. 2026-10-31 원문 SHA-256은 다음과 같다.
 
     9e57c958c43520deb5dd91f5e1773bf779bfb91e7d273dc8494a93a3a0866d2f
 
-이전 문서의 “O 180도 제외, 총 80전이” 결론은 원문 대조 후 정정한다. 표준 7종은 90도 전이 56개와 180도 전이 28개, **총 84개 전이**다. O의 disallow_kick은 추가 offset을 금지하지만, 원위치 회전은 그보다 먼저 검사하므로 O 180도도 가능하다.
+공식 자료는 90도 전이 56개와 180도 전이 28개, **84개 전이**다. O의 disallow_kick은 추가 offset을 금지하지만 원위치 회전은 먼저 검사하므로, O 180도가 원문에 없다는 설명은 잘못이다.
 
-원문은 실패 후 시도할 offset만 표에 보관한다. Neyra/Clearra의 명시적 sequence에는 최초 (0,0)을 붙이고, y축이 아래로 증가하는 원문의 dy를 위로 증가하는 엔진 좌표로 변환한다. I 180도는 원위치 포함 두 후보이며, 기존 Clearra Rust 값이 맞고 C builtin의 여섯 후보가 잘못되어 있었다. 따라서 C를 무조건 정답으로 삼아 Rust를 바꾸지 않는다.
+그러나 이 사실이 탐색 그래프에 O 180도 간선을 추가해야 한다는 뜻은 아니다. 표준 O의 네 방향은 점유 셀이 같고 두 원위치 90도 회전으로 180도를 대체할 수 있다. 정확한 입력 횟수·lock reset·입력 타이밍이 주 제약이 아닌 이번 배치 탐색에서는 **Clearra Rust의 기존 80전이 최적화를 유지**한다. 공식 84개를 보관하는 자료와, 등가 간선을 생략한 runtime 프로필을 분리한다.
 
-권위와 데이터 흐름은 다음으로 고정한다.
+I 180도는 다르다. 원문은 최초 (0,0)을 암묵적으로 시도하고 이후 하나의 offset을 검사하므로 총 두 후보다. 기존 Rust 값이 맞으며 C의 여섯 후보는 순서와 값이 달라 first-success 결과와 최종 도달 가능한 점유 셀까지 바꿀 수 있다. 따라서 C I180만 두 후보로 정정하고, C 기본 실행 경로에 canonical Rust의 검증된 80전이 descriptor를 전달한다. O를 제외한 원문과의 수치·순서는 정확히 일치시킨다.
 
-    공식 tetrio.js
-    → 정적 추출한 84전이 fixture와 source hash
-    → 수정된 Clearra Rust canonical profile
-    → C verified descriptor 및 Neyra 생성 Rust 모듈
+[공식 규칙 fixture](../crates/neyra-core/tests/fixtures/tetrio_srs_plus_standard_tetromino_kicks.json)와 [Neyra 생성기](../scripts/generate-srs-plus.py)를 버전 관리한다. fixture는 원문의 y축을 변환하고 최초 (0,0)을 명시한 84전이를 보존한다. 전체 tetrio.js는 제품 저장소에 넣거나 실행하지 않는다.
 
-[공식 규칙 fixture](../crates/neyra-core/tests/fixtures/tetrio_srs_plus_standard_tetromino_kicks.json)와 [Neyra 생성기](../scripts/generate-srs-plus.py)를 버전 관리한다. 전체 tetrio.js를 제품 저장소에 넣거나 실행하지 않는다. 추출기는 데이터 리터럴만 정적으로 읽으며, source hash와 정렬된 transition hash를 기록한다.
+Neyra의 물리 회전·명시적 replay는 이 84전이 자료를 사용한다. 별도의 빌드 탐색 정책으로 O 스핀을 제외하고, 같은 점유 셀을 만드는 O의 회전 후보는 대표 방향으로 축약할 수 있다. reference move generator와 명시적 회전 replay를 유지하여 이 최적화의 기하학적 동등성을 확인한다. O 이외 미노에서는 동일 점유 셀이라도 다음 kick·스핀 이력이 다를 수 있으므로 rotation 상태를 전역적으로 합치지 않는다.
 
-Clearra에서는 O 180도를 Rust/C 모두에 추가하고, C I 180도를 두 후보로 정정한다. 기본 SRS+도 Rust canonical profile을 검증된 descriptor로 투영하여 C 실행기에 전달한다. 독립 C builtin 호출은 같은 fixture와 대조한다.
-
-Neyra의 기존 손복사 84전이는 공식 fixture와 수치·순서 모두 같았다. 해당 코드를 fixture에서 생성한 Rust 모듈로 교체하므로 데이터 원천이 통일되며 정상적인 회전 결과를 불필요하게 바꾸지 않는다.
-
-RulesFingerprint에는 upstream commit, descriptor hash, 미노 셀 좌표와 원점, 순서 있는 kick 배열, 허용 입력, spawn, 천장, 스핀·drop 정책을 포함한다. 이 값이 달라지면 물리·P7·전이표 캐시를 재사용하지 않는다.
+RulesFingerprint에는 upstream 자료, descriptor, 미노 좌표·원점, 순서 있는 kicks, 허용 입력, spawn, 천장, O 스핀 제외와 drop 정책을 포함한다. 물리 계약이 달라지면 물리·P7 인증 캐시를 재사용하지 않는다. 등가 최적화만 바뀐 경우에는 계약의 동등성을 먼저 확인하고 불필요한 자산 무효화를 피한다.
 
 ### 5.2 24행은 실제 셀의 사망 경계
 
@@ -502,18 +495,66 @@ Stockfish의 공식 용어와 Lc0의 policy/value 기반 MCTS 설명은 탐색 �
 
 이번 검토로 주 제어기를 다시 바꾸지는 않는다. 가방 경계 branch-and-bound와 정확한 P7를 유지하고, 다음 내부 구조를 보강한다.
 
-- **정확한 상태 DAG:** 같은 가방 경계는 후속 후보 stream과 인증을 공유한다. 물리 상태와 경로별 비용·확률·witness label을 분리하며, 여러 결과의 최소 비용과 최대 확률을 섞어 가상의 후보를 만들지 않는다.
+- **후보 내부 실행 DAG 우선:** 고정 계획 하나의 P7 실행 그래프에서 동일 실행 상태를 합친다. 서로 다른 가방 경계나 worker를 하나의 전역 DAG로 묶는 것은 기본값이 아니다. 재사용할 때도 물리 상태와 경로별 비용·확률·witness label을 분리하고, 최소 비용과 최대 확률을 다른 후보에서 가져와 섞지 않는다.
 - **재개 가능한 frontier:** 후보 생성 cursor, 물리 witness, P7 결과를 폭 확대·비용 contour 변경·pause/resume 사이에 유지한다. root부터 계산을 반복하지 않는다.
-- **진행 중 질의 합치기:** 같은 정확한 필드·미노·목표·규칙의 물리 질의는 한 작업만 예약한다. 여러 P7 간선은 그 결과를 함께 사용한다.
+- **공유의 비용 제한:** 기존 worker 내부 캐시를 우선 사용한다. 추가 캐시나 진행 중 질의 합치기는 실제 중복률, 조회·복사·할당 비용, 보관 메모리까지 확인한 뒤 선택한다. worker 사이의 work stealing이나 잠금이 필요한 전역 캐시를 전제하지 않는다.
 - **점진적 후보 할당:** 이번 작업에서 상위 후보 일부를 확인하되 나머지는 Deferred로 남긴다. 낮은 순위나 점수 차이는 불가능 증명이 아니다.
 - **포켓 소비 후 평가:** 스핀을 실제로 얻은 보상과 미래 구조의 추정 가치를 분리한다. TSD/TST 가상 처리나 공격량 평가를 가져오지 않고, 모든 관련 미노의 Spin Single과 후속 구조로 다시 정의한다.
-- **충돌 anchor mask:** 반복되는 exact board·piece·orientation 충돌 질의를 bitset으로 공유한다. 물리 충돌과 24행 사망 판정은 별도 조건으로 유지한다.
+- **충돌 anchor mask:** 같은 보드에서 충분히 많은 질의를 할 때만 사전 계산한다. 질의 몇 개를 위해 전체 mask를 생성하면 손해일 수 있다. 물리 충돌과 24행 사망 판정은 별도 조건으로 유지한다.
 - **마감 의무에 따른 extension:** 현재 포켓의 소비와 공통 경계 확인을 위해서만 제한적으로 더 본다. 과거에 스핀했다는 사실만으로 계속 확장하지 않는다.
 - **완료 결과의 원자적 반영:** activePreview는 작업 중에도 갱신하지만 인증 incumbent은 완결된 결과로만 바꾼다. runId/config fingerprint가 다른 늦은 worker 결과는 폐기한다.
 
 스케줄러는 GenerateGoals, RefineP7, DescendBoundary의 작은 작업을 번갈아 진행한다. 생성 시도 수, 새 고유 상태 수, 중복 작업량, 물리 질의 수, P7 정밀화 비용을 따로 계측한다. 캐시 hit가 높다는 이유로 반복 생성 비용을 숨기지 않는다.
 
 Live bot의 미지 next 기대값·생존 fallback·평균 평가를 구축률로 사용하지 않는다. 단일 ply와 가방 하나의 탐색 깊이도 구분한다. 이러한 원리를 가져왔다는 사실만으로 10가방 이상 완주 성능을 검증한 것은 아니다.
+
+### 12.2 정적 보드 평가
+
+평가는 명시적인 정수·bitset 특징과 구조 계약으로 구성한다. NNUE, 학습용 데이터, 신경망 추론을 요구하지 않는다. [Cold Clear의 정적 평가](https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/bot/src/evaluation/standard.rs)에서 높이·거친 표면·묻힌 빈칸·overhang·T 슬롯을 분리하는 원리를 가져오되, 대전의 공격량·TSD/TST·콤보·PC 보상을 복사하지 않는다. 공개 fusion에는 NN 평가 경로도 있으므로 전체 평가기를 도입하지 않는다.
+
+#### 현재 평가에서 고칠 부분
+
+현재 board_score의 overhangs는 양옆과 위가 막힌 빈칸에 양의 점수를 준다. 이는 SRS+로 진입 가능한 스핀 포켓을 확인한 것이 아니므로, 회수하지 못할 구멍까지 좋은 모양으로 오인할 수 있다. near_rows 역시 단순히 많이 찬 행을 보상하므로, 스핀 싱글로 소비할 수 있는 행과 그렇지 않은 행을 구분하지 못한다.
+
+또한 열 높이 합에는 블록 수와 holes가 함께 포함된다. B를 실제 잔여 블록 수, H를 열의 최고 블록 아래에 있는 빈칸 수라 하면 다음 항등식이 성립한다.
+
+    sum(column_height) = B + H
+    B = 4 × placed_pieces − 10 × completed_singles
+
+같은 배치 수·싱글 수의 후보끼리 비교할 때 B는 상수다. 따라서 aggregate height와 holes를 별개의 독립 특징처럼 두면 같은 결함을 중복 가중한다. 최대 높이와 스폰 위험은 별도의 유용한 정보이므로 유지한다.
+
+#### 계산할 특징
+
+| 특징 | 정의와 용도 | 계산 경계 |
+| --- | --- | --- |
+| 비용 하한 | 현재 lock 수 + 남은 과제의 증명된 최소 추가 lock 수 | 전역 목표의 우선 기준. 추정 포켓 점수를 안전한 하한에 더하지 않는다. |
+| 즉시 스핀 | 이미 정확한 물리 witness가 있고 재고가 허용하는 Spin Single | 사용 가능한 미노 수와 충돌하는 포켓을 함께 고려한다. 같은 공간의 여러 회전을 중복 보상하지 않는다. |
+| 구조 포켓 | 목표 mask·지지·빈 공간·kick 순서 조건이 있는 미완성 슬롯 | 단순 overhang 수를 대체한다. 구조적 후보와 검증 완료 슬롯을 구분한다. |
+| 미완료 의무 | 포켓을 유지·소비하기 위해 필요한 미노, 누락 셀, 유지해야 할 빈 공간 | 완료 기한과 남은 재고를 함께 저장한다. 이름만 붙인 구멍에는 예외를 주지 않는다. |
+| 불필요한 holes | 현재 활성 구조 계약에 속하지 않는 묻힌 빈칸 | 강한 음의 정렬 특징. 구멍이라는 사실만으로 불가능 판정을 내리지 않는다. |
+| 덮임 깊이 | 불필요한 빈칸 위에 쌓인 블록 수와 영향을 받는 행 | 얕은 수리와 깊이 묻힌 결함을 구분한다. |
+| 양측 표면 | 활성 스핀 영역을 제외한 좌·우 적재 영역의 높이 차이와 좁은 틈 | 중앙의 의도된 통로까지 전체 bumpiness로 벌하지 않는다. 통로 위치는 고정하지 않는다. |
+| 상단 위험 | 실제 최대 높이, 현재 스폰 충돌, 예정 경로의 상단 여유 | 24행 사망과 관련된 정보. 단순 평균 높이보다 직접적이다. |
+| 배치 의존성 | 강제 선행 관계, 동시에 만족해야 할 지지 조건, 홀드로 해결하지 못할 충돌 | 정렬용 추정과 정확한 P7 결과를 분리한다. OR 경로가 있는 관계를 단일 DAG로 단정하지 않는다. |
+
+행별 점유 수, 열 높이, holes와 덮임 깊이는 24개 row mask를 순회하며 한 번에 계산한다. 구조 슬롯 검사는 기존 목표 생성기의 작은 활성 영역과 미노별 mask를 재사용한다. 평가 때문에 전체 보드의 정확한 도달성을 다시 생성하지 않는다. 같은 결과 필드의 중복 후보를 먼저 줄일 수 있다면 평가 캐시를 추가하기 전에 그 중복을 없앤다.
+
+#### 정렬과 가지치기 분리
+
+가중치 하나에 모든 의미를 섞는 대신, 우선 다음 순서로 후보를 정렬한다.
+
+1. 정확한 합법성·현재 예산·성공률 상한을 통과하는가.
+2. 비용 하한이 작은가. 완주 후보는 실제 N_p를 먼저 비교한다.
+3. 현재 구조 의무를 충족하고 사용할 수 있는 스핀을 만드는가.
+4. 불필요한 구멍과 덮임 깊이·기한이 지난 의무가 적은가.
+5. 양측 적재 표면과 스폰 여유가 좋은가.
+6. 앞 조건이 같을 때 입력 비용과 탐색 다양성을 사용한다.
+
+목표가 준비인 첫 가방과 스핀을 소비하는 후속 가방은 같은 보상을 기계적으로 적용하지 않는다. 첫 가방의 0스핀은 우선 검토할 준비 경로이며 강제 조건이 아니다. 이후에도 4스핀 같은 고정 할당량을 강제하지 않고, 남은 스핀·lock 예산과 잔여 블록 자원으로 필요한 생산성을 평가한다.
+
+구조 포켓의 수를 더할 때 서로 겹치는 occupied/empty 요구나 동일 미노 재고를 중복 사용하지 않는다. 일곱 종류의 작은 재고 문제로 호환되는 조합을 고르거나, 정확한 조합 계산을 하지 않았다면 그 수치를 휴리스틱으로만 사용한다. 정적 점수를 성공률로 변환하지 않으며 구축률은 P7 검증이 담당한다.
+
+표면 점수가 낮거나 hole이 많다는 이유만으로 ProvenImpossible을 기록하지 않는다. 평가에 따라 우선순위를 뒤로 미룬 후보는 Deferred이며, 엄밀한 가지치기는 별도의 증명된 bound에서만 수행한다.
 
 ## 13. Rust 모듈과 데이터 흐름
 
@@ -586,7 +627,7 @@ Live bot의 미지 next 기대값·생존 fallback·평균 평가를 구축률�
 ### 단계 A: 규칙과 재생 기준
 
 - 공식 fixture의 84개 회전 전이와 순서 있는 offset 대조.
-- O 180도 원위치 허용, 추가 O kick 불허.
+- 공식 O 원위치 회전 자료 보존, O 스핀 제외, 점유 셀 등가 탐색 간선의 축약 검증.
 - 셀 기준 천장·first-success 사망·가짜 ceiling spin 방지.
 - 회전별 padding 원점 사례.
 - strict24 기준 reference forward와 reverse target 동치 검사.
@@ -654,9 +695,9 @@ Live bot의 미지 next 기대값·생존 fallback·평균 평가를 구축률�
 
 ### 현재 구현 및 Clearra
 
-- [공식 SRS+ 대조와 재현 설명](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/tests/fixtures/rules/tetrio-srs-plus.md)
-- [정정한 canonical Rust 프로필](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/crates/clearra-rules/src/kicks/srs_kicks.rs)
-- [Rust→C 기본 descriptor 연결](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/crates/clearra-core-ffi/src/rules/rule_descriptor_compiler.rs)
+- [공식 SRS+ 대조와 재현 설명](https://github.com/daejunnom/Clearra/blob/f504c8f02d771da518000f901d2b8704a1d6830b/tests/fixtures/rules/tetrio-srs-plus.md)
+- [정정한 canonical Rust 프로필](https://github.com/daejunnom/Clearra/blob/f504c8f02d771da518000f901d2b8704a1d6830b/crates/clearra-rules/src/kicks/srs_kicks.rs)
+- [Rust→C 기본 descriptor 연결](https://github.com/daejunnom/Clearra/blob/f504c8f02d771da518000f901d2b8704a1d6830b/crates/clearra-core-ffi/src/rules/rule_descriptor_compiler.rs)
 - [Neyra 검토 기준](https://github.com/daejunnom/Neyra/tree/2baf90f97eb60994b35f570198c5e25d64ad0606)
 - [Neyra physics.rs](https://github.com/daejunnom/Neyra/blob/2baf90f97eb60994b35f570198c5e25d64ad0606/crates/neyra-core/src/physics.rs)
 - [Neyra supply.rs](https://github.com/daejunnom/Neyra/blob/2baf90f97eb60994b35f570198c5e25d64ad0606/crates/neyra-core/src/supply.rs)

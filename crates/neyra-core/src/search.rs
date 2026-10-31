@@ -203,17 +203,22 @@ impl PhysicsCache {
         if self.locks.len() >= 512 {
             self.locks.clear();
         }
-        let locks = Rc::new(board.reachable_locks(piece));
+        let locks = Rc::new(board.search_locks(piece));
         self.locks.insert((board, piece), Rc::clone(&locks));
         locks
     }
 
     fn target(&mut self, board: Board, pose: Pose, spin: bool) -> Option<Placement> {
-        if let Some(locks) = self.locks.get(&(board, pose.piece)) {
-            return locks
-                .iter()
-                .find(|p| p.pose == pose && (!spin || p.spin))
-                .cloned();
+        // The search list has only O's orientation-zero representative.
+        // Preserve exact-pose queries in other orientations through reverse
+        // reachability rather than treating their missing cache entry as failure.
+        if pose.piece != Piece::O || pose.rotation == 0 {
+            if let Some(locks) = self.locks.get(&(board, pose.piece)) {
+                return locks
+                    .iter()
+                    .find(|p| p.pose == pose && (!spin || p.spin))
+                    .cloned();
+            }
         }
         let key = (board, pose, spin);
         if let Some(placement) = self.targets.get(&key) {
@@ -301,7 +306,8 @@ fn projected_poses(target: &TargetOperation, deleted: u32) -> Vec<Pose> {
     let min_x = cells.iter().map(|c| c.0).min().unwrap();
     let min_y = cells.iter().map(|c| c.1).min().unwrap();
     let mut poses = vec![];
-    for rotation in 0..4 {
+    let rotations = if target.piece == Piece::O { 1 } else { 4 };
+    for rotation in 0..rotations {
         let origin = Pose {
             piece: target.piece,
             x: 0,
@@ -1475,7 +1481,7 @@ impl SearchSession {
             .unwrap_or_default();
         serde_json::json!({
             "format": "neyra", "schemaVersion": 1, "engineVersion": env!("CARGO_PKG_VERSION"),
-            "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "movement": "SonicDropOnly", "supply": "UniformP7NormalizedHold", "runtimeReplayVerified": false },
+            "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7NormalizedHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
             "candidate": archive.map(|a| &a.summary), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),

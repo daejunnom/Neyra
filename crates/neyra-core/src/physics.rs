@@ -236,8 +236,9 @@ impl Board {
 
     /// Whether a successful rotation ending here earns any All-mini+ spin.
     /// Mini/full distinctions do not change Naga Eyes' spin-single objective.
+    /// This build-search profile excludes O spins, including spawn enclosures.
     pub fn spin_at(&self, pose: Pose) -> bool {
-        if !self.legal(pose) || !self.grounded(pose) {
+        if pose.piece == Piece::O || !self.legal(pose) || !self.grounded(pose) {
             return false;
         }
         if pose.piece == Piece::T {
@@ -349,10 +350,20 @@ impl Board {
     /// Forward reference enumerator. Geometry with spin and without spin are
     /// separate states so a short non-spin route cannot hide a legal spin.
     pub fn reachable_locks(&self, piece: Piece) -> Vec<Placement> {
+        self.lock_candidates(piece, false)
+    }
+
+    /// Search candidates use one representative for O's identical cell sets.
+    /// Explicit rotation/replay and the reference enumerator retain all poses.
+    pub(crate) fn search_locks(&self, piece: Piece) -> Vec<Placement> {
+        self.lock_candidates(piece, true)
+    }
+
+    fn lock_candidates(&self, piece: Piece, canonical_o: bool) -> Vec<Placement> {
         if !self.can_spawn(piece) {
             return Vec::new();
         }
-        let (nodes, _) = self.forward_nodes(piece, true);
+        let (nodes, _) = self.forward_nodes_with_policy(piece, true, canonical_o);
         nodes
             .iter()
             .enumerate()
@@ -444,6 +455,15 @@ impl Board {
     }
 
     fn forward_nodes(&self, piece: Piece, allow_sonic: bool) -> (Vec<Node>, Vec<usize>) {
+        self.forward_nodes_with_policy(piece, allow_sonic, false)
+    }
+
+    fn forward_nodes_with_policy(
+        &self,
+        piece: Piece,
+        allow_sonic: bool,
+        canonical_o: bool,
+    ) -> (Vec<Node>, Vec<usize>) {
         let root = State {
             pose: piece.spawn(),
             spin: false,
@@ -464,8 +484,15 @@ impl Board {
             Input::Ccw,
             Input::Half,
         ];
+        // With O spins excluded, these rotations are self-loops after
+        // projection to occupied cells. Other pieces keep every rotation.
+        let action_count = if canonical_o && piece == Piece::O {
+            3
+        } else {
+            actions.len()
+        };
         while let Some(parent) = queue.pop_front() {
-            for input in actions {
+            for &input in &actions[..action_count] {
                 if !allow_sonic && input == Input::Sonic {
                     continue;
                 }

@@ -20,3 +20,12 @@
   deployment. Existing GitHub checks and access controls still apply.
 - Keep source research, implementation status, and measured search results
   distinct. Do not copy private reference code into this public repository.
+- Exclude O spins in this build-search profile. Keep physical rotation data
+  separate from search-state equivalence: an origin-only rotation need not
+  become a separate geometric search candidate.
+- Do not commit performance experiment scripts, benchmark harnesses, raw runs,
+  or benchmark result reports. Keep these outside the repository. Evaluate
+  additional computation sharing with matched-work ABBA measurements before
+  adopting it; worker-local caches do not imply a global shared search DAG.
+- Use explicit static board features and structural obligations for evaluation.
+  Do not introduce NNUE, training data dependencies, or learned evaluation.

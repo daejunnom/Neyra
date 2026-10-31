@@ -4,7 +4,6 @@
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
   import { SearchClient, spinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
-  import { getBagViews, clearraPalette } from '$lib/buildDocument';
   import { encodeBuildDocument } from '$lib/exportFormats';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
   import './styles.css';
@@ -21,13 +20,12 @@
   let settingsError = '';
   let elapsedMs = 0;
   let previousTick = 0;
-  let view: 'current' | 'best' = 'current';
-  let bagIndex = -1;
+  let view: 'current' | 'best' = 'best';
+  let frameIndex = -1;
   let playing = false;
   let visibleCandidateKey = '';
   let savedMessage = '';
   let notice = '';
-  let bagWarning = '';
   let availableWorkers = 1;
 
   type ExportFormat = 'ctk3' | 'fumen';
@@ -53,13 +51,13 @@
   $: conditionalProbability = (snapshot !== null || hasSession ? runConfig : config).ignore_first_bag_probability;
   $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
-  $: bags = displayedBags(candidate);
-  $: selectedIndex = bagIndex < 0 ? Math.max(0, bags.length - 1) : Math.min(bagIndex, Math.max(0, bags.length - 1));
-  $: bag = bags[selectedIndex];
-  $: boardRows = bag?.rows ?? candidate?.rows ?? [];
-  $: boardColors = bag?.cells ?? [];
-  $: boardSpins = bag?.spins ?? candidate?.spins ?? 0;
-  $: boardPlaced = bag?.placed ?? candidate?.placed ?? 0;
+  $: if (client) client.observeCurrent(view === 'current');
+  $: frames = candidate?.frames ?? [];
+  $: selectedIndex = frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
+  $: frame = frames[selectedIndex];
+  $: boardRows = frame?.rows ?? candidate?.rows ?? [];
+  $: boardSpins = frame?.spins ?? candidate?.spins ?? 0;
+  $: boardPlaced = frame?.placed ?? candidate?.placed ?? 0;
   $: verifying = status === 'running' && snapshot?.phase === 'verifying';
   $: statusLabel = ({
     idle: '탐색 준비',
@@ -71,25 +69,17 @@
     failed: '탐색을 멈췄어요'
   } as Record<RunStatus, string>)[status];
   $: candidateKey = candidate ? JSON.stringify([candidate.id, candidate.verified, candidate.spins,
-    candidate.placed, candidate.fieldQuality, candidate.frameCount, candidate.rows]) : '';
+    candidate.placed, candidate.bagCount, candidate.fieldQuality,
+    candidate.verified ? candidate.firstBagProbability : null,
+    candidate.verified ? candidate.probability : null, candidate.frameCount, candidate.rows]) : '';
   $: if (candidateKey !== visibleCandidateKey) {
     visibleCandidateKey = candidateKey;
-    bagIndex = -1;
+    frameIndex = -1;
     playing = false;
   }
 
   function percent(value: number) {
     return (Math.max(0, Math.min(1, value)) * 100).toLocaleString('ko-KR', { maximumFractionDigits: 2 }) + '%';
-  }
-  function displayedBags(item: Candidate | null) {
-    try {
-      const result = getBagViews(item);
-      bagWarning = '';
-      return result;
-    } catch (reason) {
-      bagWarning = reason instanceof Error ? reason.message : '가방 표시를 읽지 못했어요.';
-      return [];
-    }
   }
   function time(ms: number) {
     const total = Math.floor(ms / 1000);
@@ -162,9 +152,9 @@
       const now = performance.now();
       if (status === 'running') elapsedMs += now - previousTick;
       previousTick = now;
-      if (playing && bags.length > 0) {
-        if (selectedIndex >= bags.length - 1) playing = false;
-        else bagIndex = selectedIndex + 1;
+      if (playing && frames.length > 0) {
+        if (selectedIndex >= frames.length - 1) playing = false;
+        else frameIndex = selectedIndex + 1;
       }
     }, 250);
     return () => { exportEpoch += 1; rejectDocument('화면을 닫아 문서 준비를 멈췄어요.'); window.clearInterval(clock); client.dispose(); };
@@ -182,19 +172,21 @@
     notice = '';
     elapsedMs = 0;
     snapshot = null;
-    view = 'current';
-    bagIndex = -1;
+    view = 'best';
+    frameIndex = -1;
     playing = false;
     runConfig = { ...config };
     previousTick = performance.now();
+    client.observeCurrent(false);
     client.start(runConfig);
   }
   function pause() { client.pause(); }
   function resume() {
-    view = 'current';
-    bagIndex = -1;
+    view = 'best';
+    frameIndex = -1;
     playing = false;
     previousTick = performance.now();
+    client.observeCurrent(false);
     client.resume();
   }
   function stop() { playing = false; client.cancel(); }
@@ -307,12 +299,12 @@
     } catch { selectCopyText(); }
   }
   function togglePlayback() {
-    if (bags.length < 2) return;
-    if (selectedIndex === bags.length - 1) bagIndex = 0;
+    if (frames.length < 2) return;
+    if (selectedIndex === frames.length - 1) frameIndex = 0;
     playing = !playing;
   }
-  function previousBag() { playing = false; bagIndex = Math.max(0, selectedIndex - 1); }
-  function nextBag() { playing = false; bagIndex = Math.min(bags.length - 1, selectedIndex + 1); }
+  function previousFrame() { playing = false; frameIndex = Math.max(0, selectedIndex - 1); }
+  function nextFrame() { playing = false; frameIndex = Math.min(frames.length - 1, selectedIndex + 1); }
 
 </script>
 
@@ -343,32 +335,28 @@
     <section class="board-panel" aria-label="후보 필드">
       <div class="panel-top">
         <div class="view-tabs" role="tablist" aria-label="필드 보기">
+          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} onclick={() => view = 'best'}>최신 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
           <button role="tab" aria-selected={view === 'current'} class:selected={view === 'current'} onclick={() => view = 'current'}>탐색 중</button>
-          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} disabled={!bestRoute} onclick={() => view = 'best'}>최선 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
         </div>
         <span class="board-dimensions">10 × 24</span>
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최선 결과 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} ariaLabel={view === 'best' ? '최신 경로 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
         <div class="field-summary">
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
           <div class="field-stat"><span>현재 가방</span><strong>{candidate ? Math.max(1, Math.ceil(boardPlaced / 7)) : '—'}</strong></div>
           <div class="candidate-label" class:complete={candidate?.complete}>{candidate?.complete ? '완주 후보' : candidate?.verified && candidate.qualified ? '검증 통과' : candidate ? '탐색 후보' : '빈 필드'}</div>
-          {#if bag}<div class="bag-inventory" aria-label={`${bag.bag}가방 사용 미노`}>
-            <small>{bag.partial ? '마지막 부분 가방' : '가방 완료'} · +{bag.spinGain}스핀</small>
-            <div>{#each bag.pieces as piece}<span style={'--piece-color:' + clearraPalette[piece]}>{piece}</span>{/each}</div>
-          </div>{/if}
         </div>
       </div>
 
       <div class="timeline">
-        <button class="icon-button" aria-label="이전 가방" disabled={bags.length < 2 || selectedIndex === 0} onclick={previousBag}><Icon name="back" size={15} /></button>
-        <button class="icon-button playback-button" aria-label={playing ? '재생 일시정지' : '가방 재생'} disabled={bags.length < 2} onclick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={14} /></button>
-        <input type="range" aria-label="가방 선택" min="0" max={Math.max(0, bags.length - 1)} value={selectedIndex} disabled={bags.length < 2} oninput={(event) => { bagIndex = Number(event.currentTarget.value); playing = false; }} />
-        <button class="icon-button" aria-label="다음 가방" disabled={bags.length < 2 || selectedIndex === bags.length - 1} onclick={nextBag}><Icon name="arrow" size={15} /></button>
-        <span class="frame-count">{bag?.bag ?? (candidate ? candidate.bagCount : 0)}<small> / {candidate?.bagCount ?? bags.length} 가방</small></span>
+        <button class="icon-button" aria-label="이전 미노" disabled={frames.length < 2 || selectedIndex === 0} onclick={previousFrame}><Icon name="back" size={15} /></button>
+        <button class="icon-button playback-button" aria-label={playing ? '재생 일시정지' : '미노 재생'} disabled={frames.length < 2} onclick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={14} /></button>
+        <input type="range" aria-label="미노 배치 선택" min="0" max={Math.max(0, frames.length - 1)} value={selectedIndex} disabled={frames.length < 2} oninput={(event) => { frameIndex = Number(event.currentTarget.value); playing = false; }} />
+        <button class="icon-button" aria-label="다음 미노" disabled={frames.length < 2 || selectedIndex === frames.length - 1} onclick={nextFrame}><Icon name="arrow" size={15} /></button>
+        <span class="frame-count">{frame?.placed ?? candidate?.placed ?? 0}<small> / {candidate?.placed ?? 0} 미노</small></span>
       </div>
     </section>
 
@@ -378,7 +366,7 @@
         <h2>{status === 'idle' ? '가능성을 탐색하세요.' : status === 'paused' ? '잠시 쉬어가는 중.' : status === 'cancelled' ? '여기까지 탐색했어요.' : status === 'completed' ? '이번 탐색을 마쳤어요.' : status === 'failed' ? '다시 시작할 수 있어요.' : '다음 빌드를 찾는 중.'}</h2>
         <p class="run-description">{status === 'idle' ? '빈 필드에서 40번의 스핀 싱글을 완성할 새로운 구축을 찾습니다.' : status === 'paused' ? '지금까지의 결과는 그대로 유지됩니다.' : status === 'cancelled' || status === 'completed' ? '발견한 후보를 확인하거나 새 탐색을 시작하세요.' : status === 'failed' ? '아래 내용을 확인한 뒤 탐색을 다시 시작해 주세요.' : '발견한 구조와 검증 상황이 실시간으로 갱신됩니다.'}</p>
         <div class="goal-summary">
-          <div><span>{conditionalProbability ? '2가방부터 성공률' : '성공률 기준'}</span><strong>{(hasSession ? runConfig : config).min_success_percent}%<small> 이상</small></strong></div>
+          <div><span>{conditionalProbability ? '2가방부터 성공률' : '성공률 기준'}</span><strong>{(hasSession ? runConfig : config).min_success_percent}%{#if (hasSession ? runConfig : config).min_success_percent < 100}<small> 이상</small>{/if}</strong></div>
           <div><span>개선 목표</span><strong>{(hasSession ? runConfig : config).piece_goal}<small> 미노</small></strong></div>
         </div>
         <div class="run-actions">
@@ -429,7 +417,7 @@
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
         {/if}
-        <p class="verification-note">{bagWarning || verificationLabel(candidate)}</p>
+        <p class="verification-note">{verificationLabel(candidate)}</p>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
     </aside>
@@ -463,7 +451,7 @@
 <dialog class="help-dialog" bind:this={about}>
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
-  <p>왼쪽은 각 가방을 마친 필드, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>는 첫 가방을 포함한 스핀 효율로 비교합니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
+  <p>왼쪽은 발견한 경로의 미노별 배치, 오른쪽은 작업 진척도입니다. <strong>최신 경로</strong>는 첫 가방을 포함한 스핀 효율이 같으면 더 깊은 경로를 보여 줍니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
   <p>설정한 미노 수는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>

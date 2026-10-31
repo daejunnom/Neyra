@@ -49,10 +49,6 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .goal-track i{display:block;background:#b5eb89;width:100%;transition:height 200ms;border-radius:inherit}
 .candidate-label{font-size:9px;align-self:flex-start;letter-spacing:.2px;padding:4px 7px;border:1px solid #39543a;color:#99b58d;border-radius:4px;margin-top:0}
 .candidate-label.complete{color:#c5efa9;border-color:#89b65c;background:#a5e17a0d}
-.bag-inventory{margin-top:auto;padding-bottom:15px;display:flex;flex-direction:column;gap:8px}
-.bag-inventory>small{font-size:9px;color:#92ab8c;line-height:1.5;white-space:nowrap}
-.bag-inventory>div{display:flex;flex-wrap:wrap;gap:4px;max-width:110px}
-.bag-inventory span{display:grid;place-items:center;width:22px;height:23px;border:1px solid color-mix(in srgb,var(--piece-color) 45%,transparent);border-radius:3px;background:color-mix(in srgb,var(--piece-color) 10%,transparent);color:var(--piece-color);font-size:10px;font-weight:650}
 .timeline{padding:12px 22px 14px;display:flex;align-items:center;gap:5px;border-top:1px solid #2e4431;height:57px}
 .timeline input{accent-color:#b5eb89;min-width:0;flex:1;height:3px;cursor:pointer}
 .timeline input:disabled{opacity:.3}
@@ -138,7 +134,7 @@ dialog::backdrop{background:#080e0bbf;backdrop-filter:blur(4px)}
 .help-dialog strong{color:#cee7b5;font-weight:550}
 @media(min-width:960px) and (min-height:850px){.page-heading{padding-top:39px;padding-bottom:28px}.board-stage{padding-top:20px;padding-bottom:22px}.field-wrap{width:220px}.run-section{padding-top:29px;padding-bottom:27px}.run-section h2{margin-top:25px}.progress-section{padding-top:24px;padding-bottom:24px}}
 @media(max-width:850px){.app-shell{padding:0 22px}.workspace{grid-template-columns:minmax(0,1fr) minmax(290px,.92fr)}.board-stage{gap:20px;padding-left:16px;padding-right:19px}.field-summary{width:85px}.field-wrap{width:min(178px,29vw)}.run-section,.progress-section,.best-section{padding-left:20px;padding-right:20px}.panel-top{padding-left:20px;padding-right:20px}.goal-track{right:-2px}.field-stat.primary>strong{font-size:35px}.metrics{gap:16px 13px}.metrics dt{font-size:9px}.metrics dd{font-size:12px}.run-description{font-size:10px}}
-@media(max-width:650px){.app-shell{padding:0 16px}.app-header{height:66px}.brand{font-size:23px}.page-heading{padding:23px 0 18px;gap:10px}.page-heading .eyebrow{font-size:8px;letter-spacing:1.3px}.page-heading h1{font-size:20px}.settings-button{padding:8px}.settings-button span{display:none}.workspace{grid-template-columns:1fr}.board-panel{border-right:0;border-bottom:1px solid #344633}.panel-top{height:48px}.board-stage{min-height:0;gap:32px;padding:12px 20px 10px}.field-wrap{width:150px}.field-summary{width:106px;padding-top:10px;gap:21px}.field-stat.primary>strong{font-size:39px}.field-stat>strong{font-size:23px}.goal-track{right:6px}.bag-inventory{padding-bottom:7px}.timeline{padding-top:9px;padding-bottom:10px;height:46px}.run-section{padding:21px}.run-section h2{font-size:18px;margin-top:15px;margin-bottom:7px}.run-description{max-width:none;min-height:0;font-size:11px}.goal-summary{margin:18px 0 17px}.progress-section{padding:19px 21px}.metrics{grid-template-columns:1fr 1fr;gap:16px 25px}.metrics dt{font-size:10px}.metrics dd{font-size:13px}.best-section{padding:19px 21px 15px}.best-empty{padding-top:17px}.best-empty p{margin-bottom:3px}.app-footer{font-size:8px;padding-top:15px;align-items:flex-start}.app-footer>span:first-child{max-width:180px;line-height:1.5}.header-actions{gap:9px}.github-link{font-size:10px}}
+@media(max-width:650px){.app-shell{padding:0 16px}.app-header{height:66px}.brand{font-size:23px}.page-heading{padding:23px 0 18px;gap:10px}.page-heading .eyebrow{font-size:8px;letter-spacing:1.3px}.page-heading h1{font-size:20px}.settings-button{padding:8px}.settings-button span{display:none}.workspace{grid-template-columns:1fr}.board-panel{border-right:0;border-bottom:1px solid #344633}.panel-top{height:48px}.board-stage{min-height:0;gap:32px;padding:12px 20px 10px}.field-wrap{width:150px}.field-summary{width:106px;padding-top:10px;gap:21px}.field-stat.primary>strong{font-size:39px}.field-stat>strong{font-size:23px}.goal-track{right:6px}.timeline{padding-top:9px;padding-bottom:10px;height:46px}.run-section{padding:21px}.run-section h2{font-size:18px;margin-top:15px;margin-bottom:7px}.run-description{max-width:none;min-height:0;font-size:11px}.goal-summary{margin:18px 0 17px}.progress-section{padding:19px 21px}.metrics{grid-template-columns:1fr 1fr;gap:16px 25px}.metrics dt{font-size:10px}.metrics dd{font-size:13px}.best-section{padding:19px 21px 15px}.best-empty{padding-top:17px}.best-empty p{margin-bottom:3px}.app-footer{font-size:8px;padding-top:15px;align-items:flex-start}.app-footer>span:first-child{max-width:180px;line-height:1.5}.header-actions{gap:9px}.github-link{font-size:10px}}
 @media(max-height:820px) and (min-width:651px){.app-header{height:66px}.page-heading{padding-top:22px;padding-bottom:18px}.field-wrap{width:171px}.board-stage{min-height:0;padding-top:12px;padding-bottom:12px;gap:30px}.field-summary{gap:20px}.run-section{padding-top:20px;padding-bottom:19px}.run-section h2{margin-top:17px}.goal-summary{margin:17px 0}.progress-section{padding-top:17px;padding-bottom:17px}.best-section{padding-top:16px;padding-bottom:10px}.best-empty{padding-top:14px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
 
@@ -147,3 +143,56 @@ dialog::backdrop{background:#080e0bbf;backdrop-filter:blur(4px)}
 .result-actions .icon-button{width:27px;height:28px}
 .copy-dialog textarea{display:block;resize:vertical;max-height:35vh;min-height:105px;width:100%;padding:10px;border:1px solid #435b3d;border-radius:5px;background:#122018;color:#d2e7bf;font:11px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
 .copy-notice{font-size:11px;color:#a7bd97;line-height:1.7;margin:0 0 14px}
+
+/* Keep the ordinary desktop workspace within the browser's available height.
+   The field scales with its own panel, while short/error content remains scrollable. */
+@media(min-width:900px){
+ .app-shell{height:100dvh;min-height:600px;display:grid;grid-template-rows:auto auto minmax(0,1fr) auto}
+ .app-header{height:58px}
+ .page-heading{padding:17px 0 16px}
+ .page-heading .eyebrow{margin-bottom:6px}
+ .page-heading h1{font-size:22px}
+ .workspace{min-height:0}
+ .board-panel,.control-panel{min-height:0}
+ .control-panel{overflow:auto}
+ .panel-top{height:47px;flex-shrink:0}
+ .board-stage{min-height:0;padding:12px 24px;container-type:size;gap:28px}
+ .field-wrap{width:min(220px,calc((100cqh - 16px)*5/12 + 22px))}
+ .field-summary{padding-top:12px;gap:22px}
+ .timeline{height:45px;padding:7px 20px;flex-shrink:0}
+ .run-section,.progress-section,.best-section{padding-left:23px;padding-right:23px;flex-shrink:0}
+ .run-section{padding-top:16px;padding-bottom:16px}
+ .run-section h2{font-size:18px;margin:12px 0 6px}
+ .run-description{min-height:0}
+ .goal-summary{margin:14px 0 13px;gap:10px}
+ .goal-summary>div{gap:4px}
+ .run-actions .button{min-height:38px}
+ .progress-section{padding-top:15px;padding-bottom:15px}
+ .metrics{margin-top:15px;gap:12px 20px}
+ .verified-progress{margin-top:10px}
+ .best-section{padding-top:15px;padding-bottom:11px}
+ .best-card{margin-top:11px;padding:10px 13px}
+ .best-card p{margin-top:7px}
+ .verification-note{margin-top:9px;min-height:25px}
+ .save-status{margin-top:4px}
+ .app-footer{padding:10px 0 12px}
+}
+@media(min-width:900px) and (max-height:800px){
+ .app-header{height:49px}
+ .page-heading{padding:12px 0}
+ .page-heading h1{font-size:21px}
+ .page-heading .eyebrow{font-size:8px;margin-bottom:5px}
+ .run-description{display:none}
+ .run-section{padding-top:13px;padding-bottom:13px}
+ .run-section h2{margin:10px 0 0}
+ .goal-summary{margin:13px 0 12px}
+ .progress-section{padding-top:13px;padding-bottom:13px}
+ .best-section{padding-top:13px;padding-bottom:9px}
+ .app-footer{padding:8px 0 10px}
+}
+@media(min-width:900px) and (max-height:700px){
+ .run-section{padding-top:11px;padding-bottom:11px}
+ .metrics{margin-top:10px;gap:8px 20px}
+ .best-card{margin-top:8px;padding-top:8px;padding-bottom:8px}
+ .best-card strong{font-size:24px}
+}

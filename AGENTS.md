@@ -41,8 +41,10 @@
   can reverse a one-spin difference, never a two-spin difference. Keep raw
   evaluation separate and normalize once; no bonuses after normalization.
   Temporary scheduling cooldowns must not change the archived best route.
-- The displayed partial record uses spins/max(7, placed), then more total
-  spins, higher raw field quality, fewer locks and higher effective probability.
+- The displayed partial record uses spins/max(7, placed), then more bags and
+  more total spins. For two one-bag records with equal spins, higher first-bag
+  construction probability precedes raw field quality. Otherwise use raw field
+  quality, fewer locks and higher effective probability for remaining ties.
   Include the setup bag in every public efficiency value; only internal
   scheduling may exclude it. Keep the total-spin maximum as separate progress.
   Reset only for a new run; compare records identically in Rust and TypeScript.
@@ -57,6 +59,9 @@
   validation or a second P7 pass. Keep the chosen orientation for later bags,
   export the symmetry assumption when it changes coverage or cost, and retain
   canonical bits/costs/input evidence without claiming reflected-input proof.
+  Traverse the first bag's 2,520 reflection pairs directly. A proven pair cost
+  may skip its other canonical query; skipped raw entries remain unknown.
+  Distinguish effective model coverage from actual canonical query counts.
 - Share only monotonic verified same-depth spin benchmarks between workers.
   Imported hints never create local progress or supply certificates. New
   benchmarks revoke old scheduling leases; backpropagation must not refill
@@ -68,12 +73,15 @@
   Static air clearance is not exact mino reachability; actual spin witnesses
   may override its roof/access penalties. Keep code and documents explicit.
 - Same-depth spin/quality disadvantage is a selective futility criterion,
-  never mathematical dominance between different boards. Preserve a reduced
-  re-search opportunity, remove selectively skipped plans from duplicate
-  memory, and reconsider them after horizon widening. Verified incumbents and
+  never mathematical dominance between different boards. Retain its verified
+  quality references across horizon widening; do not renew a dominated branch's
+  budget just because a larger cost allowance is available. A strictly promising
+  short continuation may earn one narrow initial probe. Verified incumbents and
   genuine terminal prefixes must not be erased by scheduler heuristics.
-  Pace slack decreases with distance to the active horizon; first-bag setup
+  Pace slack decreases with distance to the chosen horizon; first-bag setup
   protection must not become a permanent seven-lock discount in that cut.
+  Ordinary scheduling follows the preferred piece goal. Longer-horizon probes
+  must stay narrow and infrequent and must not bypass quality disadvantage.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.
@@ -85,10 +93,13 @@
 - Worker lanes partition first-placement proposals, not every complete build.
   Preserve independent P7 certificates, compact progress, correct replay
   ownership, manual worker preferences and all-worker pause/cancel semantics.
-- Display whole-bag end states and a real final partial bag, using Clearra's
-  piece palette. Recover colors only from recorded pre-clear placement cells
-  and actual line compression; never infer mino identity from mask differences.
-  CTK3/Fumen documents are bag diagrams, not a universal representative input
-  order. Preserve all 24 physical rows in CTK3 and reject Fumen exports with an
+- Default to the latest retained route and render a monochrome board without
+  column numbers or per-bag spin-gain decoration. Playback steps through the
+  actual representative piece frames; do not imply that order is universal.
+  Keep desktop controls within an ordinary Chrome viewport and label an exact
+  100% threshold as 100%, without an "at least" suffix.
+  CTK3/Fumen documents remain bag diagrams. Recover their colors only from
+  recorded pre-clear cells and actual line compression, never mask differences.
+  Preserve all 24 physical rows in CTK3 and reject Fumen exports with an
   occupied 24th row instead of cropping or using its separate garbage row.
   Report clipboard success only after the browser write succeeds.

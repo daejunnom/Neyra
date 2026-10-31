@@ -60,15 +60,21 @@ function fieldQuality(candidate: Candidate): number {
 export function betterPartial(a: Candidate, b: Candidate): boolean {
   const aRate = a.spins * countedPieces(b);
   const bRate = b.spins * countedPieces(a);
-  return aRate > bRate || (aRate === bRate &&
-    (a.spins > b.spins || (a.spins === b.spins &&
-      (fieldQuality(a) > fieldQuality(b) || (fieldQuality(a) === fieldQuality(b) &&
-        (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)))))));
+  if (aRate !== bRate) return aRate > bRate;
+  if (a.bagCount !== b.bagCount) return a.bagCount > b.bagCount;
+  if (a.spins !== b.spins) return a.spins > b.spins;
+  if (a.bagCount === 1 && b.bagCount === 1) {
+    const aStart = Number.isFinite(a.firstBagProbability) ? a.firstBagProbability! : 0;
+    const bStart = Number.isFinite(b.firstBagProbability) ? b.firstBagProbability! : 0;
+    if (aStart !== bStart) return aStart > bStart;
+  }
+  if (fieldQuality(a) !== fieldQuality(b)) return fieldQuality(a) > fieldQuality(b);
+  return a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability);
 }
 
 /** A plan ID alone cannot distinguish an improved record from its old export. */
 function samePartialRecord(a: Candidate, b: Candidate): boolean {
-  return a.id === b.id && a.spins === b.spins && a.placed === b.placed &&
+  return a.id === b.id && a.spins === b.spins && a.placed === b.placed && a.bagCount === b.bagCount &&
     fieldQuality(a) === fieldQuality(b) && a.probability === b.probability &&
     a.firstBagProbability === b.firstBagProbability && a.firstBagSymmetry === b.firstBagSymmetry &&
     a.firstBagSymmetryAssumed === b.firstBagSymmetryAssumed && a.frameCount === b.frameCount &&
@@ -77,7 +83,7 @@ function samePartialRecord(a: Candidate, b: Candidate): boolean {
 
 function partialArchiveKey(item: OwnedCandidate): string {
   const value = item.candidate;
-  return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, fieldQuality(value),
+  return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, value.bagCount, fieldQuality(value),
     value.probability, value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
     value.frameCount, value.rows]);
 }
@@ -92,6 +98,7 @@ export class SearchClient {
   private intent: 'running' | 'paused' | 'cancelled' = 'cancelled';
   private status: RunStatus = 'idle';
   private currentOwner: number | null = null;
+  private observingCurrent = false;
   private nextFocusAt = 0;
   private lastProgressAt = 0;
   private progressTimer: ReturnType<typeof setTimeout> | undefined;
@@ -122,7 +129,8 @@ export class SearchClient {
       try {
         worker = new Worker(new URL('./search.worker.ts', import.meta.url), { type: 'module' });
         const id = this.slots.length;
-        const slot: WorkerSlot = { id, worker, status: 'loading', snapshot: null, incumbent: null, watching: id === 0 };
+        const slot: WorkerSlot = { id, worker, status: 'loading', snapshot: null, incumbent: null,
+          watching: this.observingCurrent && id === 0 };
         worker.onmessage = (event: MessageEvent<EngineEvent>) => {
           if (this.runId !== runId || event.data.runId !== runId) return;
           this.handle(slot, event.data);
@@ -164,6 +172,14 @@ export class SearchClient {
     this.intent = 'paused';
     this.broadcast('pause');
     this.publishStatus();
+  }
+
+  /** Stream changing full current histories only while that tab is visible.
+   * Verified record archives and compact progress remain independent. */
+  observeCurrent(enabled: boolean) {
+    if (this.observingCurrent === enabled) return;
+    this.observingCurrent = enabled;
+    this.watchCurrentOwner(enabled ? this.currentCandidateOwner()?.slot.id : undefined);
   }
 
   resume() {
@@ -384,8 +400,9 @@ export class SearchClient {
   }
 
   private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
-    const merge = (next: Candidate | null, previous: Candidate | null | undefined) => {
+    const merge = (next: Candidate | null, previous: Candidate | null | undefined, exactRecord = false) => {
       if (next && next.frames.length === 0 && next.frameCount > 0 && previous?.id === next.id &&
+          (!exactRecord || samePartialRecord(next, previous)) &&
           previous.verified === next.verified && previous.placed === next.placed && previous.spins === next.spins &&
           previous.rows.length === next.rows.length && previous.rows.every((row, y) => row === next.rows[y]) &&
           previous.frames.length === next.frameCount) return { ...next, frames: previous.frames };
@@ -394,7 +411,7 @@ export class SearchClient {
     slot.snapshot = { ...snapshot,
       current: merge(snapshot.current, slot.snapshot?.current),
       best: merge(snapshot.best, slot.snapshot?.best),
-      bestPartial: merge(snapshot.bestPartial ?? null, slot.snapshot?.bestPartial) };
+      bestPartial: merge(snapshot.bestPartial ?? null, slot.snapshot?.bestPartial, true) };
     this.mergeBenchmarks(snapshot.bestSpinsByBag);
   }
 
@@ -469,7 +486,7 @@ export class SearchClient {
     const current = this.currentCandidateOwner();
     const best = this.bestOwner();
     const partial = this.partialOwner();
-    this.watchCurrentOwner(current?.slot.id);
+    this.watchCurrentOwner(this.observingCurrent ? current?.slot.id : undefined);
     if (!best) {
       this.archivePartial(partial);
       if (!this.pendingPartialArchive) this.requestPartialDetail(partial);

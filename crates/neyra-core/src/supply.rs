@@ -76,6 +76,55 @@ pub fn mirror_mask(mask: u8) -> u8 {
     })
 }
 
+/// Directly enumerate the 2,520 two-queue reflection orbits. A caller resolves
+/// one orbit only after its minimum accepting cost is known: an observed cost
+/// at a proven language-wide lower bound can skip the partner query. Otherwise
+/// both canonical queues must be evaluated. No canonical result is inferred.
+#[derive(Clone, Debug)]
+pub struct SymmetryOrbits {
+    cursor: usize,
+    checked: u16,
+    success: u16,
+    costs: Vec<u8>,
+}
+
+impl Default for SymmetryOrbits {
+    fn default() -> Self {
+        Self { cursor: 0, checked: 0, success: 0, costs: vec![0; P7_COUNT] }
+    }
+}
+
+impl SymmetryOrbits {
+    /// Each rank appears in exactly one pair. Reuse the existing reflection
+    /// map; no second rank table or board cache is shared between workers.
+    pub fn next_pair(&mut self) -> Option<[usize; 2]> {
+        while self.cursor < P7_COUNT {
+            let rank = self.cursor;
+            self.cursor += 1;
+            let mirrored = mirror_rank(rank);
+            if rank < mirrored { return Some([rank, mirrored]); }
+        }
+        None
+    }
+
+    pub fn resolve(&mut self, pair: [usize; 2], cost: u8) {
+        assert!((1..=7).contains(&cost) || cost == 255);
+        debug_assert_eq!(mirror_rank(pair[0]), pair[1]);
+        debug_assert!(pair[0] < pair[1]);
+        debug_assert_eq!(self.costs[pair[0]], 0);
+        debug_assert_eq!(self.costs[pair[1]], 0);
+        self.costs[pair[0]] = cost;
+        self.costs[pair[1]] = cost;
+        self.checked += 2;
+        if cost != 255 { self.success += 2; }
+    }
+
+    pub fn checked(&self) -> u16 { self.checked }
+    pub fn success(&self) -> u16 { self.success }
+    pub fn upper(&self) -> u16 { self.success + P7_COUNT as u16 - self.checked }
+    pub fn costs(&self) -> &[u8] { &self.costs }
+}
+
 /// Incremental coverage of canonical supplies and their reflected labels.
 /// Each orbit contains two distinct full-bag permutations. This is a supply
 /// calculation only: the caller must explicitly state its physical symmetry

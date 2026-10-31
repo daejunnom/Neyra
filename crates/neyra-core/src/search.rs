@@ -1,5 +1,5 @@
 //! Anytime de-novo fixed-bag construction search.
-//! Geometry proposals are bounded and heuristic; canonical P7 certificates are exact.
+//! Geometry proposals are bounded and heuristic; observed canonical P7 results are exact.
 //! Optional first-bag supply reflection is an explicitly exported approximation.
 //! Clearra's separation of logical-row operation language and supply language is
 //! retained here, with a 24-row SonicDropOnly physics backend.
@@ -10,8 +10,8 @@ use crate::structure::{
     BoardFacts, CellMask, SingleGoal,
 };
 use crate::supply::{
-    decode_order, minimum_finish, mirror_rank, permutation, symmetry_union_costs,
-    LanguageNode, SymmetryCoverage, ALL_PIECES, P7_COUNT,
+    decode_order, minimum_finish, permutation,
+    LanguageNode, SymmetryOrbits, ALL_PIECES, P7_COUNT,
 };
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
@@ -24,9 +24,9 @@ const SPIN_DELTA: u8 = 3;
 const RESIDUE_MARGIN: u16 = 12;
 const BUDGET_STALE_ROUNDS: u64 = 64;
 const EXPLORATION_INTERVAL: u64 = 8;
-const QUALITY_RESEARCH_INTERVAL: u64 = 8;
+const LONG_HORIZON_PROBE_INTERVAL: u64 = 32;
 const PACE_NEAR_SLACK: u16 = 2;
-const PACE_DISTANCE_SLACK: u16 = 6;
+const PACE_DISTANCE_SLACK: u16 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -267,9 +267,9 @@ struct Plan {
     /// Reuse the completed proposal's raw boundary evaluation in cheap cuts.
     #[serde(skip)]
     quality: f64,
-    /// Periodic reduced re-search; selective comparisons are not proofs.
+    /// One bounded longer-horizon proposal; ordinary work keeps the preferred pace.
     #[serde(skip)]
-    quality_escape: bool,
+    pace_fallback: bool,
     /// A bounded, exact geometric continuation, not a supply certificate.
     #[serde(skip)]
     future: Continuation,
@@ -845,7 +845,10 @@ struct BagCertificate {
     symmetry_costs: Option<Vec<u8>>,
     success: u16,
     effective_success: u16,
+    /// Supplies resolved in the selected model, including both members of an orbit.
     checked: u16,
+    /// Canonical queues actually evaluated; skipped partners retain unknown costs.
+    canonical_checked: u16,
     /// Stable lexicographic P7 rank, I J L O S T Z.
     #[serde(serialize_with = "serialize_bit_words")]
     success_bits: Vec<u64>,
@@ -869,26 +872,31 @@ struct VerificationJob {
     plan: Plan,
     graph: ExecutionGraph,
     language: Option<Vec<LanguageNode>>,
+    /// Number of supplies resolved in the selected model.
     checked: usize,
+    canonical_checked: usize,
+    /// Known canonical successes; unknown reflected partners are not failures.
     success: usize,
     costs: Vec<u8>,
     codes: Vec<u32>,
     bits: Vec<u64>,
     upper: u16,
     prefix_checked: bool,
-    symmetry: Option<SymmetryCoverage>,
+    symmetry: Option<SymmetryOrbits>,
+    minimum_cost: u8,
 }
 
 impl VerificationJob {
     fn new(parent: usize, plan: Plan) -> Self {
         let symmetry = (plan.start_pieces == 0 && plan.start == Board::default() && plan.assume_reflection)
-            .then(SymmetryCoverage::default);
+            .then(SymmetryOrbits::default);
         Self {
             graph: ExecutionGraph::new(&plan),
             parent,
             plan,
             language: None,
             checked: 0,
+            canonical_checked: 0,
             success: 0,
             costs: vec![0; P7_COUNT],
             codes: vec![0; P7_COUNT],
@@ -896,7 +904,24 @@ impl VerificationJob {
             upper: P7_COUNT as u16,
             prefix_checked: false,
             symmetry,
+            minimum_cost: 8,
         }
+    }
+
+    fn check_canonical(&mut self, rank: usize) -> u8 {
+        debug_assert_eq!(self.costs[rank], 0);
+        if let Some((cost, code)) =
+            minimum_finish(self.language.as_ref().unwrap(), &permutation(rank))
+        {
+            self.costs[rank] = cost;
+            self.codes[rank] = code;
+            self.bits[rank / 64] |= 1_u64 << (rank % 64);
+            self.success += 1;
+        } else {
+            self.costs[rank] = 255;
+        }
+        self.canonical_checked += 1;
+        self.costs[rank]
     }
 
     fn advance(&mut self, goal: u8, cache: &mut PhysicsCache) {
@@ -917,32 +942,45 @@ impl VerificationJob {
             return;
         }
         if self.language.is_none() {
+            // Every edge consumes one distinct target. Ignoring the incoming
+            // queue can only shorten an accepting path, so this is a safe
+            // cost lower bound even for a terminal partial first bag.
+            self.minimum_cost = self.graph.nodes.iter()
+                .filter(|node| node.accepting)
+                .map(|node| node.key.used.count_ones() as u8)
+                .min().unwrap_or(8);
             self.language = Some(self.graph.language());
         }
-        let end = (self.checked + 64).min(P7_COUNT);
-        for rank in self.checked..end {
-            if let Some((cost, code)) =
-                minimum_finish(self.language.as_ref().unwrap(), &permutation(rank))
-            {
-                self.costs[rank] = cost;
-                self.codes[rank] = code;
-                self.bits[rank / 64] |= 1_u64 << (rank % 64);
-                self.success += 1;
-            } else {
-                self.costs[rank] = 255;
+        if self.symmetry.is_some() {
+            let mut queries = 0;
+            // Resolve a whole pair atomically. Leave room for its second query
+            // so one slice still performs at most 64 canonical evaluations.
+            while queries < 63 && self.checked < P7_COUNT {
+                let pair = self.symmetry.as_mut().unwrap().next_pair().unwrap();
+                let first = self.check_canonical(pair[0]);
+                queries += 1;
+                let cost = if first == self.minimum_cost {
+                    first
+                } else {
+                    queries += 1;
+                    first.min(self.check_canonical(pair[1]))
+                };
+                let symmetry = self.symmetry.as_mut().unwrap();
+                symmetry.resolve(pair, cost);
+                self.checked = usize::from(symmetry.checked());
             }
-            if let Some(symmetry) = &mut self.symmetry {
-                symmetry.observe(rank, self.costs[rank] != 255);
-            }
+        } else {
+            let end = (self.checked + 64).min(P7_COUNT);
+            for rank in self.checked..end { self.check_canonical(rank); }
+            self.checked = end;
         }
-        self.checked = end;
-        self.upper = self
-            .upper
-            .min((self.success + P7_COUNT - self.checked) as u16);
+        self.upper = self.upper.min(
+            (self.success + P7_COUNT - self.canonical_checked) as u16,
+        );
     }
 
     fn coverage_success(&self) -> u16 {
-        self.symmetry.as_ref().map_or(self.success as u16, SymmetryCoverage::success)
+        self.symmetry.as_ref().map_or(self.success as u16, SymmetryOrbits::success)
     }
 
     fn coverage_upper(&self) -> u16 {
@@ -1315,6 +1353,7 @@ struct GenerationJob {
     first_bag_symmetry: bool,
     relaxed_setup: bool,
     continuation_minimum_success: u16,
+    pace_fallback: bool,
 }
 
 impl GenerationJob {
@@ -1428,6 +1467,7 @@ impl GenerationJob {
             first_bag_symmetry: node.pieces == 0,
             relaxed_setup: false,
             continuation_minimum_success: minimum_success,
+            pace_fallback: false,
         }
     }
 
@@ -2003,6 +2043,7 @@ enum SelectiveReason {
     BagDelta,
     Pace,
     Residue,
+    Quality,
 }
 
 /// User-requested selective pruning. None of these comparisons proves that a
@@ -2030,10 +2071,7 @@ fn selective_reason(
     // Use all placed locks, with room to prepare while the horizon is far
     // away. The setup exemption above does not permanently shift the curve.
     // Cross multiplication avoids rounding a quota at each bag boundary.
-    let horizon = u32::from(budget.max(1));
-    let slack = u32::from(PACE_NEAR_SLACK) * horizon
-        + u32::from(PACE_DISTANCE_SLACK) * u32::from(budget.saturating_sub(pieces));
-    if u32::from(goal) * u32::from(pieces) >= u32::from(spins) * horizon + slack {
+    if pace_cut(spins, pieces, goal, budget) {
         return Some(SelectiveReason::Pace);
     }
     let remaining_spins = u16::from(goal - spins);
@@ -2062,6 +2100,14 @@ fn productive_locks(pieces: u16) -> u16 {
 
 fn efficiency(spins: u8, pieces: u16) -> f64 {
     f64::from(spins) * 7.0 / f64::from(productive_locks(pieces))
+}
+
+fn pace_cut(spins: u8, pieces: u16, goal: u8, budget: u16) -> bool {
+    if pieces <= 7 || spins >= goal { return false; }
+    let horizon = u32::from(budget.max(1));
+    let slack = u32::from(PACE_NEAR_SLACK) * horizon
+        + u32::from(PACE_DISTANCE_SLACK) * u32::from(budget.saturating_sub(pieces));
+    u32::from(goal) * u32::from(pieces) >= u32::from(spins) * horizon + slack
 }
 
 fn pace_lag(spins: u8, pieces: u16, goal: u8, budget: u16) -> f64 {
@@ -2136,6 +2182,7 @@ pub struct SearchSession {
     dispatches: u64,
     focus_since_dispatch: u64,
     last_exploration_dispatch: u64,
+    last_pace_probe_dispatch: u64,
     exploration_phase: u8,
 }
 
@@ -2219,6 +2266,7 @@ impl SearchSession {
             dispatches: 0,
             focus_since_dispatch: 0,
             last_exploration_dispatch: 0,
+            last_pace_probe_dispatch: 0,
             exploration_phase: 0,
         })
     }
@@ -2235,7 +2283,7 @@ impl SearchSession {
                 let pieces = job.plan.start_pieces + job.plan.targets.len() as u16;
                 if !job.plan.terminal && selective_reason(
                     job.plan.expected.cell_count(), 0, pieces, job.plan.expected_spins,
-                    self.best_spins_by_bag[pieces as usize / 7], self.goal, self.active_budget,
+                    self.best_spins_by_bag[pieces as usize / 7], self.goal, self.proposal_budget(job.plan.pace_fallback),
                 ).is_some() {
                     // A newer peer result may invalidate the search lease,
                     // but unexamined supplies remain unknown, never failures.
@@ -2246,7 +2294,7 @@ impl SearchSession {
                 }
                 job.advance(self.goal, &mut self.physics_cache);
                 self.last_checked = job.checked as u16;
-                self.last_success = job.success as u16;
+                self.last_success = job.coverage_success();
                 if self.preview_steps % 16 == 0 {
                     self.update_verifying_preview(&job);
                 }
@@ -2267,7 +2315,7 @@ impl SearchSession {
                 // Imported or newly verified maxima take effect on the next
                 // work slice, including a generation already in flight.
                 job.best_bag_spins = self.best_spins_by_bag[(job.start_pieces as usize / 7) + 1];
-                job.prune_budget = self.active_budget;
+                job.prune_budget = self.proposal_budget(job.pace_fallback);
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
                 let prior_selective = job.selective_pruned;
@@ -2280,7 +2328,19 @@ impl SearchSession {
                 }
                 if job.next_layer() {
                     let parent = job.parent;
-                    for state in job.complete.into_iter().rev() {
+                    let mut completed = job.complete;
+                    if job.pace_fallback {
+                        // A longer-horizon probe buys at most one ordinary P7
+                        // candidate. Genuine finishes always retain verification.
+                        let mut ordinary = false;
+                        completed.retain(|state| {
+                            if state.spins >= self.goal { return true; }
+                            if ordinary { return false; }
+                            ordinary = true;
+                            true
+                        });
+                    }
+                    for state in completed.into_iter().rev() {
                         let pieces = job.start_pieces + state.targets.len() as u16;
                         if state.spins < self.goal
                             && selective_reason(
@@ -2290,7 +2350,7 @@ impl SearchSession {
                                 state.spins,
                                 self.best_spins_by_bag[pieces as usize / 7],
                                 self.goal,
-                                self.active_budget,
+                                job.prune_budget,
                             )
                             .is_some()
                         {
@@ -2315,7 +2375,7 @@ impl SearchSession {
                                 || self.tree[parent].certificates.first()
                                 .is_some_and(|certificate| certificate.first_bag_symmetry_assumed),
                             quality: state.quality,
-                            quality_escape: job.variant % QUALITY_RESEARCH_INTERVAL == 0,
+                            pace_fallback: job.pace_fallback,
                             future: state.future,
                             debt: state.debt,
                         };
@@ -2345,7 +2405,7 @@ impl SearchSession {
             if let Some(parent) = self.focus {
                 let lease_valid = self.tree[parent].lease_epoch == self.benchmark_epoch
                     && self.dispatches.saturating_sub(self.focus_since_dispatch) < EXPLORATION_INTERVAL
-                    && self.node_selective_reason(parent).is_none();
+                    && self.regular_node_eligible(parent);
                 if let Some(index) = self.best_waiting_plan(Some(parent)).filter(|_| lease_valid) {
                     let (_, plan) = self.waiting_plans.remove(index);
                     self.begin_verification(parent, plan);
@@ -2414,7 +2474,7 @@ impl SearchSession {
                 plan.expected_spins,
                 self.best_spins_by_bag[pieces as usize / 7],
                 self.goal,
-                self.active_budget,
+                self.proposal_budget(plan.pace_fallback),
             ).is_some()
         {
             self.selective_pruned += 1;
@@ -2459,7 +2519,7 @@ impl SearchSession {
     }
 
     fn quality_prune_plan(&self, parent: usize, plan: &Plan) -> bool {
-        if plan.terminal || plan.quality_escape { return false; }
+        if plan.terminal { return false; }
         let Some(better_spins) = self.quality_dominator(
             plan.start_pieces + plan.targets.len() as u16, plan.expected_spins, plan.quality,
         ) else { return false; };
@@ -2467,24 +2527,49 @@ impl SearchSession {
             .saturating_sub(self.tree[parent].last_improved_attempt);
         // Give a coherent, promising preparation its first reduced probes.
         // Repeated unsupported optimism cannot buy unlimited verification.
-        !(stale <= 2 && plan.expected_spins.saturating_add(plan.future.spins) > better_spins)
+        !(stale <= 1 && plan.expected_spins.saturating_add(plan.future.spins) > better_spins)
     }
 
     fn widen_budget(&mut self) {
         let widened = self.active_budget.saturating_add(7).min(self.config.max_pieces);
         if widened != self.active_budget {
             self.active_budget = widened;
-            // Lower-quality preparations can become useful with more room.
-            // This resets only selective references, never verified records.
-            self.best_quality_by_bag.fill([f64::NEG_INFINITY; TARGET_SPINS as usize + 1]);
+            // More available locks do not erase an already qualified spin and
+            // quality disadvantage. Longer routes use a separate small probe.
             self.benchmark_epoch += 1;
             self.focus = None;
         }
         self.last_budget_progress_round = self.generation_rounds;
     }
 
+    fn preferred_pace_budget(&self) -> u16 {
+        let material_floor = (u16::from(self.goal) * 10).div_ceil(4);
+        self.config.piece_goal.max(material_floor).min(self.active_budget).max(1)
+    }
+
+    fn proposal_budget(&self, pace_fallback: bool) -> u16 {
+        if pace_fallback { self.active_budget } else { self.preferred_pace_budget() }
+    }
+
+    fn behind_preferred_pace(&self, index: usize) -> bool {
+        let node = &self.tree[index];
+        pace_cut(node.spins, node.pieces, self.goal, self.preferred_pace_budget())
+    }
+
+    fn regular_node_eligible(&self, index: usize) -> bool {
+        self.can_expand(index) && self.node_selective_reason(index).is_none()
+            && !self.behind_preferred_pace(index)
+    }
+
     fn node_selective_reason(&self, index: usize) -> Option<SelectiveReason> {
         let node = &self.tree[index];
+        if let Some(better_spins) = self.quality_dominator(node.pieces, node.spins, node.quality) {
+            // A concrete next-bag witness gets one narrow opportunity only.
+            // Widening a horizon or an ageing priority cannot renew it.
+            if node.attempts != 0 || node.spins.saturating_add(node.future.spins) <= better_spins {
+                return Some(SelectiveReason::Quality);
+            }
+        }
         selective_reason(
             node.board.cell_count(),
             node.obstructed_mass,
@@ -2533,7 +2618,7 @@ impl SearchSession {
         let node = &self.tree[index];
         if self.node_quality_dominated(index) { return 1; }
         productive_rounds(node.spins, node.pieces, self.last_bag_spins(index),
-            node.future.spins, stale, self.goal, self.active_budget)
+            node.future.spins, stale, self.goal, self.preferred_pace_budget())
     }
 
     /// Peers share only verified performance benchmarks. These selective hints
@@ -2569,7 +2654,39 @@ impl SearchSession {
             }).map(|(index, _)| index)
     }
 
+    fn explore_pace_probe(&mut self) -> bool {
+        if self.active_budget <= self.preferred_pace_budget()
+            || self.dispatches.saturating_sub(self.last_pace_probe_dispatch) < LONG_HORIZON_PROBE_INTERVAL
+        { return false; }
+        let parent = (1..self.tree.len())
+            .filter(|&i| self.tree[i].pieces > 7
+                && (self.tree[i].attempts > 0 || self.behind_preferred_pace(i))
+                && self.dispatches.saturating_sub(self.tree[i].last_selected) >= EXPLORATION_INTERVAL
+                && self.can_expand(i) && self.node_selective_reason(i).is_none()
+                && !self.node_quality_dominated(i))
+            .max_by(|&a, &b| {
+                let priority = |i: usize| {
+                    let n = &self.tree[i];
+                    efficiency(n.spins, n.pieces)
+                        + 0.2 * n.quality / (120.0 + n.quality.abs())
+                        + 0.002 * self.dispatches.saturating_sub(n.last_selected).min(128) as f64
+                        - 0.05 * f64::from(n.attempts)
+                };
+                self.behind_preferred_pace(a).cmp(&self.behind_preferred_pace(b))
+                    .then_with(|| priority(a).total_cmp(&priority(b)))
+            });
+        let Some(parent) = parent else { return false; };
+        self.last_pace_probe_dispatch = self.dispatches;
+        self.last_exploration_dispatch = self.dispatches;
+        self.focus = None;
+        self.tree[parent].allowance = self.tree[parent].attempts + 1;
+        self.tree[parent].lease_epoch = self.benchmark_epoch;
+        self.begin_generation_with_pace(parent, true);
+        true
+    }
+
     fn explore_once(&mut self) -> bool {
+        if self.explore_pace_probe() { return true; }
         if self.dispatches.saturating_sub(self.last_exploration_dispatch) < EXPLORATION_INTERVAL {
             return false;
         }
@@ -2584,7 +2701,7 @@ impl SearchSession {
                 return true;
             }
         }
-        let eligible = |i: usize| self.can_expand(i) && self.node_selective_reason(i).is_none();
+        let eligible = |i: usize| self.regular_node_eligible(i);
         let parent = if phase == 0 && eligible(0) { Some(0) }
         else if phase == 1 {
             (1..self.tree.len()).filter(|&i| eligible(i) && self.tree[i].pieces == 7
@@ -2605,14 +2722,18 @@ impl SearchSession {
     }
 
     fn begin_generation(&mut self, parent: usize) {
+        self.begin_generation_with_pace(parent, false);
+    }
+
+    fn begin_generation_with_pace(&mut self, parent: usize, pace_fallback: bool) {
         let attempt = self.tree[parent].attempts;
         let minimum = if parent == 0 {
             self.first_bag_minimum().max(if self.config.ignore_first_bag_probability { 1 }
                 else { required_success(&[], self.config.min_success_percent) })
         } else { required_success(self.counted_counts(&self.tree[parent].counts), self.config.min_success_percent) };
         // Re-search only selected boundaries more broadly; siblings start cheap.
-        let under_pace = under_pace(self.tree[parent].spins, self.tree[parent].pieces,
-            self.goal, self.active_budget) || self.node_quality_dominated(parent);
+        let under_pace = pace_fallback || under_pace(self.tree[parent].spins, self.tree[parent].pieces,
+            self.goal, self.preferred_pace_budget()) || self.node_quality_dominated(parent);
         let stage = if under_pace { 0 }
             else { (attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2) };
         let width = (self.config.beam_width >> (2 - stage)).max(4);
@@ -2631,7 +2752,8 @@ impl SearchSession {
         );
         generation.best_bag_spins =
             self.best_spins_by_bag[(self.tree[parent].pieces as usize / 7) + 1];
-        generation.prune_budget = self.active_budget;
+        generation.prune_budget = self.proposal_budget(pace_fallback);
+        generation.pace_fallback = pace_fallback;
         generation.first_bag_symmetry = parent == 0
             && (!self.config.ignore_first_bag_probability || self.config.first_bag_min_success_percent > 0.0);
         generation.relaxed_setup = parent == 0;
@@ -2698,14 +2820,13 @@ impl SearchSession {
         // Bounded best-first resumption between focused depth-first stretches.
         // The exact mass/cost bound prunes; this priority only schedules effort.
         let earliest = (0..self.tree.len())
-            .filter(|&i| self.can_expand(i) && self.node_selective_reason(i).is_none())
+            .filter(|&i| self.regular_node_eligible(i))
             .map(|i| self.tree[i].revisit_after)
             .min()?;
         self.schedule_epoch = self.schedule_epoch.max(earliest);
         (0..self.tree.len())
             .filter(|&i| {
-                self.can_expand(i)
-                    && self.node_selective_reason(i).is_none()
+                self.regular_node_eligible(i)
                     && self.tree[i].revisit_after <= self.schedule_epoch
             })
             .max_by(|&a, &b| {
@@ -2823,7 +2944,7 @@ impl SearchSession {
                 assume_reflection: (job.start_pieces == 0 && (!self.config.ignore_first_bag_probability || self.config.first_bag_min_success_percent > 0.0))
                     || parent.certificates.first().is_some_and(|c| c.first_bag_symmetry_assumed),
                 quality: seed.quality,
-                quality_escape: job.variant % QUALITY_RESEARCH_INTERVAL == 0,
+                pace_fallback: job.pace_fallback,
                 future: seed.future.clone(),
                 debt: seed.debt,
             }),
@@ -2853,8 +2974,8 @@ impl SearchSession {
                 current.summary.first_bag_probability = lower_counts.first()
                     .map(|count| f64::from(*count) / P7_COUNT as f64);
                 current.summary.checked = job.checked as u16;
-                current.summary.success = job.success as u16;
-                current.summary.failed = (job.checked - job.success) as u16;
+                current.summary.success = job.coverage_success();
+                current.summary.failed = job.checked as u16 - job.coverage_success();
                 return;
             }
         }
@@ -2877,8 +2998,8 @@ impl SearchSession {
                 qualified: false,
                 verified: false,
                 checked: job.checked as u16,
-                success: job.success as u16,
-                failed: (job.checked - job.success) as u16,
+                success: job.coverage_success(),
+                failed: job.checked as u16 - job.coverage_success(),
                 bag_count: parent.counts.len() as u16 + 1,
                 budget_pieces: None,
                 cdf: vec![],
@@ -2898,7 +3019,7 @@ impl SearchSession {
         let mut counts = parent.counts.clone();
         counts.push(job.coverage_success());
         let total_probability = self.path_probability(&counts);
-        let symmetry_costs = job.symmetry.as_ref().map(|_| symmetry_union_costs(&job.costs));
+        let symmetry_costs = job.symmetry.as_ref().map(|orbits| orbits.costs().to_vec());
         let symmetry_assumed = job.plan.start_pieces > 0 && job.plan.assume_reflection
             || symmetry_costs.as_ref().is_some_and(|costs| *costs != job.costs);
         let effective_costs = symmetry_costs.as_deref().unwrap_or(&job.costs);
@@ -2933,8 +3054,10 @@ impl SearchSession {
             self.path_qualifies(&counts)
         };
         let desired = budget.map(|n| n - parent.pieces).unwrap_or(7) as u8;
+        // The selected witness must have actually been queried and have
+        // the orbit minimum cost. A skipped partner remains zero, not a path.
         let canonical_choice = |rank: usize| job.symmetry.is_none()
-            || job.costs[rank] <= job.costs[mirror_rank(rank)];
+            || (job.costs[rank] > 0 && job.costs[rank] == effective_costs[rank]);
         let representative = job.costs.iter().enumerate()
             .position(|(rank, c)| *c == desired && canonical_choice(rank))
             .or_else(|| job.costs.iter().enumerate()
@@ -2969,6 +3092,7 @@ impl SearchSession {
             success: job.success as u16,
             effective_success: *counts.last().unwrap(),
             checked: P7_COUNT as u16,
+            canonical_checked: job.canonical_checked as u16,
             success_bits: job.bits,
             costs: job.costs,
             order_codes: job.codes,
@@ -3082,7 +3206,7 @@ impl SearchSession {
                         job.plan.future.spins,
                         0,
                         self.goal,
-                        self.active_budget,
+                        self.preferred_pace_budget(),
                     ) },
                     lease_epoch: self.benchmark_epoch,
                     last_selected: self.dispatches,
@@ -3106,7 +3230,9 @@ impl SearchSession {
                         source.last_improved_attempt = source.attempts;
                         source.revisit_after = self.schedule_epoch;
                     }
-                    self.focus = Some(child);
+                    // A successful fallback is archived, but cannot start a
+                    // large depth-first lease until its actual pace recovers.
+                    self.focus = self.regular_node_eligible(child).then_some(child);
                     self.focus_since_dispatch = self.dispatches;
                 }
             } else {
@@ -3252,16 +3378,21 @@ impl SearchSession {
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
             "interchange": false, "globalOptimalityProven": false,
             "probabilityScope": if self.config.ignore_first_bag_probability { "AfterFirstBag" } else { "AllBags" },
-            "firstBagSymmetryPolicy": "AssumeJLAndSZSupplyReflection;chooseLowerCostOnFirstQueue;canonicalOnTie;fixedOrientationAfterStart",
+            "firstBagSymmetryPolicy": "AssumeJLAndSZSupplyReflection;resolveQueuePairsAtMinimumCost;useVerifiedOrientation;fixedOrientationAfterStart",
+            "checkedMeaning": "checked=resolvedModelSupplies;canonicalChecked=actuallyEvaluatedCanonicalSupplies",
             "firstBagSymmetryAssumed": archive.is_some_and(|a| a.summary.first_bag_symmetry_assumed),
             "mirroredInputsVerified": false,
-            "costsMeaning": "0=unknown;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=assumedReflectionUnion",
-            "displayPartialRanking": "spins/max(7,placed);thenSpins;thenFieldQuality;thenFewerLocks;thenProbability",
+            "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
+            "displayPartialRanking": "spins/max(7,placed);thenMoreBags;thenSpins;oneBagThenStartProbability;thenFieldQuality;thenFewerLocks;thenProbability",
             "selectiveSearch": {
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
                 "paceNearSlack": PACE_NEAR_SLACK, "paceDistanceSlack": PACE_DISTANCE_SLACK,
                 "paceIncludesSetup": true,
-                "qualityResearchInterval": QUALITY_RESEARCH_INTERVAL, "qualityPruned": self.quality_pruned,
+                "qualityResearchInterval": 0, "qualityPruned": self.quality_pruned,
+                "qualityReferencesSurviveBudgetWidening": true,
+                "qualityPreparationRounds": 1,
+                "preferredPaceBudget": self.preferred_pace_budget(),
+                "longHorizonProbeInterval": LONG_HORIZON_PROBE_INTERVAL,
                 "activeBudget": self.active_budget,
                 "budgetStaleRounds": BUDGET_STALE_ROUNDS,
                 "explorationInterval": EXPLORATION_INTERVAL,
@@ -3277,7 +3408,14 @@ fn better_partial(a: &CandidateSummary, b: &CandidateSummary) -> bool {
     let lhs = u32::from(a.spins) * u32::from(b.placed.max(7));
     let rhs = u32::from(b.spins) * u32::from(a.placed.max(7));
     lhs.cmp(&rhs)
+        .then_with(|| a.bag_count.cmp(&b.bag_count))
         .then_with(|| a.spins.cmp(&b.spins))
+        .then_with(|| {
+            if a.bag_count == 1 && b.bag_count == 1 {
+                a.first_bag_probability.unwrap_or(0.0).partial_cmp(&b.first_bag_probability.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else { std::cmp::Ordering::Equal }
+        })
         .then_with(|| a.field_quality.partial_cmp(&b.field_quality).unwrap_or(std::cmp::Ordering::Equal))
         .then_with(|| b.placed.cmp(&a.placed))
         .then_with(|| a.probability.partial_cmp(&b.probability).unwrap_or(std::cmp::Ordering::Equal))
@@ -3417,7 +3555,7 @@ mod tests {
             terminal: true,
             assume_reflection: false,
             quality: 0.0,
-            quality_escape: false,
+            pace_fallback: false,
             future: Continuation::default(),
             debt: [0; HEIGHT],
         };
@@ -3478,7 +3616,7 @@ mod tests {
             terminal: true,
             assume_reflection: false,
             quality: 0.0,
-            quality_escape: false,
+            pace_fallback: false,
             future: Continuation::default(),
             debt: [0; HEIGHT],
         };

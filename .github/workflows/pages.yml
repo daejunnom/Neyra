@@ -1,0 +1,90 @@
+name: Test and deploy Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.25.0
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust and Wasm target
+        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --target wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindgen_archive="$RUNNER_TEMP/wasm-bindgen.tar.gz"
+          bindgen_dir="$RUNNER_TEMP/neyra-wasm-bindgen"
+          curl --fail --location --retry 3 \
+            https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.104/wasm-bindgen-0.2.104-x86_64-unknown-linux-musl.tar.gz \
+            --output "$bindgen_archive"
+          printf '%s  %s\n' '9553740907c2c1008f9a44bb00ed1f5b39ffc55d9d331581b5aebc891a4b772f' "$bindgen_archive" | sha256sum --check
+          mkdir -p "$bindgen_dir"
+          tar -xzf "$bindgen_archive" -C "$bindgen_dir" --strip-components=1
+          test "$("$bindgen_dir/wasm-bindgen" --version)" = 'wasm-bindgen 0.2.104'
+          echo "$bindgen_dir" >> "$GITHUB_PATH"
+
+      - name: Test Rust
+        run: cargo test --locked
+
+      - name: Check Svelte and TypeScript
+        run: pnpm check
+
+      - name: Build site
+        env:
+          NEYRA_BASE_PATH: /Neyra
+        run: pnpm build
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Include license notices
+        run: |
+          install -m 644 LICENSE apps/neyra-web/build/LICENSE.txt
+          install -m 644 THIRD_PARTY_NOTICES.md apps/neyra-web/build/THIRD_PARTY_NOTICES.txt
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/neyra-web/build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

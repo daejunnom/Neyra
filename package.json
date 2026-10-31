@@ -1,0 +1,14 @@
+{
+  "name": "neyra",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "pnpm --filter @neyra/web dev",
+    "check": "pnpm --filter @neyra/web check",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build": "pnpm build:wasm && pnpm --filter @neyra/web build",
+    "preview": "pnpm --filter @neyra/web preview"
+  }
+}
+

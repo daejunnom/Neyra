@@ -32,9 +32,10 @@ export interface Candidate {
   spins: number;
   placed: number;
   probability: number;
-  /** Actual first-bag chance, even when the displayed probability excludes it. */
+  /** First-bag chance under the selected symmetry policy, even when excluded. */
   firstBagProbability?: number | null;
   firstBagSymmetry?: boolean;
+  firstBagSymmetryAssumed?: boolean;
   lowerProbability: number;
   upperProbability: number;
   complete: boolean;
@@ -49,6 +50,8 @@ export interface Candidate {
   frames: BoardFrame[];
   frameCount: number;
   rankingScore: number;
+  /** Unbounded terrain evaluation, used to break equal-efficiency record ties. */
+  fieldQuality: number;
 }
 
 export interface SearchSnapshot {
@@ -101,7 +104,7 @@ export type EngineCommand =
 
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
-  ignore_first_bag_probability: false,
+  ignore_first_bag_probability: true,
   piece_goal: 119,
   max_pieces: 140,
   budget_start: 0,

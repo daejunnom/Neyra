@@ -10,8 +10,8 @@ use crate::physics::{Board, Piece, Pose, FULL_ROW, HEIGHT, WIDTH};
 pub(crate) type CellMask = [u16; HEIGHT];
 
 // A smooth skyline is a weak convenience, not evidence of a usable spin
-// sequence. Bound only this preference; holes, access debt and roof towers
-// retain their own costs and cannot hide inside this cap.
+// sequence. Bound only this preference; holes, access debt, severe bank
+// repair pressure and roof towers retain their own costs outside this cap.
 const SKYLINE_PREFERENCE_LIMIT: f64 = 6.0;
 
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
@@ -122,7 +122,11 @@ impl BoardFacts {
             let runs = (gaps & !(gaps << 1)).count_ones() as u16;
             facts.row_gap_runs += runs;
             facts.split_gaps += runs.saturating_sub(1);
-            let mut remaining = if runs > 1 && facts.holes[y] != 0 { gaps } else { 0 };
+            let mut remaining = if runs > 1 && facts.holes[y] != 0 {
+                gaps
+            } else {
+                0
+            };
             let mut buried_runs = 0_u16;
             while remaining != 0 {
                 let left = remaining.trailing_zeros();
@@ -392,23 +396,32 @@ impl BoardFacts {
                 & FULL_ROW,
             self.workspace_roof_top,
         ));
-        let surface_fragmentation = self.split_gaps.saturating_sub(self.buried_split_gaps)
-            as f64 * 0.25;
+        let surface_fragmentation =
+            self.split_gaps.saturating_sub(self.buried_split_gaps) as f64 * 0.25;
         let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
+            let (_, _, repair_pressure) = self.bank_skyline(0, 0);
             return -defects
                 - (self.roughness as f64 * 0.05 + surface_fragmentation)
-                    .min(SKYLINE_PREFERENCE_LIMIT);
+                    .min(SKYLINE_PREFERENCE_LIMIT)
+                - repair_pressure;
         };
         let footprint = usable_goal.map_or(self.workspace_columns, SingleGoal::working_columns);
-        let mut linear = 0_u16;
-        let mut squared = 0_u16;
-        for x in 0..WIDTH - 1 {
-            if working & (3 << x) == 0 {
-                let change = self.heights[x].abs_diff(self.heights[x + 1]) as u16;
-                linear += change;
-                squared += change * change;
-            }
-        }
+        // The dynamic opening does not prove that its neighbouring bank
+        // needs a roof. Reserve the full rim only for a concrete usable goal.
+        let repair_protected = if usable_goal.is_some() {
+            // A final mino may occupy only one side of a wider connected
+            // opening. Keep its other side out of bank repair pressure too.
+            working
+                | if self.workspace_columns & working != 0 {
+                    self.workspace_columns
+                } else {
+                    0
+                }
+        } else {
+            footprint
+        };
+        let (linear, squared, repair_pressure) = self.bank_skyline(working, repair_protected);
+        let rim_pressure = usable_goal.map_or(0, |_| self.roof_rim_pressure(footprint, roof_top));
         let excess = self.heights.iter().enumerate().fold(0_u16, |sum, (x, h)| {
             // The rim can be a tall legitimate bank alongside a low pocket.
             // Only towers over the final mino's own columns are capped here.
@@ -427,8 +440,86 @@ impl BoardFacts {
         };
         let skyline = (linear as f64 * 0.08 + squared as f64 * 0.012 + surface_fragmentation)
             .min(SKYLINE_PREFERENCE_LIMIT);
-        -defects - skyline - excess as f64 * 0.10 - opening_cost
+        -defects
+            - skyline
+            - repair_pressure
+            - rim_pressure as f64 * 0.45
+            - excess as f64 * 0.10
+            - opening_cost
     }
+
+    /// Ordinary bank steps only affect the capped skyline preference. Large
+    /// cliffs and deep, one-column wells restrict the next bag's useful piece
+    /// choices, so their excess receives a separate repair-pressure cost.
+    /// This is not a feasibility test: no piece order or future clear is known.
+    /// Reuse the nine bank edges. Normal skyline texture may use the generous
+    /// pocket rim; severe bank defects only inherit that rim from a usable
+    /// goal. In either case the movable central opening itself is protected.
+    fn bank_skyline(&self, working: u16, repair_protected: u16) -> (u16, u16, f64) {
+        let mut linear = 0_u16;
+        let mut squared = 0_u16;
+        let mut cliffs = 0_u16;
+        let mut narrow_wells = 0_u16;
+        for x in 0..WIDTH - 1 {
+            let change = self.heights[x].abs_diff(self.heights[x + 1]) as u16;
+            if working & (3 << x) == 0 {
+                linear += change;
+                squared += change * change;
+            }
+            if repair_protected & (3 << x) == 0 {
+                // Up to three rows often match an ordinary J/L or I surface.
+                // Taller differences must not disappear when skyline caps.
+                let surplus = change.saturating_sub(3);
+                cliffs += repair_severity(surplus);
+                if x > 0 && repair_protected & (1 << (x - 1)) == 0 {
+                    let depth = self.heights[x - 1]
+                        .min(self.heights[x + 1])
+                        .saturating_sub(self.heights[x]);
+                    // Two-deep notches remain ordinary surface texture.
+                    // Deeper interior shafts introduce specific-piece debt;
+                    // an edge well remains eligible for the normal edge I.
+                    let surplus = depth.saturating_sub(2) as u16;
+                    narrow_wells += repair_severity(surplus);
+                }
+            }
+        }
+        (
+            linear,
+            squared,
+            cliffs as f64 * 0.45 + narrow_wells as f64 * 0.60,
+        )
+    }
+
+    /// A goal's rim may contain its necessary roof or a tall, continuous bank.
+    /// It may not conceal an isolated spike far above both that roof and the
+    /// outer bank. Only the excess above both is charged, never the low pocket
+    /// beside a tall bank. There are at most two rim-to-bank edges to inspect.
+    fn roof_rim_pressure(&self, footprint: u16, roof_top: u8) -> u16 {
+        let left = footprint.trailing_zeros() as usize;
+        let right = (u16::BITS - footprint.leading_zeros()) as usize;
+        let neighbours = [
+            (left.checked_sub(1), left.checked_sub(2)),
+            (
+                (right < WIDTH).then_some(right),
+                (right + 1 < WIDTH).then_some(right + 1),
+            ),
+        ];
+        neighbours.into_iter().fold(0, |pressure, pair| {
+            let (Some(rim), Some(bank)) = pair else {
+                return pressure;
+            };
+            let rise = self.heights[rim].saturating_sub(roof_top.max(self.heights[bank]));
+            pressure + repair_severity(rise.saturating_sub(3) as u16)
+        })
+    }
+}
+
+/// Preserve a growing cost instead of another saturation plateau. The first
+/// tetromino-height of excess is quadratic; beyond it the marginal cost stays
+/// linear, so a ceiling-scale defect cannot inflate the squared term forever.
+fn repair_severity(excess: u16) -> u16 {
+    let local = excess.min(4);
+    local * local + excess.saturating_sub(4) * 8
 }
 
 fn two_banks(row: u16, opening: u16) -> bool {

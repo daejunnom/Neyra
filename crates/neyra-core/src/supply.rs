@@ -78,8 +78,8 @@ pub fn mirror_mask(mask: u8) -> u8 {
 
 /// Incremental coverage of canonical supplies and their reflected labels.
 /// Each orbit contains two distinct full-bag permutations. This is a supply
-/// calculation only: callers must first establish a reflection-safe movement
-/// policy, including every later bag that continues in the chosen orientation.
+/// calculation only: the caller must explicitly state its physical symmetry
+/// assumption, including later bags in the orientation chosen at the start.
 #[derive(Clone, Debug)]
 pub struct SymmetryCoverage {
     /// Low bits: checked orbit members. High bits: successful members.
@@ -132,7 +132,8 @@ impl SymmetryCoverage {
     }
 }
 
-/// Exact shortest costs within a fully checked reflection-safe policy.
+/// Shortest costs in the supply-label reflection model, after a complete
+/// canonical check. This arithmetic does not verify reflected input paths.
 /// Orientation may be chosen once from the first bag's visible queue. The
 /// original costs and codes must remain available for the canonical witness.
 /// Values are 1..=7 or 255; unknown entries cannot become certified minima.

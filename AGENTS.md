@@ -40,16 +40,20 @@
   can reverse a one-spin difference, never a two-spin difference. Keep raw
   evaluation separate and normalize once; no bonuses after normalization.
   Temporary scheduling cooldowns must not change the archived best route.
-- The displayed partial record uses spins/max(7, placed-7), then more total
-  spins, fewer locks and higher effective probability. Keep the total-spin
-  maximum as separate progress. Reset only for a new run; preserve certificate
-  ownership and compare records with the same function in Rust and TypeScript.
-- First-bag probability exclusion is opt-in and conditional on a constructible
-  first bag. Preserve its actual chance; zero successful starts never qualify.
-  First-bag reflection swaps J/L and S/Z together. Ordered 180 kicks and spawn
-  are not fully symmetric: certify shared reflected edges and keep the chosen
-  orientation for later bags. Restricted-policy failures are not a proof of
-  physical impossibility. Keep ordinary and reflection-safe policies distinct.
+- The displayed partial record uses spins/max(7, placed), then more total
+  spins, higher raw field quality, fewer locks and higher effective probability.
+  Include the setup bag in every public efficiency value; only internal
+  scheduling may exclude it. Keep the total-spin maximum as separate progress.
+  Reset only for a new run; compare records identically in Rust and TypeScript.
+  Same-ID quality improvements must replace old fields and archived exports.
+- First-bag probability exclusion defaults on and is conditional on a
+  constructible first bag. Preserve its separate chance and explicit saved
+  settings; zero successful starts never qualify. When counted, first-bag
+  reflection swaps J/L and S/Z together in the canonical supply results.
+  The user accepts rare kick/spawn asymmetry: do not add reflected physical
+  validation or a second P7 pass. Keep the chosen orientation for later bags,
+  export the symmetry assumption when it changes coverage or cost, and retain
+  canonical bits/costs/input evidence without claiming reflected-input proof.
 - Share only monotonic verified same-depth spin benchmarks between workers.
   Imported hints never create local progress or supply certificates. New
   benchmarks revoke old scheduling leases; backpropagation must not refill

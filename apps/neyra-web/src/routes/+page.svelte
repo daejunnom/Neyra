@@ -22,7 +22,7 @@
   let view: 'current' | 'best' = 'current';
   let frameIndex = -1;
   let playing = false;
-  let visibleCandidateId = '';
+  let visibleCandidateKey = '';
   let savedMessage = '';
   let notice = '';
   let availableWorkers = 1;
@@ -55,8 +55,10 @@
     completed: '이번 탐색 완료',
     failed: '탐색을 멈췄어요'
   } as Record<RunStatus, string>)[status];
-  $: if (candidate?.id !== visibleCandidateId) {
-    visibleCandidateId = candidate?.id ?? '';
+  $: candidateKey = candidate ? JSON.stringify([candidate.id, candidate.verified, candidate.spins,
+    candidate.placed, candidate.fieldQuality, candidate.frameCount, candidate.rows]) : '';
+  $: if (candidateKey !== visibleCandidateKey) {
+    visibleCandidateKey = candidateKey;
     frameIndex = -1;
     playing = false;
   }
@@ -87,7 +89,8 @@
     const scope = conditionalProbability ? '2가방부터' : item.verified ? '선택한 후보 구축률' : '구축률 확인 중';
     const first = conditionalProbability && item.firstBagProbability != null
       ? ` · 첫 가방 ${percent(item.firstBagProbability)}` : '';
-    return `${scope} · ${coverageLabel(item)}${first}`;
+    const symmetry = item.firstBagSymmetryAssumed ? ' · 대칭 가정' : '';
+    return `${scope} · ${coverageLabel(item)}${first}${symmetry}`;
   }
   function receive(event: EngineEvent) {
     if (event.type === 'progress') {
@@ -294,7 +297,7 @@
               <div><strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
               <p>{budgetCoverageLabel(bestRoute)} {conditionalProbability ? '2가방부터 성공률' : '성공률'} <Icon name="arrow" size={13} /></p>
             {:else}
-              <div><strong title="첫 준비 가방을 제외한 효율 · 최소 1가방">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
+              <div><strong title="첫 가방을 포함한 전체 배치 기준">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
               <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
             {/if}
           </button>

@@ -43,22 +43,43 @@ export function betterComplete(a: Candidate, b: Candidate): boolean {
     (atBudget(a) > atBudget(b) || (atBudget(a) === atBudget(b) && a.probability > b.probability)));
 }
 
-/** First-bag preparation is excluded; at least one full bag is counted. */
-export function productivePieces(candidate: Candidate): number {
-  return Math.max(7, candidate.placed - 7);
+/** Displayed efficiency includes the opening bag; count at least one bag. */
+export function countedPieces(candidate: Candidate): number {
+  return Math.max(7, candidate.placed);
 }
 
 export function spinsPerBag(candidate: Candidate): number {
-  return candidate.spins * 7 / productivePieces(candidate);
+  return candidate.spins * 7 / countedPieces(candidate);
+}
+
+function fieldQuality(candidate: Candidate): number {
+  return Number.isFinite(candidate.fieldQuality) ? candidate.fieldQuality : -Infinity;
 }
 
 /** Compare the displayed efficiency record without floating-point division. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
-  const aRate = a.spins * productivePieces(b);
-  const bRate = b.spins * productivePieces(a);
+  const aRate = a.spins * countedPieces(b);
+  const bRate = b.spins * countedPieces(a);
   return aRate > bRate || (aRate === bRate &&
     (a.spins > b.spins || (a.spins === b.spins &&
-      (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)))));
+      (fieldQuality(a) > fieldQuality(b) || (fieldQuality(a) === fieldQuality(b) &&
+        (a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability)))))));
+}
+
+/** A plan ID alone cannot distinguish an improved record from its old export. */
+function samePartialRecord(a: Candidate, b: Candidate): boolean {
+  return a.id === b.id && a.spins === b.spins && a.placed === b.placed &&
+    fieldQuality(a) === fieldQuality(b) && a.probability === b.probability &&
+    a.firstBagProbability === b.firstBagProbability && a.firstBagSymmetry === b.firstBagSymmetry &&
+    a.firstBagSymmetryAssumed === b.firstBagSymmetryAssumed && a.frameCount === b.frameCount &&
+    a.rows.length === b.rows.length && a.rows.every((row, y) => row === b.rows[y]);
+}
+
+function partialArchiveKey(item: OwnedCandidate): string {
+  const value = item.candidate;
+  return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, fieldQuality(value),
+    value.probability, value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
+    value.frameCount, value.rows]);
 }
 
 function complete(candidate: Candidate | null | undefined): candidate is Candidate {
@@ -78,7 +99,7 @@ export class SearchClient {
   private pendingDetails = new Map<number, { requestId: string }>();
   private partialPeak: OwnedCandidate | null = null;
   private partialArchive: ArchivedCandidate | null = null;
-  private pendingPartialArchive: { requestId: string; owner: number; candidateId: string } | null = null;
+  private pendingPartialArchive: { requestId: string; owner: number; key: string } | null = null;
   private rejectedPartialArchives = new Set<string>();
   private bestSpinsByBag = Array<number>(101).fill(0);
 
@@ -171,7 +192,7 @@ export class SearchClient {
       return;
     }
     if (selection === 'partial' && this.partialArchive?.slot.id === owner.slot.id &&
-        this.partialArchive.candidate.id === owner.candidate.id) {
+        samePartialRecord(this.partialArchive.candidate, owner.candidate)) {
       this.receive({ type: 'export', runId: this.runId, requestId, data: this.partialArchive.data });
       return;
     }
@@ -248,10 +269,10 @@ export class SearchClient {
               this.partialArchive = { slot, candidate, data: message.data };
             }
           } else {
-            this.rejectedPartialArchives.add(`${slot.id}:${archive.candidateId}`);
+            this.rejectedPartialArchives.add(archive.key);
           }
         } else {
-          this.rejectedPartialArchives.add(`${slot.id}:${archive.candidateId}`);
+          this.rejectedPartialArchives.add(archive.key);
         }
         this.publishProgress(true);
         return;
@@ -330,14 +351,12 @@ export class SearchClient {
       const candidate = slot.snapshot?.bestPartial;
       if (candidate?.verified && candidate.qualified && !candidate.complete &&
           (!best || betterPartial(candidate, best.candidate) ||
-            (best.slot.id === slot.id && best.candidate.id === candidate.id &&
-              best.candidate.spins === candidate.spins && best.candidate.placed === candidate.placed &&
-              best.candidate.probability === candidate.probability &&
+            (best.slot.id === slot.id && samePartialRecord(best.candidate, candidate) &&
               candidate.frames.length >= best.candidate.frames.length))) best = { slot, candidate };
     }
     const archived = this.partialArchive;
     if (archived && (!best || betterPartial(archived.candidate, best.candidate) ||
-        (best.slot.id === archived.slot.id && best.candidate.id === archived.candidate.id))) best = archived;
+        (best.slot.id === archived.slot.id && samePartialRecord(best.candidate, archived.candidate)))) best = archived;
     this.partialPeak = best;
     return best;
   }
@@ -345,9 +364,9 @@ export class SearchClient {
   private archivePartial(item: OwnedCandidate | null) {
     if (!item || item.slot.status === 'failed' || this.pendingPartialArchive ||
         (this.partialArchive && !betterPartial(item.candidate, this.partialArchive.candidate)) ||
-        this.rejectedPartialArchives.has(`${item.slot.id}:${item.candidate.id}`)) return;
+        this.rejectedPartialArchives.has(partialArchiveKey(item))) return;
     const requestId = crypto.randomUUID();
-    this.pendingPartialArchive = { requestId, owner: item.slot.id, candidateId: item.candidate.id };
+    this.pendingPartialArchive = { requestId, owner: item.slot.id, key: partialArchiveKey(item) };
     // Archive only the new global record. Ordinary progress stays compact and
     // this internal request never triggers a download in the user's browser.
     item.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: 'partial' } satisfies EngineCommand);

@@ -430,7 +430,7 @@
   <form onsubmit={saveSettings}>
     <div class="dialog-heading"><div><p class="eyebrow">SEARCH OPTIONS</p><h2>탐색 설정</h2></div><button class="icon-button" type="button" onclick={() => settings.close()} aria-label="설정 닫기"><Icon name="close" /></button></div>
     <div class="settings-grid">
-      <label><span>최소 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '첫 가방 구축 후의 성공률 기준' : '전체 빌드의 성공률 기준'}</small></label>
+      <label><span>최소 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '2가방부터 스핀 전개 성공률' : '전체 스핀 전개 성공률'}</small></label>
       <label><span>개선 목표 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>목표보다 긴 결과도 보관해요.</small></label>
       <label class="full-row"><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
@@ -451,6 +451,7 @@
 <dialog class="help-dialog" bind:this={about}>
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
+  <p>일반 배치는 홀드 없이 가능한지 확인하며, 홀드와 성공률 기준은 줄을 지우는 전개에 적용합니다.</p>
   <p>왼쪽은 발견한 경로의 미노별 배치, 오른쪽은 작업 진척도입니다. <strong>최신 경로</strong>는 첫 가방을 포함한 스핀 효율이 같으면 더 깊은 경로를 보여 줍니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
   <p>설정한 미노 수는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>

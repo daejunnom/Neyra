@@ -33,6 +33,20 @@
   explicit saved user settings. The first-bag floor is separate, as below.
   Independent worker profiles must keep separate certificates.
   Combining their displayed results does not combine their P7 success sets.
+- Each fixed plan must be quiet-safe for all 5,040 model supplies, regardless
+  of either probability floor: every supply needs a legal strategy that reaches
+  success or a forced clearing-supply blockage without a failed quiet placement.
+  Start with the first piece active and an empty bag-local hold. Quiet locks use
+  the current piece; only candidates on a productive clearing continuation may
+  be deferred, and releasing a held piece must clear one line. A goal-ending
+  held clear may leave an unused current piece in hold. An undeclared piece in
+  a terminal plan is a clearing-supply blockage, not a quiet-placement failure.
+  End-of-bag held release requires every next-piece type to be spawnable.
+  Never restore a free initial hold or treat a quiet failure as tolerated chance.
+  A completed nonterminal tiling may identify certainly quiet targets from its
+  full logical rows only when those rows match the representative deleted-row
+  mask. Use that fact for necessary first-supply checks; uncertainty and genuine
+  terminal prefixes must bypass this gate. Preserve first-bag reflection.
 - Keep proposal ordering distinct from proven bounds. An open passage or an
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
@@ -52,12 +66,13 @@
 - First-bag probability exclusion defaults on and is conditional on a
   constructible first bag. Preserve its separate chance and explicit saved
   settings; zero successful starts never qualify. The independent first-bag
-  minimum defaults to 80%; 0 disables that separate floor. Compute the allowed
-  first-bag symmetry whenever the first bag is counted OR this floor is enabled.
+  minimum defaults to 80%; 0 disables that separate floor. Always compute the
+  empty first bag's allowed symmetry, including when its probability is excluded
+  and its independent floor is zero; quiet coverage still requires that model.
   Reflection swaps J/L and S/Z together in the canonical supply results.
   The user accepts rare kick/spawn asymmetry: do not add reflected physical
   validation or a second P7 pass. Keep the chosen orientation for later bags,
-  export the symmetry assumption when it changes coverage or cost, and retain
+  export the symmetry assumption when it changes success, quiet coverage or cost, and retain
   canonical bits/costs/input evidence without claiming reflected-input proof.
   Traverse the first bag's 2,520 reflection pairs directly. A proven pair cost
   may skip its other canonical query; skipped raw entries remain unknown.
@@ -82,6 +97,21 @@
   protection must not become a permanent seven-lock discount in that cut.
   Ordinary scheduling follows the preferred piece goal. Longer-horizon probes
   must stay narrow and infrequent and must not bypass quality disadvantage.
+- Apply necessary material checks at each placement. The sum of the cheapest
+  current row deficits bounds additional singles from the remaining cells;
+  O supplies cells but is never a finisher. Do not confuse that optimistic
+  capacity with proof that any spin is reachable. Within-bag pace compares the
+  optimistic bag-end total, not an interpolated quota on the current lock.
+  Prefix spin/quality comparisons must use the same remaining inventory.
+  Keep necessary cost cuts, selective pace/rank cuts and bounded-beam admission
+  distinct. None of the latter proves a board impossible or a P7 supply failed.
+  Pace uses the lower SAO/Sarcelle diagram envelope over 17 bags, scaled to the
+  selected goal and horizon, with slack 2 + remaining/horizon. The diagrams are
+  progress references, not certificates for the clear-only hold policy.
+- Increase unexplained-hole cost only as a static ordering preference. Only an
+  actual spin witness may exempt its required-empty cells from the extra 0.5
+  cost; a speculative goal cannot claim that exemption. Preserve open channels
+  and the witnessed roof, and never turn this score into a hard impossibility.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.

@@ -13,6 +13,9 @@ pub(crate) type CellMask = [u16; HEIGHT];
 // sequence. Bound only this preference; holes, access debt, severe bank
 // repair pressure and roof towers retain their own costs outside this cap.
 const SKYLINE_PREFERENCE_LIMIT: f64 = 6.0;
+// Existing cavities still have their base cost. Only a replayed spin goal can
+// explain the additional burden; a proposed pocket alone is not a repair plan.
+const UNEXPLAINED_HOLE_COST: f64 = 0.5;
 
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
     mask.iter().map(|row| row.count_ones() as u16).sum()
@@ -101,7 +104,7 @@ impl BoardFacts {
         for x in 0..WIDTH {
             let bit = 1 << x;
             let mut above = 0;
-            for y in (0..HEIGHT).rev() {
+            for y in (0..facts.height as usize).rev() {
                 if board.rows[y] & bit != 0 {
                     if above == 0 {
                         facts.heights[x] = y as u8 + 1;
@@ -114,7 +117,7 @@ impl BoardFacts {
                 }
             }
         }
-        for (y, &row) in board.rows.iter().enumerate() {
+        for (y, &row) in board.rows.iter().enumerate().take(facts.height as usize) {
             if row == 0 {
                 continue;
             }
@@ -380,7 +383,13 @@ impl BoardFacts {
         } else {
             0
         };
+        let unexplained_holes = if witnessed {
+            goal.map_or(self.hole_count, |g| self.unplanned_holes(&g.required_empty))
+        } else {
+            self.hole_count
+        };
         let defects = self.hole_count as f64 * 2.0
+            + unexplained_holes as f64 * UNEXPLAINED_HOLE_COST
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
             + self.cover_depth as f64 * 0.25

@@ -1,5 +1,6 @@
-//! Finite normalized see-7 supply language. The first piece is already held.
-//! This is an independent small product evaluator, not a queue oracle.
+//! Finite see-7 supply languages. Runtime policy starts with an active first
+//! piece and an empty bag-local hold. The unrestricted normalized evaluator is
+//! retained as a reference; it is not the build certificate's hold policy.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -15,6 +16,158 @@ pub struct LanguageNode {
     pub accepting: bool,
     /// Pieces which can spawn before a hold action at this board.
     pub spawn_mask: u8,
+}
+
+pub const CLEAR_ONLY_HOLD_POLICY: &str = "ActiveFirst;EmptyBagHold;QuietLocksUseCurrent;DeferOnlyProductiveClearCandidates;HeldLocksClear;TerminalUnusedSwapAllowed;EndFlushRequiresAllNextSpawns";
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClearingEdge {
+    pub piece: u8,
+    pub child: usize,
+    pub clears: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClearingNode {
+    pub edges: Vec<ClearingEdge>,
+    pub accepting: bool,
+    pub spawn_mask: u8,
+    pub used: u8,
+}
+
+/// Immutable execution facts reused by all supplies of one fixed target plan.
+/// A piece may clear in one order and lock quietly in another. Deferral uses
+/// a productive clearing continuation; the actual held release must clear.
+pub struct ClearOnlyLanguage {
+    nodes: Vec<ClearingNode>,
+    targets: u8,
+    productive: Vec<bool>,
+    future_clears: Vec<u8>,
+}
+
+impl ClearOnlyLanguage {
+    pub fn new(nodes: Vec<ClearingNode>, targets: u8) -> Self {
+        let mut productive = vec![false; nodes.len()];
+        let mut future_clears = vec![0; nodes.len()];
+        // Edges add exactly one used target. Using the rank rather than index
+        // order also supports converging execution graphs and test languages.
+        for depth in (0..=7).rev() {
+            for (index, node) in nodes.iter().enumerate() {
+                if node.used.count_ones() != depth { continue; }
+                if node.accepting { productive[index] = true; continue; }
+                for edge in &node.edges {
+                    debug_assert_eq!(nodes[edge.child].used, node.used | (1 << edge.piece));
+                    if !productive[edge.child] { continue; }
+                    productive[index] = true;
+                    future_clears[index] |= future_clears[edge.child]
+                        | if edge.clears { 1 << edge.piece } else { 0 };
+                }
+            }
+        }
+        Self { nodes, targets, productive, future_clears }
+    }
+
+    fn quiet_only(&self, queue: &[u8; 7]) -> SupplyOutcome {
+        let mut index = 0;
+        let mut order = 0;
+        for depth in 0..=7 {
+            let node = &self.nodes[index];
+            if node.accepting { return SupplyOutcome::success(depth as u8, order); }
+            if depth == 7 { return SupplyOutcome::blocked(false); }
+            let piece = queue[depth];
+            let required = self.targets & !node.used & (1 << piece) != 0;
+            if node.spawn_mask & (1 << piece) == 0 {
+                return SupplyOutcome::blocked(!required);
+            }
+            let edge = node.edges.iter().find(|edge| edge.piece == piece
+                && !edge.clears && self.productive[edge.child]);
+            let Some(edge) = edge else { return SupplyOutcome::blocked(!required); };
+            order |= u32::from(piece) << (depth * 3);
+            index = edge.child;
+        }
+        unreachable!()
+    }
+}
+
+/// A quiet-safe failure is a forced clear/supply blockage, never a failed
+/// ordinary placement. All supplies must be quiet-safe independently of the
+/// requested success threshold. Only accepting finishes contribute chance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupplyOutcome {
+    pub finish: Option<(u8, u32)>,
+    pub quiet_safe: bool,
+}
+
+impl SupplyOutcome {
+    fn success(cost: u8, code: u32) -> Self {
+        Self { finish: Some((cost, code)), quiet_safe: true }
+    }
+    fn blocked(quiet_safe: bool) -> Self { Self { finish: None, quiet_safe } }
+}
+
+/// Exact OR over legal strategies for this visible queue. The caller supplies
+/// the outer AND over all queues (or over first-bag reflection pairs).
+/// Zero-lock empty-hold transitions are explored explicitly: a blocked clear
+/// cannot hide the next quiet piece's failure by stopping before that hold.
+pub fn clearing_only_finish(language: &ClearOnlyLanguage, queue: &[u8; 7]) -> SupplyOutcome {
+    if language.nodes.is_empty() { return SupplyOutcome::blocked(false); }
+    if language.future_clears[0] == 0 { return language.quiet_only(queue); }
+    let mut pending = VecDeque::from([(0_usize, 0_u8, NO_PIECE, true, 0_u32)]);
+    let mut seen = HashSet::from([(0_usize, 0_u8, NO_PIECE, true)]);
+    let mut clear_blocked = false;
+    while let Some((index, cursor, held, hold_ready, order)) = pending.pop_front() {
+        let node = &language.nodes[index];
+        let depth = node.used.count_ones() as u8;
+        if node.accepting { return SupplyOutcome::success(depth, order); }
+        if depth >= 7 { continue; }
+        let current = queue.get(cursor as usize).copied().unwrap_or(NO_PIECE);
+        let required = current != NO_PIECE
+            && language.targets & !node.used & (1 << current) != 0;
+        let can_clear = current != NO_PIECE
+            && language.future_clears[index] & (1 << current) != 0;
+        let ordinary = required && !can_clear;
+        // After consuming all seven supplies, releasing the last held clear
+        // exchanges the next bag's unknown active piece. Every type must spawn.
+        let spawnable = if current == NO_PIECE {
+            held != NO_PIECE && node.spawn_mask == ALL_PIECES
+        } else { node.spawn_mask & (1 << current) != 0 };
+        if !spawnable {
+            clear_blocked |= !ordinary;
+            continue;
+        }
+        let mut moved = false;
+        for edge in &node.edges {
+            if !language.productive[edge.child] { continue; }
+            let next_hold = if edge.piece == current {
+                held
+            } else if edge.piece == held && hold_ready && edge.clears
+                && (current == NO_PIECE || language.nodes[edge.child].accepting
+                    || language.future_clears[edge.child] & (1 << current) != 0)
+            {
+                // A goal-ending held clear may leave an unused current in hold.
+                // There is no ordinary placement after that absorbing finish.
+                current
+            } else { continue; };
+            moved = true;
+            let next_cursor = cursor + u8::from(current != NO_PIECE);
+            let next = (edge.child, next_cursor, next_hold, true);
+            if seen.insert(next) {
+                pending.push_back((next.0, next.1, next.2, next.3,
+                    order | (u32::from(edge.piece) << (depth * 3))));
+            }
+        }
+        if held == NO_PIECE && hold_ready && can_clear && cursor < 7 {
+            moved = true;
+            let next = (index, cursor + 1, current, false);
+            if seen.insert(next) {
+                // The state rank has not increased: 0-1 BFS retains minimum
+                // lock cost while still checking the newly active spawn.
+                pending.push_front((next.0, next.1, next.2, next.3, order));
+            }
+        }
+        if !moved { clear_blocked |= !ordinary; }
+    }
+    SupplyOutcome::blocked(clear_blocked)
 }
 
 pub fn permutation(mut rank: usize) -> [u8; 7] {

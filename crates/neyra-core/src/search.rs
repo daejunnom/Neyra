@@ -10,10 +10,13 @@ use crate::structure::{
     BoardFacts, CellMask, SingleGoal,
 };
 use crate::supply::{
-    decode_order, minimum_finish, permutation,
-    LanguageNode, SymmetryOrbits, ALL_PIECES, P7_COUNT,
+    clearing_only_finish, decode_order, permutation,
+    ClearOnlyLanguage, ClearingEdge, ClearingNode, SymmetryOrbits,
+    CLEAR_ONLY_HOLD_POLICY, ALL_PIECES, P7_COUNT,
 };
 use num_bigint::BigUint;
+#[cfg(test)]
+use crate::supply::LanguageNode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -26,7 +29,11 @@ const BUDGET_STALE_ROUNDS: u64 = 64;
 const EXPLORATION_INTERVAL: u64 = 8;
 const LONG_HORIZON_PROBE_INTERVAL: u64 = 32;
 const PACE_NEAR_SLACK: u16 = 2;
-const PACE_DISTANCE_SLACK: u16 = 4;
+const PACE_DISTANCE_SLACK: u16 = 1;
+// Lower cumulative envelope of the published SAO and Sarcelle Naga diagrams.
+// Index 0 is the empty field; index 17 is 39, not an invented completed route.
+// These are progress references, not physics or supply certificates.
+const PACE_REFERENCE: [u8; 18] = [0, 0, 2, 4, 8, 10, 12, 15, 17, 19, 21, 24, 26, 29, 31, 33, 36, 39];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -523,18 +530,19 @@ fn projected_poses(target: &TargetOperation, deleted: u32) -> Vec<Pose> {
     poses
 }
 
-/// Every ordered held/current pair represents 5! queues. Unknown future
+/// Every ordered first/next pair represents 5! queues. Unknown future
 /// targets may overestimate this mask; never remove a choice on a heuristic.
 fn first_pair_upper(available: u8, spawn: u8, accepting: bool) -> u16 {
     if accepting {
         return P7_COUNT as u16;
     }
     let mut pairs = 0;
-    for held in 0..7 {
-        for current in 0..7 {
-            if held != current
-                && spawn & (1 << current) != 0
-                && available & ((1 << held) | (1 << current)) != 0
+    for first in 0..7 {
+        for next in 0..7 {
+            if first != next
+                && spawn & (1 << first) != 0
+                && (available & (1 << first) != 0
+                    || (spawn & available & (1 << next) != 0))
             {
                 pairs += 1;
             }
@@ -553,7 +561,8 @@ fn can_be_first(start: &Board, target: &TargetOperation) -> bool {
 
 /// Optimistic two-lock supply bound before a complete bag occupies a scarce
 /// refinement slot. Geometry and spin shape are necessary; input reachability
-/// is deliberately omitted. Each held/current/next triple represents 4! queues.
+/// is deliberately omitted and holding any piece remains an optimistic
+/// relaxation. Each active/next/next triple represents 4! queues.
 fn geometric_two_lock_upper(
     start: &Board,
     targets: &[TargetOperation],
@@ -597,20 +606,22 @@ fn geometric_two_lock_upper(
     }
     let initial_spawn = spawn_mask(start);
     let mut prefixes = 0;
-    for held in 0..7 {
+    for first in 0..7 {
         for current in 0..7 {
-            if held == current || initial_spawn & (1 << current) == 0 {
+            if first == current || initial_spawn & (1 << first) == 0 {
                 continue;
             }
             for next in 0..7 {
-                if next == held || next == current {
+                if next == first || next == current {
                     continue;
                 }
-                let current_first = next_spawn[current] & (1 << next) != 0
-                    && second[current] & ((1 << held) | (1 << next)) != 0;
-                let held_first = next_spawn[held] & (1 << next) != 0
-                    && second[held] & ((1 << current) | (1 << next)) != 0;
-                prefixes += u16::from(current_first || held_first);
+                let active_first = next_spawn[first] & (1 << current) != 0
+                    && (second[first] & (1 << current) != 0
+                        || (next_spawn[first] & second[first] & (1 << next) != 0));
+                let stored_first = initial_spawn & (1 << current) != 0
+                    && next_spawn[current] & (1 << next) != 0
+                    && second[current] & ((1 << first) | (1 << next)) != 0;
+                prefixes += u16::from(active_first || stored_first);
             }
         }
     }
@@ -745,27 +756,32 @@ impl ExecutionGraph {
         )
     }
 
-    fn prefix_possible(&self, queue: &[u8; 7], index: usize, cursor: u8, held: u8) -> bool {
+    fn prefix_possible(&self, queue: &[u8; 7], index: usize, cursor: u8,
+        held: u8, hold_ready: bool, locks: u8) -> bool {
         let node = &self.nodes[index];
         // An unexpanded node is optimistically accepting. Goal acceptance
         // precedes every next-spawn check, including partial terminal bags.
-        if node.accepting || index >= self.cursor || cursor >= 3 {
+        if node.accepting || index >= self.cursor || locks >= 2 {
             return true;
         }
         let current = queue[cursor as usize];
         if node.spawn_mask & (1 << current) == 0 {
             return false;
         }
-        node.edges.iter().any(|edge| {
+        let locks_possible = node.edges.iter().any(|edge| {
             let next_hold = if edge.piece == current {
                 held
-            } else if edge.piece == held {
+            } else if edge.piece == held && hold_ready {
                 current
             } else {
                 return false;
             };
-            self.prefix_possible(queue, edge.child, cursor + 1, next_hold)
-        })
+            self.prefix_possible(queue, edge.child, cursor + 1, next_hold, true, locks + 1)
+        });
+        // This prefix bound deliberately allows unrestricted holding. The
+        // complete policy below applies clear-only deferral and quiet safety.
+        locks_possible || (held == crate::supply::NO_PIECE && hold_ready
+            && self.prefix_possible(queue, index, cursor + 1, current, false, locks))
     }
 
     fn two_lock_upper(&self) -> u16 {
@@ -775,12 +791,14 @@ impl ExecutionGraph {
         (0..210)
             .filter(|prefix| {
                 let queue = permutation(prefix * 24);
-                self.prefix_possible(&queue, 0, 1, queue[0])
+                self.prefix_possible(&queue, 0, 0, crate::supply::NO_PIECE, true, 0)
             })
             .count() as u16
             * 24
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Reference language used by external matched-model checks.
     fn language(&self) -> Vec<LanguageNode> {
         self.nodes
             .iter()
@@ -790,6 +808,17 @@ impl ExecutionGraph {
                 edges: node.edges.iter().map(|e| (e.piece, e.child)).collect(),
             })
             .collect()
+    }
+
+    fn clearing_language(&self) -> ClearOnlyLanguage {
+        ClearOnlyLanguage::new(self.nodes.iter().map(|node| ClearingNode {
+            accepting: node.accepting,
+            spawn_mask: node.spawn_mask,
+            used: node.key.used,
+            edges: node.edges.iter().map(|edge| ClearingEdge {
+                piece: edge.piece, child: edge.child, clears: edge.lines == 1,
+            }).collect(),
+        }).collect(), self.all_targets)
     }
 
     fn witness(
@@ -849,6 +878,12 @@ struct BagCertificate {
     checked: u16,
     /// Canonical queues actually evaluated; skipped partners retain unknown costs.
     canonical_checked: u16,
+    /// Every model supply has a strategy with no failed quiet lock, even if
+    /// that strategy ends at an unavoidable clearing-supply blockage.
+    quiet_no_hold_verified: bool,
+    quiet_safe_supplies: u16,
+    canonical_quiet_safe: u16,
+    hold_policy: &'static str,
     /// Stable lexicographic P7 rank, I J L O S T Z.
     #[serde(serialize_with = "serialize_bit_words")]
     success_bits: Vec<u64>,
@@ -871,10 +906,14 @@ struct VerificationJob {
     parent: usize,
     plan: Plan,
     graph: ExecutionGraph,
-    language: Option<Vec<LanguageNode>>,
+    language: Option<ClearOnlyLanguage>,
     /// Number of supplies resolved in the selected model.
     checked: usize,
     canonical_checked: usize,
+    quiet_safe: usize,
+    canonical_quiet_safe: usize,
+    /// A quiet failure is a whole-plan policy rejection, not a P7 chance loss.
+    quiet_rejected: bool,
     /// Known canonical successes; unknown reflected partners are not failures.
     success: usize,
     costs: Vec<u8>,
@@ -897,6 +936,9 @@ impl VerificationJob {
             language: None,
             checked: 0,
             canonical_checked: 0,
+            quiet_safe: 0,
+            canonical_quiet_safe: 0,
+            quiet_rejected: false,
             success: 0,
             costs: vec![0; P7_COUNT],
             codes: vec![0; P7_COUNT],
@@ -908,11 +950,10 @@ impl VerificationJob {
         }
     }
 
-    fn check_canonical(&mut self, rank: usize) -> u8 {
+    fn check_canonical(&mut self, rank: usize) -> (u8, bool) {
         debug_assert_eq!(self.costs[rank], 0);
-        if let Some((cost, code)) =
-            minimum_finish(self.language.as_ref().unwrap(), &permutation(rank))
-        {
+        let result = clearing_only_finish(self.language.as_ref().unwrap(), &permutation(rank));
+        if let Some((cost, code)) = result.finish {
             self.costs[rank] = cost;
             self.codes[rank] = code;
             self.bits[rank / 64] |= 1_u64 << (rank % 64);
@@ -921,12 +962,29 @@ impl VerificationJob {
             self.costs[rank] = 255;
         }
         self.canonical_checked += 1;
-        self.costs[rank]
+        self.canonical_quiet_safe += usize::from(result.quiet_safe);
+        (self.costs[rank], result.quiet_safe)
     }
 
     fn advance(&mut self, goal: u8, cache: &mut PhysicsCache) {
+        if self.quiet_rejected { return; }
         if !self.graph.complete() {
             self.graph.expand_one(&self.plan, goal, cache);
+            // A zero-clear whole bag has no legal hold use. Missing ordinary
+            // first or second locks is a policy rejection, not chance loss.
+            let quiet_bag = !self.plan.terminal
+                && self.plan.start_spins < goal
+                && self.plan.expected_spins == self.plan.start_spins
+                && self.graph.all_targets == ALL_PIECES;
+            if quiet_bag && !self.graph.overflow && self.graph.cursor == 1 {
+                let root = &self.graph.nodes[0];
+                let ready = root.edges.iter().filter(|edge| edge.lines == 0)
+                    .fold(0, |mask, edge| mask | (1 << edge.piece)) & root.spawn_mask;
+                let covered = ready | if self.symmetry.is_some() {
+                    crate::supply::mirror_mask(ready)
+                } else { 0 };
+                if covered != ALL_PIECES { self.quiet_rejected = true; return; }
+            }
             self.upper = self.upper.min(self.graph.first_upper());
             if !self.prefix_checked
                 && !self.graph.overflow
@@ -936,6 +994,24 @@ impl VerificationJob {
                     .iter()
                     .all(|e| e.child < self.graph.cursor)
             {
+                if quiet_bag {
+                    let possible = |first: u8, second: u8| {
+                        let root = &self.graph.nodes[0];
+                        root.spawn_mask & (1 << first) != 0 && root.edges.iter().any(|edge| {
+                            if edge.piece != first || edge.lines != 0 { return false; }
+                            let child = &self.graph.nodes[edge.child];
+                            child.spawn_mask & (1 << second) != 0 && child.edges.iter()
+                                .any(|edge| edge.piece == second && edge.lines == 0)
+                        })
+                    };
+                    let all_prefixes_safe = (0..7).all(|first| (0..7).all(|second| {
+                        first == second || possible(first, second)
+                            || (self.symmetry.is_some() && possible(
+                                crate::supply::mirror_piece(first),
+                                crate::supply::mirror_piece(second)))
+                    }));
+                    if !all_prefixes_safe { self.quiet_rejected = true; return; }
+                }
                 self.upper = self.upper.min(self.graph.two_lock_upper());
                 self.prefix_checked = true;
             }
@@ -949,7 +1025,7 @@ impl VerificationJob {
                 .filter(|node| node.accepting)
                 .map(|node| node.key.used.count_ones() as u8)
                 .min().unwrap_or(8);
-            self.language = Some(self.graph.language());
+            self.language = Some(self.graph.clearing_language());
         }
         if self.symmetry.is_some() {
             let mut queries = 0;
@@ -959,20 +1035,27 @@ impl VerificationJob {
                 let pair = self.symmetry.as_mut().unwrap().next_pair().unwrap();
                 let first = self.check_canonical(pair[0]);
                 queries += 1;
-                let cost = if first == self.minimum_cost {
+                let (cost, quiet_safe) = if first.0 == self.minimum_cost {
                     first
                 } else {
                     queries += 1;
-                    first.min(self.check_canonical(pair[1]))
+                    let second = self.check_canonical(pair[1]);
+                    (first.0.min(second.0), first.1 || second.1)
                 };
                 let symmetry = self.symmetry.as_mut().unwrap();
                 symmetry.resolve(pair, cost);
                 self.checked = usize::from(symmetry.checked());
+                if quiet_safe { self.quiet_safe += 2; }
+                else { self.quiet_rejected = true; break; }
             }
         } else {
             let end = (self.checked + 64).min(P7_COUNT);
-            for rank in self.checked..end { self.check_canonical(rank); }
-            self.checked = end;
+            for rank in self.checked..end {
+                let (_, quiet_safe) = self.check_canonical(rank);
+                self.checked += 1;
+                if quiet_safe { self.quiet_safe += 1; }
+                else { self.quiet_rejected = true; break; }
+            }
         }
         self.upper = self.upper.min(
             (self.success + P7_COUNT - self.canonical_checked) as u16,
@@ -1328,6 +1411,7 @@ struct GenerationJob {
     start: Board,
     start_spins: u8,
     start_pieces: u16,
+    start_spawn: u8,
     frontier: Vec<SeedState>,
     next_by_inventory: [Vec<SeedState>; 128],
     complete: Vec<SeedState>,
@@ -1354,6 +1438,17 @@ struct GenerationJob {
     relaxed_setup: bool,
     continuation_minimum_success: u16,
     pace_fallback: bool,
+    /// A strict cost cap may remove a prefix only when this bag cannot finish.
+    hard_piece_cap: u16,
+    /// Qualified complete-bag rank, compared only with an optimistic bag-end rank.
+    bag_alpha: f64,
+    /// Prefix alternatives are comparable only at the same remaining inventory.
+    prefix_quality: Vec<[f64; 7]>,
+    /// Facts live only while this one parent is expanded over its remaining pieces.
+    current_facts: Option<BoardFacts>,
+    mino_bound_pruned: u64,
+    mino_selective_pruned: u64,
+    mino_capacity_pruned: u64,
 }
 
 impl GenerationJob {
@@ -1369,6 +1464,7 @@ impl GenerationJob {
         lane: u16,
         lanes: u16,
     ) -> Self {
+        let start_spawn = spawn_mask(&node.board);
         let mut seed = SeedState {
             board: node.board,
             spins: node.spins,
@@ -1386,7 +1482,7 @@ impl GenerationJob {
         };
         // The earlier bounded probe found these placements from this exact
         // boundary. Use that coherent route as a geometric proposal prefix;
-        // the final bag still goes through all 5040 normalized hold queues.
+        // the final bag still goes through the clear-only hold supply policy.
         // Other rounds explore independently instead of fixing this prefix.
         if !setup && variant % 3 != 2 {
             for placement in &node.future.placements {
@@ -1410,7 +1506,7 @@ impl GenerationJob {
                 } else {
                     seed.first_mask & !placement.pose.piece.bit()
                 };
-                if first_pair_upper(first_mask, spawn_mask(&node.board), false) < minimum_success {
+                if first_pair_upper(first_mask, start_spawn, false) < minimum_success {
                     break;
                 }
                 seed.debt = next_debt(&seed, &result.board, result.cleared_rows);
@@ -1442,6 +1538,7 @@ impl GenerationJob {
             start: node.board,
             start_spins: node.spins,
             start_pieces: node.pieces,
+            start_spawn,
             frontier: if terminal { vec![] } else { vec![seed.clone()] },
             next_by_inventory: std::array::from_fn(|_| Vec::new()),
             complete: if terminal { vec![seed] } else { vec![] },
@@ -1468,6 +1565,13 @@ impl GenerationJob {
             relaxed_setup: false,
             continuation_minimum_success: minimum_success,
             pace_fallback: false,
+            hard_piece_cap: u16::MAX,
+            bag_alpha: f64::NEG_INFINITY,
+            prefix_quality: vec![[f64::NEG_INFINITY; 7]; 128],
+            current_facts: None,
+            mino_bound_pruned: 0,
+            mino_selective_pruned: 0,
+            mino_capacity_pruned: 0,
         }
     }
 
@@ -1479,15 +1583,23 @@ impl GenerationJob {
         if self.state_index >= self.frontier.len() {
             return 0;
         }
+        let bounds = MinoBounds {
+            start_pieces: self.start_pieces, best_bag_spins: self.best_bag_spins,
+            bag_alpha: self.bag_alpha, goal, budget: self.prune_budget,
+            hard_piece_cap: self.hard_piece_cap,
+        };
         let state = &self.frontier[self.state_index];
-        if delta_lag(
-            state.spins,
-            self.best_bag_spins,
-            remaining_bag_spins(&state.board, state.used),
-        ) {
+        let cut = mino_cut(&state.board, state.used, state.spins, bounds);
+        let dominated = self.start_pieces != 0
+            && state.spins.saturating_add(remaining_bag_spins(&state.board, state.used)) < goal
+            && prefix_dominated(&self.prefix_quality, state.used,
+                state.spins.saturating_sub(self.start_spins), state.quality);
+        if cut.is_some() || dominated {
             self.state_index += 1;
             self.piece_index = 0;
-            self.selective_pruned += 1;
+            self.current_facts = None;
+            if cut == Some(MinoCut::Cost) { self.mino_bound_pruned += 1; self.pruned += 1; }
+            else { self.mino_selective_pruned += 1; self.selective_pruned += 1; }
             return 0;
         }
         let foundation_ready = !self.setup
@@ -1522,17 +1634,24 @@ impl GenerationJob {
             self.state_index += 1;
         }
         if state.used & (1 << (piece as u8)) != 0 {
+            if self.piece_index == 0 { self.current_facts = None; }
             return 0;
         }
         let root_choice = self.start_pieces == 0 && state.used == 0;
         // Every lane partitions the same first-lock geometry list. The rest
         // of each bag is built locally; no worker shares a supply certificate.
-        let locks = cache.proposals(state.board, piece, self.broad && !root_choice);
+        // Quiet setup rounds discard every single. Their narrow proposal set
+        // therefore needs no exact spin witness search at all.
+        let locks = if self.setup && !self.broad {
+            Rc::new(state.board.surface_locks(piece))
+        } else { cache.proposals(state.board, piece, self.broad && !root_choice) };
         let per_inventory = self.inventory_limit(state.used | piece.bit());
-        let before_facts = BoardFacts::new(&state.board);
+        let before_facts = self.current_facts.get_or_insert_with(|| BoardFacts::new(&state.board));
         let before_holes = before_facts.holes;
         let mut expanded = 0;
-        for placement in locks.iter() {
+        // Witnessed spins establish a useful local window before quiet moves.
+        // The root list is unchanged (the empty field has no spin single).
+        for placement in locks.iter().filter(|p| p.spin).chain(locks.iter().filter(|p| !p.spin)) {
             expanded += 1;
             if root_choice {
                 let choice = self.root_choice;
@@ -1581,7 +1700,7 @@ impl GenerationJob {
             } else {
                 first_mask
             };
-            let first_upper = first_pair_upper(available, spawn_mask(&self.start), self.start_spins >= goal);
+            let first_upper = first_pair_upper(available, self.start_spawn, self.start_spins >= goal);
             let first_upper = if self.first_bag_symmetry {
                 first_upper.saturating_mul(2).min(P7_COUNT as u16)
             } else { first_upper };
@@ -1595,24 +1714,41 @@ impl GenerationJob {
             };
             let spins = state.spins + result.lines;
             let used = state.used | piece.bit();
-            if spins < goal
-                && (delta_lag(
-                    spins,
-                    self.best_bag_spins,
-                    remaining_bag_spins(&result.board, used),
-                ) || (used == ALL_PIECES
-                    && selective_reason(
-                        result.board.cell_count(),
-                        0, // Obstruction is checked after its continuation witness.
-                        self.start_pieces + 7,
-                        spins,
-                        self.best_bag_spins,
-                        goal,
-                        self.prune_budget,
-                    )
-                    .is_some()))
+            // A round reserved for quiet setup can never repair a missing
+            // first choice with a later clear. Unknown targets remain allowed.
+            // Mixed prefixes may change a target's clear role, so are exempt.
+            if !complete && (self.setup || (used == ALL_PIECES && spins == self.start_spins))
+                && !quiet_first_covered(first_mask & self.start_spawn, self.first_bag_symmetry)
             {
-                self.selective_pruned += 1;
+                self.pruned += 1;
+                self.mino_bound_pruned += 1;
+                continue;
+            }
+            if let Some(cut) = mino_cut(&result.board, used, spins, bounds) {
+                if cut == MinoCut::Cost { self.mino_bound_pruned += 1; self.pruned += 1; }
+                else { self.mino_selective_pruned += 1; self.selective_pruned += 1; }
+                continue;
+            }
+            if !complete && used == ALL_PIECES {
+                let quiet = guaranteed_quiet_targets(
+                    &self.start, state.targets.iter().chain(std::iter::once(&target)), deleted,
+                );
+                if quiet.is_some_and(|quiet| {
+                    let bad = quiet & !(first_mask & self.start_spawn);
+                    if self.first_bag_symmetry {
+                        bad & crate::supply::mirror_mask(bad) != 0
+                    } else { bad != 0 }
+                }) {
+                    self.pruned += 1;
+                    self.mino_bound_pruned += 1;
+                    continue;
+                }
+            }
+            let (bucket, limit) = if used == ALL_PIECES {
+                (&self.complete, 12)
+            } else { (&self.next_by_inventory[used as usize], per_inventory) };
+            if !complete && below_bucket_window(bucket, limit, spins) {
+                self.mino_capacity_pruned += 1;
                 continue;
             }
             let mut targets = state.targets.clone();
@@ -1629,16 +1765,6 @@ impl GenerationJob {
                     continue;
                 }
             }
-            let mut frames = state.frames.clone();
-            frames.push(DisplayFrame {
-                rows: result.board.rows,
-                piece: piece_name(piece),
-                placed_cells: placement.pose.cells().map(|(x, y)| (x as u8, y as u8)),
-                spins,
-                placed: self.start_pieces + targets.len() as u16,
-                lines: result.lines,
-                spin: result.spin,
-            });
             let pursuit = if result.lines == 0 {
                 state.pursuit.as_ref().and_then(|pursuit| {
                     // Once a non-setup bag spends its intended finisher,
@@ -1685,11 +1811,42 @@ impl GenerationJob {
                 // spends the floor too early and destroys P7 robustness.
                 // Continuation refinement compares the completed foundations.
                 setup_score(&self.start, &targets) * if self.relaxed_setup { 0.35 } else { 1.0 }
-                    + structural * 0.06 + rng.unit() * 6.0
+                    + structural * 0.06
             } else {
-                structural + setup_score(&self.start, &targets) * 0.25 + rng.unit() * 2.0
+                structural + setup_score(&self.start, &targets) * 0.25
             };
-            let score = spin_rank(spins, quality);
+            // Jitter only orders proposals; it is not evidence of better terrain.
+            let score = spin_rank(spins, quality + rng.unit() * if self.setup { 6.0 } else { 2.0 });
+            if self.start_pieces != 0 && !complete
+                && spins.saturating_add(remaining_bag_spins(&result.board, used)) < goal
+                && prefix_dominated(&self.prefix_quality, used,
+                    spins.saturating_sub(self.start_spins), quality)
+            {
+                self.mino_selective_pruned += 1;
+                self.selective_pruned += 1;
+                continue;
+            }
+            let (bucket, limit) = if used == ALL_PIECES {
+                (&self.complete, 12)
+            } else { (&self.next_by_inventory[used as usize], per_inventory) };
+            if !complete && bucket.len() >= limit
+                && bucket.last().is_some_and(|worst| score <= worst.score)
+            {
+                self.mino_capacity_pruned += 1;
+                continue;
+            }
+            let gain = usize::from(spins.saturating_sub(self.start_spins));
+            self.prefix_quality[used as usize][gain] = self.prefix_quality[used as usize][gain].max(quality);
+            let mut frames = state.frames.clone();
+            frames.push(DisplayFrame {
+                rows: result.board.rows,
+                piece: piece_name(piece),
+                placed_cells: placement.pose.cells().map(|(x, y)| (x as u8, y as u8)),
+                spins,
+                placed: self.start_pieces + targets.len() as u16,
+                lines: result.lines,
+                spin: result.spin,
+            });
             let next = SeedState {
                 board: result.board,
                 spins,
@@ -1716,6 +1873,7 @@ impl GenerationJob {
                 ));
             }
         }
+        if self.piece_index == 0 { self.current_facts = None; }
         expanded
     }
 
@@ -1735,6 +1893,7 @@ impl GenerationJob {
             return false;
         }
         self.frontier = self.finish_inventory_layer();
+        self.current_facts = None;
         self.state_index = 0;
         self.piece_index = 0;
         self.depth += 1;
@@ -2021,14 +2180,124 @@ fn cost_lower_bound(board: &Board, spins: u8, goal: u8) -> u16 {
     )
 }
 
-/// An optimistic within-bag opportunity count, including material supplied by O
-/// but never crediting O with a spin. Used only to avoid cutting preparations
-/// that can still close the requested gap to a certified same-depth result.
-fn remaining_bag_spins(board: &Board, used: u8) -> u8 {
+/// Optimistic end-of-bag material and single count. Completing k distinct rows
+/// needs at least the sum of the k cheapest current row deficits. Any newly
+/// introduced empty row costs ten cells, so it cannot improve that lower bound.
+/// Geometry, input reachability and ordering can only reduce this capacity.
+fn bag_potential(board: &Board, used: u8) -> (u8, u16) {
     let remaining = ALL_PIECES & !used;
-    let finishers = (remaining & !Piece::O.bit()).count_ones() as u16;
-    let material = board.cell_count() + remaining.count_ones() as u16 * 4;
-    finishers.min(material / 10) as u8
+    let finishers = (remaining & !Piece::O.bit()).count_ones() as u8;
+    let fresh = remaining.count_ones() as u16 * 4;
+    let mut deficits = [0_u8; 11];
+    let mut cells = 0;
+    for row in board.rows {
+        let filled = row.count_ones() as u16;
+        cells += filled;
+        deficits[10 - filled as usize] += 1;
+    }
+    let mut spent = 0;
+    let mut singles = 0;
+    'rows: for (missing, &count) in deficits.iter().enumerate() {
+        for _ in 0..count {
+            if singles == finishers || spent + missing as u16 > fresh { break 'rows; }
+            spent += missing as u16;
+            singles += 1;
+        }
+    }
+    (singles, cells + fresh - u16::from(singles) * 10)
+}
+
+/// O contributes material but is never credited with a spin.
+fn remaining_bag_spins(board: &Board, used: u8) -> u8 {
+    bag_potential(board, used).0
+}
+
+fn quiet_first_covered(available: u8, reflected: bool) -> bool {
+    let covered = if reflected { available | crate::supply::mirror_mask(available) } else { available };
+    covered == ALL_PIECES
+}
+
+/// In a completed fixed bag, a target touching no ultimately full logical row
+/// cannot clear in any execution order. Such a piece must be playable first
+/// when it leads the supply. This is only a necessary quiet-policy condition;
+/// partial/terminal plans must not use it. A malformed union remains unknown.
+fn guaranteed_quiet_targets<'a>(
+    start: &Board, targets: impl IntoIterator<Item = &'a TargetOperation>, deleted: u32,
+) -> Option<u8> {
+    let mut rows = [0_u16; 32];
+    rows[..HEIGHT].copy_from_slice(&start.rows);
+    if rows.iter().any(|row| row & !crate::physics::FULL_ROW != 0) { return None; }
+    let mut seen = 0_u8;
+    let mut touched = [0_u32; 7];
+    for target in targets {
+        let piece = target.piece as usize;
+        if seen & target.piece.bit() != 0 { return None; }
+        seen |= target.piece.bit();
+        for &(x, y) in &target.cells {
+            if x as usize >= crate::physics::WIDTH || y >= 32 { return None; }
+            let cell = 1_u16 << x;
+            if rows[y as usize] & cell != 0 { return None; }
+            rows[y as usize] |= cell;
+            touched[piece] |= 1_u32 << y;
+        }
+    }
+    if seen != ALL_PIECES { return None; }
+    let full = rows.iter().enumerate().fold(0_u32, |mask, (y, &row)| {
+        mask | if row == crate::physics::FULL_ROW { 1_u32 << y } else { 0 }
+    });
+    // Comparing the exact deletion mask validates normalization through row31;
+    // counting rows alone could silently misclassify a target's clear role.
+    if full != deleted { return None; }
+    Some(touched.iter().enumerate().fold(0, |quiet, (piece, &rows)| {
+        quiet | if rows & full == 0 { 1 << piece } else { 0 }
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct MinoBounds {
+    start_pieces: u16,
+    best_bag_spins: u8,
+    bag_alpha: f64,
+    goal: u8,
+    budget: u16,
+    hard_piece_cap: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MinoCut { Cost, Selective }
+
+/// Called before expensive field evaluation at every partial placement.
+/// A possible same-bag finish is protected: its canonical seven targets are
+/// not a lower bound on the number of locks that a supply may actually need.
+fn mino_cut(board: &Board, used: u8, spins: u8, bounds: MinoBounds) -> Option<MinoCut> {
+    if spins >= bounds.goal { return None; }
+    let (more, optimistic_cells) = bag_potential(board, used);
+    let upper = spins.saturating_add(more);
+    if upper >= bounds.goal { return None; }
+    let end = bounds.start_pieces + 7;
+    let left = u16::from(bounds.goal - upper);
+    let after = left.max((left * 10).saturating_sub(optimistic_cells).div_ceil(4));
+    if end.saturating_add(after) > bounds.hard_piece_cap { return Some(MinoCut::Cost); }
+    if delta_lag(spins, bounds.best_bag_spins, more)
+        || pace_cut(upper, end, bounds.goal, bounds.budget)
+        || (bounds.start_pieces != 0 && f64::from(upper) + 0.95 <= bounds.bag_alpha)
+    { return Some(MinoCut::Selective); }
+    None
+}
+
+/// A selective alpha window among actual prefixes with identical inventory.
+/// These are proposal references, never an impossibility or P7 certificate.
+fn prefix_dominated(windows: &[[f64; 7]], used: u8, gain: u8, quality: f64) -> bool {
+    windows[used as usize].iter().skip(usize::from(gain) + 1)
+        .any(|&better| better > quality)
+}
+
+/// The quality contribution is strictly below 0.95. This shortcut only skips
+/// candidates that cannot enter this already full bounded proposal bucket.
+fn below_bucket_window(bucket: &[SeedState], limit: usize, spins: u8) -> bool {
+    bucket.len() >= limit && bucket.last().is_some_and(|worst| {
+        f64::from(spins) + 0.95 <= worst.score
+    })
 }
 
 fn delta_lag(spins: u8, best_at_bag: u8, optimistic_more: u8) -> bool {
@@ -2102,18 +2371,35 @@ fn efficiency(spins: u8, pieces: u16) -> f64 {
     f64::from(spins) * 7.0 / f64::from(productive_locks(pieces))
 }
 
+/// Expected spins as a rational with denominator 40 * horizon. Map a user
+/// horizon onto 17 reference bags; interpolate without rounding per-mino quotas.
+fn pace_reference_numerator(pieces: u16, goal: u8, budget: u16) -> u64 {
+    let horizon = u64::from(budget.max(1));
+    let scaled = u64::from(pieces) * 17;
+    let bag = (scaled / horizon) as usize;
+    let reference = if bag >= 17 {
+        u64::from(PACE_REFERENCE[17]) * u64::from(pieces)
+    } else {
+        let remainder = scaled % horizon;
+        u64::from(PACE_REFERENCE[bag]) * (horizon - remainder)
+            + u64::from(PACE_REFERENCE[bag + 1]) * remainder
+    };
+    u64::from(goal) * reference
+}
+
 fn pace_cut(spins: u8, pieces: u16, goal: u8, budget: u16) -> bool {
     if pieces <= 7 || spins >= goal { return false; }
-    let horizon = u32::from(budget.max(1));
-    let slack = u32::from(PACE_NEAR_SLACK) * horizon
-        + u32::from(PACE_DISTANCE_SLACK) * u32::from(budget.saturating_sub(pieces));
-    u32::from(goal) * u32::from(pieces) >= u32::from(spins) * horizon + slack
+    let horizon = u64::from(budget.max(1));
+    let slack = u64::from(PACE_NEAR_SLACK) * horizon
+        + u64::from(PACE_DISTANCE_SLACK) * u64::from(budget.saturating_sub(pieces));
+    pace_reference_numerator(pieces, goal, budget)
+        >= u64::from(spins) * 40 * horizon + slack * 40
 }
 
 fn pace_lag(spins: u8, pieces: u16, goal: u8, budget: u16) -> f64 {
     if pieces <= 7 { return 0.0; }
-    f64::from(goal) * f64::from(pieces)
-        / f64::from(budget.max(1)) - f64::from(spins)
+    pace_reference_numerator(pieces, goal, budget) as f64
+        / (40.0 * f64::from(budget.max(1))) - f64::from(spins)
 }
 
 fn pace_slack(pieces: u16, budget: u16) -> f64 {
@@ -2130,13 +2416,11 @@ fn productive_rounds(
     spins: u8, pieces: u16, last_gain: u8, future_spins: u8,
     stale: u32, goal: u8, budget: u16,
 ) -> u32 {
-    // Reduce the budget before reaching the selective cut, but grant the same
-    // distance-aware preparation allowance used by the horizon policy.
-    if under_pace(spins, pieces, goal, budget) {
-        return 1;
-    }
-    if pieces <= 7 { return 1 + u32::from(future_spins != 0 && stale == 0); }
-    focused_rounds(last_gain, future_spins.min(1), stale).min(8)
+    // Strong piece-level cuts should leave enough work for surviving branches,
+    // including a quiet reconstruction before a productive following bag.
+    if pieces <= 7 { return 2 + u32::from(future_spins != 0 && stale < 2); }
+    let rounds = focused_rounds(last_gain, future_spins.min(1), stale).clamp(3, 8);
+    if under_pace(spins, pieces, goal, budget) { rounds.min(4) } else { rounds }
 }
 
 pub struct SearchSession {
@@ -2176,7 +2460,11 @@ pub struct SearchSession {
     /// Per-spin entries retain alternatives instead of one winning board.
     best_quality_by_bag: Vec<[f64; TARGET_SPINS as usize + 1]>,
     quality_pruned: u64,
+    quiet_policy_rejected: u64,
     selective_pruned: u64,
+    mino_bound_pruned: u64,
+    mino_selective_pruned: u64,
+    mino_capacity_pruned: u64,
     last_budget_progress_round: u64,
     benchmark_epoch: u64,
     dispatches: u64,
@@ -2260,7 +2548,11 @@ impl SearchSession {
             best_spins_by_bag: vec![0; 101],
             best_quality_by_bag: vec![[f64::NEG_INFINITY; TARGET_SPINS as usize + 1]; 101],
             quality_pruned: 0,
+            quiet_policy_rejected: 0,
             selective_pruned: 0,
+            mino_bound_pruned: 0,
+            mino_selective_pruned: 0,
+            mino_capacity_pruned: 0,
             last_budget_progress_round: 0,
             benchmark_epoch: 0,
             dispatches: 0,
@@ -2301,6 +2593,12 @@ impl SearchSession {
                 if job.graph.overflow {
                     // Incomplete analysis is not inserted into any failure bitset.
                     self.backpropagate(job.parent, 0.0);
+                } else if job.quiet_rejected {
+                    // This fixed tiling violates the mandatory no-hold quiet
+                    // placement policy, independently of the chance threshold.
+                    self.quiet_policy_rejected += 1;
+                    self.pruned += 1;
+                    self.backpropagate(job.parent, 0.0);
                 } else if job.checked == P7_COUNT {
                     self.finish_verification(job);
                 } else if !self.can_still_qualify(&job) {
@@ -2319,10 +2617,14 @@ impl SearchSession {
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
                 let prior_selective = job.selective_pruned;
+                let prior_mino = (job.mino_bound_pruned, job.mino_selective_pruned, job.mino_capacity_pruned);
                 self.expanded += job.advance(&mut self.rng, self.goal, &mut self.physics_cache);
                 self.pruned += job.pruned - prior_pruned;
                 self.duplicates += job.duplicates - prior_duplicates;
                 self.selective_pruned += job.selective_pruned - prior_selective;
+                self.mino_bound_pruned += job.mino_bound_pruned - prior_mino.0;
+                self.mino_selective_pruned += job.mino_selective_pruned - prior_mino.1;
+                self.mino_capacity_pruned += job.mino_capacity_pruned - prior_mino.2;
                 if self.preview_steps % 16 == 0 {
                     self.update_generation_preview(&job);
                 }
@@ -2371,7 +2673,7 @@ impl SearchSession {
                             targets: state.targets,
                             seed_frames: state.frames,
                             terminal: state.spins >= self.goal,
-                            assume_reflection: (job.start_pieces == 0 && (!self.config.ignore_first_bag_probability || self.config.first_bag_min_success_percent > 0.0))
+                            assume_reflection: (job.start_pieces == 0 && job.start == Board::default())
                                 || self.tree[parent].certificates.first()
                                 .is_some_and(|certificate| certificate.first_bag_symmetry_assumed),
                             quality: state.quality,
@@ -2732,10 +3034,9 @@ impl SearchSession {
                 else { required_success(&[], self.config.min_success_percent) })
         } else { required_success(self.counted_counts(&self.tree[parent].counts), self.config.min_success_percent) };
         // Re-search only selected boundaries more broadly; siblings start cheap.
-        let under_pace = pace_fallback || under_pace(self.tree[parent].spins, self.tree[parent].pieces,
-            self.goal, self.preferred_pace_budget()) || self.node_quality_dominated(parent);
-        let stage = if under_pace { 0 }
-            else { (attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2) };
+        let narrow = pace_fallback || self.node_quality_dominated(parent);
+        let stage = if narrow { 0 }
+            else { (1 + attempt / 4 + u32::from(self.last_bag_spins(parent) >= 2)).min(2) };
         let width = (self.config.beam_width >> (2 - stage)).max(4);
         let setup = parent == 0 && attempt % 4 != 3;
         let mut generation = GenerationJob::new(
@@ -2752,10 +3053,16 @@ impl SearchSession {
         );
         generation.best_bag_spins =
             self.best_spins_by_bag[(self.tree[parent].pieces as usize / 7) + 1];
+        generation.bag_alpha = self.best_quality_by_bag[(self.tree[parent].pieces as usize / 7) + 1]
+            .iter().enumerate().filter(|(_, quality)| quality.is_finite())
+            .map(|(spins, &quality)| spin_rank(spins as u8, quality))
+            .fold(f64::NEG_INFINITY, f64::max);
+        generation.hard_piece_cap = self.cost_cap();
         generation.prune_budget = self.proposal_budget(pace_fallback);
         generation.pace_fallback = pace_fallback;
-        generation.first_bag_symmetry = parent == 0
-            && (!self.config.ignore_first_bag_probability || self.config.first_bag_min_success_percent > 0.0);
+        // Quiet placements must remain supply-safe even when start probability
+        // is excluded and its numeric floor is disabled.
+        generation.first_bag_symmetry = parent == 0;
         generation.relaxed_setup = parent == 0;
         if parent == 0 {
             generation.continuation_minimum_success = required_success(&[], self.config.min_success_percent);
@@ -2941,7 +3248,7 @@ impl SearchSession {
                 targets: seed.targets.clone(),
                 seed_frames: seed.frames.clone(),
                 terminal: seed.spins >= self.goal,
-                assume_reflection: (job.start_pieces == 0 && (!self.config.ignore_first_bag_probability || self.config.first_bag_min_success_percent > 0.0))
+                assume_reflection: (job.start_pieces == 0 && job.start == Board::default())
                     || parent.certificates.first().is_some_and(|c| c.first_bag_symmetry_assumed),
                 quality: seed.quality,
                 pace_fallback: job.pace_fallback,
@@ -2960,7 +3267,8 @@ impl SearchSession {
         let mut upper_counts = parent.counts.clone();
         upper_counts.push(job.coverage_upper());
         let symmetry_assumed = if job.plan.start_pieces == 0 {
-            job.symmetry.is_some() && usize::from(job.coverage_success()) > job.success
+            job.symmetry.is_some() && (usize::from(job.coverage_success()) > job.success
+                || job.quiet_safe > job.canonical_quiet_safe)
         } else { job.plan.assume_reflection };
         let lower = self.path_probability(&lower_counts);
         let upper = self.path_probability(&upper_counts);
@@ -3014,6 +3322,7 @@ impl SearchSession {
     }
 
     fn finish_verification(&mut self, job: VerificationJob) {
+        debug_assert!(!job.quiet_rejected && job.quiet_safe == P7_COUNT);
         self.verified_candidates += 1;
         let parent = &self.tree[job.parent];
         let mut counts = parent.counts.clone();
@@ -3021,7 +3330,8 @@ impl SearchSession {
         let total_probability = self.path_probability(&counts);
         let symmetry_costs = job.symmetry.as_ref().map(|orbits| orbits.costs().to_vec());
         let symmetry_assumed = job.plan.start_pieces > 0 && job.plan.assume_reflection
-            || symmetry_costs.as_ref().is_some_and(|costs| *costs != job.costs);
+            || symmetry_costs.as_ref().is_some_and(|costs| *costs != job.costs)
+            || (job.symmetry.is_some() && job.quiet_safe > job.canonical_quiet_safe);
         let effective_costs = symmetry_costs.as_deref().unwrap_or(&job.costs);
         let mut cdf = vec![];
         let mut budget = None;
@@ -3093,6 +3403,10 @@ impl SearchSession {
             effective_success: *counts.last().unwrap(),
             checked: P7_COUNT as u16,
             canonical_checked: job.canonical_checked as u16,
+            quiet_no_hold_verified: true,
+            quiet_safe_supplies: job.quiet_safe as u16,
+            canonical_quiet_safe: job.canonical_quiet_safe as u16,
+            hold_policy: CLEAR_ONLY_HOLD_POLICY,
             success_bits: job.bits,
             costs: job.costs,
             order_codes: job.codes,
@@ -3369,26 +3683,21 @@ impl SearchSession {
         let certificates: Vec<_> = archive
             .map(|a| a.certificates.iter().map(|c| c.as_ref()).collect())
             .unwrap_or_default();
-        serde_json::json!({
-            "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
-            "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7NormalizedHold", "runtimeReplayVerified": false },
-            "config": self.config, "snapshot": self.snapshot(),
-            "candidate": archive.map(|a| &a.summary), "bags": certificates,
-            "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
-            "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
-            "interchange": false, "globalOptimalityProven": false,
-            "probabilityScope": if self.config.ignore_first_bag_probability { "AfterFirstBag" } else { "AllBags" },
-            "firstBagSymmetryPolicy": "AssumeJLAndSZSupplyReflection;resolveQueuePairsAtMinimumCost;useVerifiedOrientation;fixedOrientationAfterStart",
-            "checkedMeaning": "checked=resolvedModelSupplies;canonicalChecked=actuallyEvaluatedCanonicalSupplies",
-            "firstBagSymmetryAssumed": archive.is_some_and(|a| a.summary.first_bag_symmetry_assumed),
-            "mirroredInputsVerified": false,
-            "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
-            "displayPartialRanking": "spins/max(7,placed);thenMoreBags;thenSpins;oneBagThenStartProbability;thenFieldQuality;thenFewerLocks;thenProbability",
-            "selectiveSearch": {
+        let selective_search = serde_json::json!({
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
                 "paceNearSlack": PACE_NEAR_SLACK, "paceDistanceSlack": PACE_DISTANCE_SLACK,
+                "paceModel": "LowerSaoSarcelleEnvelope;17BagHorizonInterpolation;ReferenceGoal40",
+                "paceReferenceCumulativeSpins": PACE_REFERENCE,
                 "paceIncludesSetup": true,
                 "qualityResearchInterval": 0, "qualityPruned": self.quality_pruned,
+                "minoBoundPruned": self.mino_bound_pruned,
+                "minoSelectivePruned": self.mino_selective_pruned,
+                "minoCapacityPruned": self.mino_capacity_pruned,
+                "minoBoundMeaning": "necessaryWholeBagCostOrQuietFirstAvailability;possibleTerminalPrefixExempt",
+                "minoSelectiveMeaning": "optimisticBagEndPaceAndRank;sameInventoryActualSpinAndQualityWindow",
+                "minoCapacityMeaning": "cannotEnterCurrentBoundedProposalBucket;notGlobalImpossibility",
+                "minoPruning": "rowDeficitUpper;wholeBagPaceUpper;sameInventoryPrefixWindow;boundedBeamAdmission",
+                "normalGenerationRounds": [3, 8],
                 "qualityReferencesSurviveBudgetWidening": true,
                 "qualityPreparationRounds": 1,
                 "preferredPaceBudget": self.preferred_pace_budget(),
@@ -3397,7 +3706,26 @@ impl SearchSession {
                 "budgetStaleRounds": BUDGET_STALE_ROUNDS,
                 "explorationInterval": EXPLORATION_INTERVAL,
                 "cutsAreImpossibilityProofs": false
-            }
+        });
+        serde_json::json!({
+            "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
+            "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
+            "config": self.config, "snapshot": self.snapshot(),
+            "candidate": archive.map(|a| &a.summary), "bags": certificates,
+            "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
+            "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
+            "interchange": false, "globalOptimalityProven": false,
+            "probabilityScope": if self.config.ignore_first_bag_probability { "AfterFirstBag" } else { "AllBags" },
+            "quietPlacementPolicy": "EverySupplyHasStrategyWithoutQuietBlockageUntilSuccessOrForcedClearBlockage",
+            "holdPolicy": CLEAR_ONLY_HOLD_POLICY,
+            "quietPolicyRejected": self.quiet_policy_rejected,
+            "firstBagSymmetryPolicy": "AssumeJLAndSZSupplyReflection;resolveQueuePairsAtMinimumCost;useVerifiedOrientation;fixedOrientationAfterStart",
+            "checkedMeaning": "checked=resolvedModelSupplies;canonicalChecked=actuallyEvaluatedCanonicalSupplies",
+            "firstBagSymmetryAssumed": archive.is_some_and(|a| a.summary.first_bag_symmetry_assumed),
+            "mirroredInputsVerified": false,
+            "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
+            "displayPartialRanking": "spins/max(7,placed);thenMoreBags;thenSpins;oneBagThenStartProbability;thenFieldQuality;thenFewerLocks;thenProbability",
+            "selectiveSearch": selective_search
         }).to_string()
     }
 }
@@ -3572,11 +3900,14 @@ mod tests {
             job.advance(40, &mut cache);
         }
         assert_eq!(job.checked, 5040);
-        // Only S is declared. It must be current or held immediately; the
-        // verifier cannot place undeclared pieces merely to reach it.
-        assert_eq!(job.success, 1440);
-        assert_eq!(job.costs.iter().filter(|cost| **cost == 1).count(), 1440);
-        assert_eq!(job.costs.iter().filter(|cost| **cost == 255).count(), 3600);
+        // Only S is declared. The first supply is active; an undeclared quiet
+        // piece cannot be held merely to peek at S. Other queues are clearing
+        // supply failures, not failures of a declared ordinary placement.
+        assert!(!job.quiet_rejected);
+        assert_eq!(job.quiet_safe, 5040);
+        assert_eq!(job.success, 720);
+        assert_eq!(job.costs.iter().filter(|cost| **cost == 1).count(), 720);
+        assert_eq!(job.costs.iter().filter(|cost| **cost == 255).count(), 4320);
         let rank = job.costs.iter().position(|cost| *cost == 1).unwrap();
         let (frames, paths) = job.graph.witness(job.codes[rank], 1, 112);
         assert_eq!(frames.len(), 1);

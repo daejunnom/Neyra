@@ -180,28 +180,35 @@ export class SearchClient {
     this.publishStatus();
   }
 
-  export(view: CandidateView = 'best') {
+  export(view: CandidateView = 'best', requestId = crypto.randomUUID()): boolean {
     const owner = view === 'current' ? this.currentCandidateOwner() :
       view === 'partial' ? this.partialOwner() : this.bestOwner() ?? this.partialOwner();
-    if (!owner) return;
+    if (!owner) return false;
     const selection: CandidateView = view === 'current' ? 'current' : owner.candidate.complete ? 'best' : 'partial';
-    const requestId = crypto.randomUUID();
     if (selection === 'best' && owner.slot.incumbent?.candidate.id === owner.candidate.id) {
       // A completed certificate remains usable even if its worker later fails.
       this.receive({ type: 'export', runId: this.runId, requestId, data: owner.slot.incumbent.data });
-      return;
+      return true;
     }
     if (selection === 'partial' && this.partialArchive?.slot.id === owner.slot.id &&
         samePartialRecord(this.partialArchive.candidate, owner.candidate)) {
       this.receive({ type: 'export', runId: this.runId, requestId, data: this.partialArchive.data });
-      return;
+      return true;
     }
     if (owner.slot.status === 'failed') {
-      this.receive({ type: 'warning', runId: this.runId, message: '이 경로의 기록을 받기 전에 탐색기가 중단됐어요. 이미 보관한 결과는 계속 저장할 수 있습니다.' });
-      return;
+      this.receive({ type: 'export-error', runId: this.runId, requestId, message: '이 경로의 기록을 받기 전에 탐색기가 중단됐어요. 이미 보관한 결과는 계속 저장할 수 있습니다.' });
+      return false;
     }
     this.pendingExports.set(requestId, { owner: owner.slot.id, view: selection });
-    owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: selection } satisfies EngineCommand);
+    try {
+      owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: selection } satisfies EngineCommand);
+      return true;
+    } catch {
+      this.pendingExports.delete(requestId);
+      this.receive({ type: 'export-error', runId: this.runId, requestId,
+        message: '이 후보의 문서를 요청하지 못했어요. 다른 후보를 선택해 주세요.' });
+      return false;
+    }
   }
 
   dispose() {
@@ -281,7 +288,7 @@ export class SearchClient {
       if (!request || request.owner !== slot.id) return;
       this.pendingExports.delete(message.requestId);
       if (message.type === 'export-error') {
-        this.receive({ type: 'warning', runId: this.runId, message: message.message });
+        this.receive({ type: 'export-error', runId: this.runId, requestId: message.requestId, message: message.message });
       } else {
         if (message.snapshot) this.updateSnapshot(slot, message.snapshot);
         if (request.view === 'current') {
@@ -301,7 +308,11 @@ export class SearchClient {
     this.pendingDetails.delete(slot.id);
     if (this.pendingPartialArchive?.owner === slot.id) this.pendingPartialArchive = null;
     for (const [requestId, request] of this.pendingExports) {
-      if (request.owner === slot.id) this.pendingExports.delete(requestId);
+      if (request.owner === slot.id) {
+        this.pendingExports.delete(requestId);
+        this.receive({ type: 'export-error', runId: this.runId, requestId,
+          message: '문서를 받기 전에 이 후보의 탐색기가 중단됐어요. 보관된 최선 경로를 선택해 주세요.' });
+      }
     }
     if (this.slots.every((candidate) => candidate.status === 'failed')) {
       this.status = 'failed';

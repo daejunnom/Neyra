@@ -29,8 +29,9 @@
   adopting it; worker-local caches do not imply a global shared search DAG.
 - Use explicit static board features and structural obligations for evaluation.
   Do not introduce NNUE, training data dependencies, or learned evaluation.
-- New settings default to 100% construction success; preserve explicit saved
-  user settings. Independent worker profiles must keep separate certificates.
+- The overall construction-success threshold defaults to 100%; preserve
+  explicit saved user settings. The first-bag floor is separate, as below.
+  Independent worker profiles must keep separate certificates.
   Combining their displayed results does not combine their P7 success sets.
 - Keep proposal ordering distinct from proven bounds. An open passage or an
   unfinished preparation goal is not an executed spin witness. A canonical
@@ -48,8 +49,10 @@
   Same-ID quality improvements must replace old fields and archived exports.
 - First-bag probability exclusion defaults on and is conditional on a
   constructible first bag. Preserve its separate chance and explicit saved
-  settings; zero successful starts never qualify. When counted, first-bag
-  reflection swaps J/L and S/Z together in the canonical supply results.
+  settings; zero successful starts never qualify. The independent first-bag
+  minimum defaults to 80%; 0 disables that separate floor. Compute the allowed
+  first-bag symmetry whenever the first bag is counted OR this floor is enabled.
+  Reflection swaps J/L and S/Z together in the canonical supply results.
   The user accepts rare kick/spawn asymmetry: do not add reflected physical
   validation or a second P7 pass. Keep the chosen orientation for later bags,
   export the symmetry assumption when it changes coverage or cost, and retain
@@ -64,6 +67,13 @@
   widen a stalled soft budget, and do not cache heuristic misses as failures.
   Static air clearance is not exact mino reachability; actual spin witnesses
   may override its roof/access penalties. Keep code and documents explicit.
+- Same-depth spin/quality disadvantage is a selective futility criterion,
+  never mathematical dominance between different boards. Preserve a reduced
+  re-search opportunity, remove selectively skipped plans from duplicate
+  memory, and reconsider them after horizon widening. Verified incumbents and
+  genuine terminal prefixes must not be erased by scheduler heuristics.
+  Pace slack decreases with distance to the active horizon; first-bag setup
+  protection must not become a permanent seven-lock discount in that cut.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.
@@ -75,3 +85,10 @@
 - Worker lanes partition first-placement proposals, not every complete build.
   Preserve independent P7 certificates, compact progress, correct replay
   ownership, manual worker preferences and all-worker pause/cancel semantics.
+- Display whole-bag end states and a real final partial bag, using Clearra's
+  piece palette. Recover colors only from recorded pre-clear placement cells
+  and actual line compression; never infer mino identity from mask differences.
+  CTK3/Fumen documents are bag diagrams, not a universal representative input
+  order. Preserve all 24 physical rows in CTK3 and reject Fumen exports with an
+  occupied 24th row instead of cropping or using its separate garbage row.
+  Report clipboard success only after the browser write succeeds.

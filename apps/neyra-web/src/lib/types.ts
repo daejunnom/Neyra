@@ -1,6 +1,8 @@
 export interface SearchConfig {
   min_success_percent: number;
   ignore_first_bag_probability: boolean;
+  /** Independent setup filter. Zero leaves the first-bag chance unrestricted. */
+  first_bag_min_success_percent: number;
   piece_goal: number;
   max_pieces: number;
   budget_start: number;
@@ -24,6 +26,8 @@ export interface BoardFrame {
   placed: number;
   lines: number;
   spin: boolean;
+  /** Actual pre-clear physical cells; absent only in older saved records. */
+  placedCells?: [number, number][];
 }
 
 export interface Candidate {
@@ -105,6 +109,7 @@ export type EngineCommand =
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
   ignore_first_bag_probability: true,
+  first_bag_min_success_percent: 80,
   piece_goal: 119,
   max_pieces: 140,
   budget_start: 0,

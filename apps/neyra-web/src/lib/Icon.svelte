@@ -7,6 +7,7 @@
     stop: 'M6 6h12v12H6z',
     settings: 'M4 7h16M4 17h16M8 4v6M16 14v6',
     download: 'M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4',
+    copy: 'M8 8h12v13H8zM16 8V3H3v13h5',
     arrow: 'm9 5 7 7-7 7',
     back: 'm15 5-7 7 7 7',
     close: 'm6 6 12 12M18 6 6 18',

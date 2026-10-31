@@ -5,21 +5,24 @@
   Grid layout and cell semantics retained; 24-row mask view added.
 -->
 <script lang="ts">
+  import { clearraPalette } from './buildDocument';
   export let rows: number[] = [];
+  export let colors: string[][] = [];
   export let ariaLabel = '탐색 필드';
   export let empty = false;
   $: cells = Array.from({ length: 240 }, (_, index) => {
     const y = 23 - Math.floor(index / 10);
     const x = index % 10;
-    return Boolean((rows[y] || 0) & (1 << x));
+    const filled = Boolean((rows[y] || 0) & (1 << x));
+    return { filled, piece: filled ? colors[y]?.[x] ?? 'X' : '_' };
   });
 </script>
 
 <div class="preview">
   <div class="row-labels" aria-hidden="true"><span>24</span><span>20</span><span>10</span><span>01</span></div>
   <div class="solution-board" role="img" aria-label={ariaLabel}>
-    {#each cells as filled, index}
-      <span class="cell" class:empty={!filled} class:filled class:buffer={index < 40} class:boundary={index >= 40 && index < 50} aria-hidden="true"></span>
+    {#each cells as cell, index}
+      <span class="cell" class:empty={!cell.filled} class:filled={cell.filled} class:buffer={index < 40} class:boundary={index >= 40 && index < 50} data-piece={cell.piece} style={cell.filled ? '--cell-color:' + (clearraPalette[cell.piece] ?? clearraPalette.X) : undefined} aria-hidden="true"></span>
     {/each}
     {#if empty}
       <div class="board-placeholder"><span class="placeholder-mino"><i></i><i></i><i></i><i></i></span><span>새로운 빌드의 시작</span></div>
@@ -33,7 +36,7 @@
   .solution-board { aspect-ratio:10/24; background:#111e1c; border:1px solid #43534d; border-radius:5px; display:grid; grid-template-columns:repeat(10,minmax(0,1fr)); grid-template-rows:repeat(24,minmax(0,1fr)); overflow:hidden; width:100%; position:relative; }
   .cell { min-height:0; min-width:0; box-shadow:inset 0 0 0 .5px #ffffff06; }
   .empty { background:#14231f; }
-  .filled { background:#96c7b5; box-shadow:inset 0 0 0 .8px #152b23, inset 0 2px 0 #ffffff29; }
+  .filled { background:var(--cell-color,#96c7b5); box-shadow:inset 0 0 0 .8px #152b23, inset 0 2px 0 #ffffff29; }
   .buffer.empty { background:#0f1b18; }
   .boundary { border-top:1px dashed #557468; }
   .row-labels { position:absolute; left:0; top:0; bottom:17px; width:16px; color:#61776d; font-size:9px; font-variant-numeric:tabular-nums; }

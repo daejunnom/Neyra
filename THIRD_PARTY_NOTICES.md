@@ -9,10 +9,12 @@ Neyra adapts the following Clearra source:
 | Clearra source | Neyra use |
 | --- | --- |
 | `core-c/src/rules/srs_kicks.c` | Historical reference for the original handwritten tables; replaced by the reviewed official-source fixture and generated Rust module described below |
-| `packages/clearra-ui/src/lib/workspace/SolutionBoardPreview.svelte` | Board grid and cell semantics in `apps/neyra-web/src/lib/BoardPreview.svelte`; tetromino colors in `src/routes/+page.svelte` |
+| `packages/clearra-ui/src/lib/workspace/SolutionBoardPreview.svelte` | Board grid and cell semantics in `apps/neyra-web/src/lib/BoardPreview.svelte`; tetromino palette in `apps/neyra-web/src/lib/buildDocument.ts` |
 | `packages/clearra-ui/src/lib/workspace/WorkspaceProgressStatus.svelte` | Progress status and track presentation in `apps/neyra-web/src/lib/ProgressStrip.svelte` |
 | `packages/clearra-ui/src/lib/workspace/WorkspaceShell.svelte` | Workspace structure in `apps/neyra-web/src/routes/+page.svelte` and `styles.css` |
 | `apps/clearra-web/svelte.config.js` | Static adapter and base-path configuration in `apps/neyra-web/svelte.config.js` |
+
+The piece palette is also checked against revision `f504c8f02d771da518000f901d2b8704a1d6830b`. Neyra uses Clearra’s standalone **ctk3 0.1.2** package for native document encoding, from [`packages/ctk3`](https://github.com/daejunnom/Clearra/tree/f504c8f02d771da518000f901d2b8704a1d6830b/packages/ctk3). That package carries the same Clearra MIT notice below. Its native API preserves Neyra’s 24-row fields.
 
 Original license, reproduced without modification:
 
@@ -39,6 +41,36 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+```
+
+## tetris-fumen
+
+Neyra uses **tetris-fumen 1.1.3**, published by knewjade, to encode Fumen bag diagrams. Source: [knewjade/tetris-fumen](https://github.com/knewjade/tetris-fumen). The package version and integrity are pinned by the lockfile. This package is also a dependency of ctk3.
+
+The installed package’s original license is reproduced without modification:
+
+```text
+MIT License
+
+Copyright (c) 2019
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## Triangle.js, distributed with Spilink

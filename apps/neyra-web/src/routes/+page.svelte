@@ -4,6 +4,8 @@
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
   import { SearchClient, spinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
+  import { getBagViews, clearraPalette } from '$lib/buildDocument';
+  import { encodeBuildDocument } from '$lib/exportFormats';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
   import './styles.css';
 
@@ -20,18 +22,30 @@
   let elapsedMs = 0;
   let previousTick = 0;
   let view: 'current' | 'best' = 'current';
-  let frameIndex = -1;
+  let bagIndex = -1;
   let playing = false;
   let visibleCandidateKey = '';
   let savedMessage = '';
   let notice = '';
+  let bagWarning = '';
   let availableWorkers = 1;
 
-  // Clearra SolutionBoardPreview.svelte palette (MIT, pinned in THIRD_PARTY_NOTICES).
-  const pieceColors: Record<string, string> = {
-    I: '#60d6db', O: '#f2cb52', T: '#c47bdc', S: '#70c982',
-    Z: '#ec7771', J: '#6d91e5', L: '#eaa05d'
-  };
+  type ExportFormat = 'ctk3' | 'fumen';
+  type BuildDocument = ReturnType<typeof encodeBuildDocument>;
+  let exportFormat: ExportFormat = 'ctk3';
+  let exportBusy = false;
+  let exportEpoch = 0;
+  let copyDialog: HTMLDialogElement;
+  let copyText: HTMLTextAreaElement;
+  let preparedDocument: BuildDocument | null = null;
+  let clipboardAvailable = false;
+  let copyNotice = '';
+  let pendingDocument: {
+    requestId: string; format: ExportFormat;
+    resolve: (document: BuildDocument) => void; reject: (reason: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
+
   const number = new Intl.NumberFormat('ko-KR');
   const compactNumber = new Intl.NumberFormat('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
   $: active = status === 'running' || status === 'loading';
@@ -39,12 +53,13 @@
   $: conditionalProbability = (snapshot !== null || hasSession ? runConfig : config).ignore_first_bag_probability;
   $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
-  $: frames = candidate?.frames ?? [];
-  $: selectedIndex = frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
-  $: frame = frames[selectedIndex];
-  $: boardRows = frame?.rows ?? candidate?.rows ?? [];
-  $: boardSpins = frame?.spins ?? candidate?.spins ?? 0;
-  $: boardPlaced = frame?.placed ?? candidate?.placed ?? 0;
+  $: bags = displayedBags(candidate);
+  $: selectedIndex = bagIndex < 0 ? Math.max(0, bags.length - 1) : Math.min(bagIndex, Math.max(0, bags.length - 1));
+  $: bag = bags[selectedIndex];
+  $: boardRows = bag?.rows ?? candidate?.rows ?? [];
+  $: boardColors = bag?.cells ?? [];
+  $: boardSpins = bag?.spins ?? candidate?.spins ?? 0;
+  $: boardPlaced = bag?.placed ?? candidate?.placed ?? 0;
   $: verifying = status === 'running' && snapshot?.phase === 'verifying';
   $: statusLabel = ({
     idle: '탐색 준비',
@@ -59,12 +74,22 @@
     candidate.placed, candidate.fieldQuality, candidate.frameCount, candidate.rows]) : '';
   $: if (candidateKey !== visibleCandidateKey) {
     visibleCandidateKey = candidateKey;
-    frameIndex = -1;
+    bagIndex = -1;
     playing = false;
   }
 
   function percent(value: number) {
     return (Math.max(0, Math.min(1, value)) * 100).toLocaleString('ko-KR', { maximumFractionDigits: 2 }) + '%';
+  }
+  function displayedBags(item: Candidate | null) {
+    try {
+      const result = getBagViews(item);
+      bagWarning = '';
+      return result;
+    } catch (reason) {
+      bagWarning = reason instanceof Error ? reason.message : '가방 표시를 읽지 못했어요.';
+      return [];
+    }
   }
   function time(ms: number) {
     const total = Math.floor(ms / 1000);
@@ -105,12 +130,19 @@
       error = event.message;
     } else if (event.type === 'warning') {
       notice = event.message;
-    } else if (event.type === 'export') {
-      download(event.data, 'neyra-result.json');
+    } else if (event.type === 'export' && pendingDocument?.requestId === event.requestId) {
+      const pending = pendingDocument;
+      pendingDocument = null;
+      clearTimeout(pending.timer);
+      try { pending.resolve(encodeBuildDocument(event.data, pending.format)); }
+      catch (reason) { pending.reject(reason instanceof Error ? reason : new Error(String(reason))); }
+    } else if (event.type === 'export-error' && pendingDocument?.requestId === event.requestId) {
+      rejectDocument(event.message);
     }
   }
   onMount(() => {
     availableWorkers = workerLimit();
+    clipboardAvailable = typeof navigator.clipboard?.writeText === 'function';
     client = new SearchClient(receive);
     try {
       const stored = localStorage.getItem('neyra-config-v1');
@@ -130,15 +162,20 @@
       const now = performance.now();
       if (status === 'running') elapsedMs += now - previousTick;
       previousTick = now;
-      if (playing && frames.length > 0) {
-        if (selectedIndex >= frames.length - 1) playing = false;
-        else frameIndex = selectedIndex + 1;
+      if (playing && bags.length > 0) {
+        if (selectedIndex >= bags.length - 1) playing = false;
+        else bagIndex = selectedIndex + 1;
       }
     }, 250);
-    return () => { window.clearInterval(clock); client.dispose(); };
+    return () => { exportEpoch += 1; rejectDocument('화면을 닫아 문서 준비를 멈췄어요.'); window.clearInterval(clock); client.dispose(); };
   });
   function start() {
     if (!client || active) return;
+    exportEpoch += 1;
+    rejectDocument('새 탐색을 시작해 문서 준비를 멈췄어요.');
+    exportBusy = false;
+    preparedDocument = null;
+    copyDialog?.close();
     status = 'loading';
     error = '';
     savedMessage = '';
@@ -146,7 +183,7 @@
     elapsedMs = 0;
     snapshot = null;
     view = 'current';
-    frameIndex = -1;
+    bagIndex = -1;
     playing = false;
     runConfig = { ...config };
     previousTick = performance.now();
@@ -155,7 +192,7 @@
   function pause() { client.pause(); }
   function resume() {
     view = 'current';
-    frameIndex = -1;
+    bagIndex = -1;
     playing = false;
     previousTick = performance.now();
     client.resume();
@@ -164,6 +201,8 @@
   function validateConfig(value: SearchConfig) {
     if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '성공률은 0% 초과, 100% 이하로 입력해 주세요.';
     if (typeof value.ignore_first_bag_probability !== 'boolean') return '첫 가방 성공률 설정을 다시 선택해 주세요.';
+    if (!Number.isFinite(value.first_bag_min_success_percent) || value.first_bag_min_success_percent < 0 || value.first_bag_min_success_percent > 100) return '첫 가방 최소 성공률은 0–100%로 입력해 주세요. 0%는 제한 없음입니다.';
+    if (Math.abs(value.first_bag_min_success_percent * 100 - Math.round(value.first_bag_min_success_percent * 100)) > 1e-7) return '첫 가방 성공률은 소수 둘째 자리까지 입력해 주세요.';
     if (!Number.isInteger(value.piece_goal) || value.piece_goal < 1 || value.piece_goal > 1000) return '목표 미노 수는 1–1,000 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.max_pieces) || value.max_pieces < 1 || value.max_pieces > 700) return '탐색 상한은 1–700 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
@@ -184,21 +223,97 @@
   function newSeed() {
     draft.seed = (crypto.getRandomValues(new Uint32Array(1))[0] % 4294967295) + 1;
   }
-  function download(data: unknown, filename: string) {
-    const url = URL.createObjectURL(new Blob([typeof data === 'string' ? data : JSON.stringify(data, null, 2)], { type: 'application/json' }));
-    const anchor = document.createElement('a');
-    anchor.href = url; anchor.download = filename; anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    savedMessage = '결과를 저장했어요.';
+  function rejectDocument(message: string) {
+    if (!pendingDocument) return;
+    const pending = pendingDocument;
+    pendingDocument = null;
+    clearTimeout(pending.timer);
+    pending.reject(new Error(message));
   }
-  function exportResult() { client.export(view); }
+  function requestDocument(format: ExportFormat): Promise<BuildDocument> {
+    return new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      pendingDocument = { requestId, format, resolve, reject,
+        timer: setTimeout(() => rejectDocument('문서를 받지 못했어요. 잠시 후 다시 시도해 주세요.'), 15000) };
+      try {
+        if (!client.export(view, requestId)) rejectDocument('저장할 후보를 먼저 선택해 주세요.');
+      } catch (reason) {
+        rejectDocument(reason instanceof Error ? reason.message : '문서를 준비하지 못했어요.');
+      }
+    });
+  }
+  function download(document: BuildDocument) {
+    const url = URL.createObjectURL(new Blob([document.text], { type: document.mime }));
+    const anchor = window.document.createElement('a');
+    anchor.href = url; anchor.download = document.filename; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    savedMessage = '문서를 저장했어요.';
+  }
+  async function exportResult(action: 'download' | 'copy') {
+    if (!client || !candidate || exportBusy) return;
+    const epoch = exportEpoch;
+    exportBusy = true;
+    savedMessage = '문서를 준비하고 있어요.';
+    const document = requestDocument(exportFormat);
+    // Register a handler immediately even if the clipboard refuses the write
+    // before the worker has returned its requested certificate.
+    document.catch(() => {});
+    try {
+      if (action === 'download') {
+        const result = await document;
+        if (epoch === exportEpoch) download(result);
+      } else {
+        try {
+          if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+            // Invoke write during the user's click; the promised content may
+            // arrive later from the worker without losing that activation.
+            const text = document.then(result => new Blob([result.text], { type: 'text/plain' }));
+            text.catch(() => {});
+            await navigator.clipboard.write([new ClipboardItem({ 'text/plain': text })]);
+          } else {
+            const result = await document;
+            if (epoch !== exportEpoch) return;
+            if (!navigator.clipboard?.writeText) throw new Error('클립보드 복사를 지원하지 않는 브라우저입니다.');
+            await navigator.clipboard.writeText(result.text);
+          }
+          if (epoch === exportEpoch) savedMessage = '문서를 클립보드에 복사했어요.';
+        } catch {
+          const result = await document;
+          if (epoch !== exportEpoch) return;
+          preparedDocument = result;
+          copyNotice = '자동으로 복사하지 못했어요. 아래 문서를 선택해 복사할 수 있습니다.';
+          copyDialog.showModal();
+          queueMicrotask(() => copyText?.select());
+          savedMessage = '복사할 문서를 준비했어요.';
+        }
+      }
+    } catch (reason) {
+      if (epoch === exportEpoch) savedMessage = reason instanceof Error ? reason.message : '문서를 준비하지 못했어요.';
+    } finally {
+      if (epoch === exportEpoch) exportBusy = false;
+    }
+  }
+  function selectCopyText() {
+    copyText.focus();
+    copyText.select();
+    copyNotice = '텍스트를 선택했어요. 브라우저의 복사 기능을 사용해 주세요.';
+  }
+  async function copyPrepared() {
+    if (!preparedDocument || !navigator.clipboard?.writeText) { selectCopyText(); return; }
+    try {
+      await navigator.clipboard.writeText(preparedDocument.text);
+      copyNotice = '문서를 클립보드에 복사했어요.';
+      savedMessage = copyNotice;
+    } catch { selectCopyText(); }
+  }
   function togglePlayback() {
-    if (frames.length < 2) return;
-    if (selectedIndex === frames.length - 1) frameIndex = 0;
+    if (bags.length < 2) return;
+    if (selectedIndex === bags.length - 1) bagIndex = 0;
     playing = !playing;
   }
-  function previousFrame() { playing = false; frameIndex = Math.max(0, selectedIndex - 1); }
-  function nextFrame() { playing = false; frameIndex = Math.min(frames.length - 1, selectedIndex + 1); }
+  function previousBag() { playing = false; bagIndex = Math.max(0, selectedIndex - 1); }
+  function nextBag() { playing = false; bagIndex = Math.min(bags.length - 1, selectedIndex + 1); }
+
 </script>
 
 <svelte:head>
@@ -235,22 +350,25 @@
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} ariaLabel={view === 'best' ? '최선 결과 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최선 결과 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
         <div class="field-summary">
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
           <div class="field-stat"><span>현재 가방</span><strong>{candidate ? Math.max(1, Math.ceil(boardPlaced / 7)) : '—'}</strong></div>
           <div class="candidate-label" class:complete={candidate?.complete}>{candidate?.complete ? '완주 후보' : candidate?.verified && candidate.qualified ? '검증 통과' : candidate ? '탐색 후보' : '빈 필드'}</div>
-          {#if frame?.piece}<div class="last-piece" style={'--piece-color:' + (pieceColors[frame.piece] || '#96c7b5')}><span>{frame.piece}</span><small>{frame.lines > 0 && frame.spin ? 'SPIN SINGLE' : 'LOCK'}</small></div>{/if}
+          {#if bag}<div class="bag-inventory" aria-label={`${bag.bag}가방 사용 미노`}>
+            <small>{bag.partial ? '마지막 부분 가방' : '가방 완료'} · +{bag.spinGain}스핀</small>
+            <div>{#each bag.pieces as piece}<span style={'--piece-color:' + clearraPalette[piece]}>{piece}</span>{/each}</div>
+          </div>{/if}
         </div>
       </div>
 
       <div class="timeline">
-        <button class="icon-button" aria-label="이전 배치" disabled={frames.length < 2 || selectedIndex === 0} onclick={previousFrame}><Icon name="back" size={15} /></button>
-        <button class="icon-button playback-button" aria-label={playing ? '재생 일시정지' : '배치 재생'} disabled={frames.length < 2} onclick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={14} /></button>
-        <input type="range" aria-label="배치 순서" min="0" max={Math.max(0, frames.length - 1)} value={selectedIndex} disabled={frames.length < 2} oninput={(event) => { frameIndex = Number(event.currentTarget.value); playing = false; }} />
-        <button class="icon-button" aria-label="다음 배치" disabled={frames.length < 2 || selectedIndex === frames.length - 1} onclick={nextFrame}><Icon name="arrow" size={15} /></button>
-        <span class="frame-count">{frames.length ? selectedIndex + 1 : 0}<small> / {frames.length}</small></span>
+        <button class="icon-button" aria-label="이전 가방" disabled={bags.length < 2 || selectedIndex === 0} onclick={previousBag}><Icon name="back" size={15} /></button>
+        <button class="icon-button playback-button" aria-label={playing ? '재생 일시정지' : '가방 재생'} disabled={bags.length < 2} onclick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={14} /></button>
+        <input type="range" aria-label="가방 선택" min="0" max={Math.max(0, bags.length - 1)} value={selectedIndex} disabled={bags.length < 2} oninput={(event) => { bagIndex = Number(event.currentTarget.value); playing = false; }} />
+        <button class="icon-button" aria-label="다음 가방" disabled={bags.length < 2 || selectedIndex === bags.length - 1} onclick={nextBag}><Icon name="arrow" size={15} /></button>
+        <span class="frame-count">{bag?.bag ?? (candidate ? candidate.bagCount : 0)}<small> / {candidate?.bagCount ?? bags.length} 가방</small></span>
       </div>
     </section>
 
@@ -290,7 +408,11 @@
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 효율 경로'}</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
+        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 효율 경로'}</h3><div class="result-actions">
+          <select bind:value={exportFormat} disabled={exportBusy} aria-label="내보내기 형식"><option value="ctk3">CTK3</option><option value="fumen">Fumen</option></select>
+          <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('download')} aria-label="선택한 후보 저장" title="문서 다운로드"><Icon name="download" size={15} /></button>
+          <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('copy')} aria-label="선택한 후보 복사" title="클립보드 복사"><Icon name="copy" size={15} /></button>
+        </div></div>
         {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
             {#if bestRoute.complete}
@@ -307,7 +429,7 @@
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
         {/if}
-        <p class="verification-note">{verificationLabel(candidate)}</p>
+        <p class="verification-note">{bagWarning || verificationLabel(candidate)}</p>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
     </aside>
@@ -324,11 +446,12 @@
       <label><span>개선 목표 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>목표보다 긴 결과도 보관해요.</small></label>
       <label class="full-row"><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
-    <details class="advanced-options"><summary>추가 설정 <span>동시 탐색 · 시드 · 범위</span></summary><div class="settings-grid">
-      <label class="full-row checkbox-setting" title="시작 가능한 첫 가방을 확인한 뒤, 2가방부터 성공률을 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">첫 가방이 구축된 뒤의 성공률을 기준으로 찾아요.</small></label>
+    <details class="advanced-options"><summary>추가 설정 <span>첫 가방 · 동시 탐색 · 범위</span></summary><div class="settings-grid">
+      <label class="full-row checkbox-setting" title="첫 가방은 별도 최소값으로 확인하고, 전체 성공률은 2가방부터 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">전체 성공률은 2가방부터 계산해요.</small></label>
+      <label><span>첫 가방 최소 성공률 <small>%</small></span><input type="number" min="0" max="100" step="0.01" required bind:value={draft.first_bag_min_success_percent} /><small>0%는 제한 없음</small></label>
       <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
-      <label class="full-row"><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
+      <label><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
       <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div></label>
     </div></details>
     {#if active || status === 'paused'}<p class="settings-note">변경한 설정은 다음 탐색부터 적용됩니다.</p>{/if}
@@ -340,7 +463,15 @@
 <dialog class="help-dialog" bind:this={about}>
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
-  <p>왼쪽은 가방 단위의 후보, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>는 첫 준비 가방을 제외한 스핀 효율로 비교합니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
+  <p>왼쪽은 각 가방을 마친 필드, 오른쪽은 작업 진척도입니다. <strong>최선 경로</strong>는 첫 가방을 포함한 스핀 효율로 비교합니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
   <p>설정한 미노 수는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
+</dialog>
+
+
+<dialog class="copy-dialog" bind:this={copyDialog}>
+  <div class="dialog-heading"><div><p class="eyebrow">BUILD DOCUMENT</p><h2>문서 복사</h2></div><button class="icon-button" onclick={() => copyDialog.close()} aria-label="복사 창 닫기"><Icon name="close" /></button></div>
+  <p class="copy-notice" role="status">{copyNotice}</p>
+  <textarea bind:this={copyText} readonly value={preparedDocument?.text ?? ''} rows="6" aria-label="복사할 빌드 문서" spellcheck="false"></textarea>
+  <div class="dialog-actions"><button class="button quiet" onclick={selectCopyText}>텍스트 선택</button>{#if clipboardAvailable}<button class="button primary" onclick={copyPrepared}><Icon name="copy" size={15} />복사</button>{/if}</div>
 </dialog>

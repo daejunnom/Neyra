@@ -53,6 +53,9 @@ jobs:
       - name: Test Rust
         run: cargo test --locked
 
+      - name: Check canonical SRS+ generated data
+        run: python3 scripts/generate-srs-plus.py --check
+
       - name: Check Svelte and TypeScript
         run: pnpm check
 

@@ -1,10 +1,12 @@
 # Neyra 탐색 재설계 v2
 
 작성일: 2026-10-31  
-상태: **구현 전 설계·코드 감사 결과**. 이 문서는 성능 개선이나 새 완주 빌드가 이미 구현·검증되었다는 보고가 아니다.
+상태: **v2 구현 설계·코드 감사 결과**. 공식 SRS+ 연결과 24행 사망 경계는 반영했으며, 나머지 v2 탐색기와 GUI 전환은 구현 대상이다. 이 문서는 새 탐색기의 성능 개선이나 40스핀 완주를 이미 검증했다는 보고가 아니다.
 
 검토 대상 Neyra: 2baf90f97eb60994b35f570198c5e25d64ad0606  
-Clearra 기준: 5c98563332706a718330bc7ae8e403d2583afe9d
+Clearra 최초 비교 기준: 5c98563332706a718330bc7ae8e403d2583afe9d
+
+공식 SRS+ 정정: [6232031](https://github.com/daejunnom/Clearra/commit/6232031047ea93a139ec2bc86819fb42e5c4ceff)
 
 ## 1. 결정
 
@@ -110,17 +112,28 @@ Alpha–Beta에서 가져오는 것은 하한·상한에 의한 조기 중단, �
 
 ## 5. 정확한 물리 계약
 
-### 5.1 Clearra SRS+의 기준을 하나로 고정
+### 5.1 공식 tetrio.js를 기준으로 Clearra Rust 프로필을 고정
 
-기준은 Clearra 정방향 탐색이 사용하는 clearra-rules::SrsKicks::srs_plus_profile()이다.
+최상위 기준은 [공식 tetrio.js](https://tetr.io/js/tetrio.js)의 SRS+ 데이터와 ComputeKick의 원점 우선 처리다. 2026-10-31에 확보한 원문 SHA-256은 다음과 같다.
 
-- [정방향 reachability의 프로필 선택](https://github.com/daejunnom/Clearra/blob/5c98563332706a718330bc7ae8e403d2583afe9d/crates/clearra-forward-search/src/reachability.rs)
-- [Rust SRS+ 프로필](https://github.com/daejunnom/Clearra/blob/5c98563332706a718330bc7ae8e403d2583afe9d/crates/clearra-rules/src/kicks/srs_kicks.rs)
-- [Rust offset 데이터](https://github.com/daejunnom/Clearra/blob/5c98563332706a718330bc7ae8e403d2583afe9d/crates/clearra-rules/src/kicks/srs_offsets.rs)
+    9e57c958c43520deb5dd91f5e1773bf779bfb91e7d273dc8494a93a3a0866d2f
 
-이 기준은 90도 전이 56개와 O를 제외한 180도 전이 24개, 총 80개다. 현재 Neyra의 O 180도 허용은 제거 대상이다. Rust 기준 I 180도는 현재 Neyra와 같은 두 offset이므로, 이름을 맞춘다는 이유로 여섯 offset으로 바꾸면 안 된다.
+이전 문서의 “O 180도 제외, 총 80전이” 결론은 원문 대조 후 정정한다. 표준 7종은 90도 전이 56개와 180도 전이 28개, **총 84개 전이**다. O의 disallow_kick은 추가 offset을 금지하지만, 원위치 회전은 그보다 먼저 검사하므로 O 180도도 가능하다.
 
-Clearra의 C builtin SRS+에는 다른 I 180도 데이터가 존재한다. 따라서 C 경로도 사용한다면 이름만 넘기지 말고 위 Rust 기준의 명시적 verified descriptor를 전달한다. 이는 소스 버전별 차이를 숨기기 위한 독자 규칙 추가가 아니라 한 기준으로 통일하기 위한 조치다.
+원문은 실패 후 시도할 offset만 표에 보관한다. Neyra/Clearra의 명시적 sequence에는 최초 (0,0)을 붙이고, y축이 아래로 증가하는 원문의 dy를 위로 증가하는 엔진 좌표로 변환한다. I 180도는 원위치 포함 두 후보이며, 기존 Clearra Rust 값이 맞고 C builtin의 여섯 후보가 잘못되어 있었다. 따라서 C를 무조건 정답으로 삼아 Rust를 바꾸지 않는다.
+
+권위와 데이터 흐름은 다음으로 고정한다.
+
+    공식 tetrio.js
+    → 정적 추출한 84전이 fixture와 source hash
+    → 수정된 Clearra Rust canonical profile
+    → C verified descriptor 및 Neyra 생성 Rust 모듈
+
+[공식 규칙 fixture](../crates/neyra-core/tests/fixtures/tetrio_srs_plus_standard_tetromino_kicks.json)와 [Neyra 생성기](../scripts/generate-srs-plus.py)를 버전 관리한다. 전체 tetrio.js를 제품 저장소에 넣거나 실행하지 않는다. 추출기는 데이터 리터럴만 정적으로 읽으며, source hash와 정렬된 transition hash를 기록한다.
+
+Clearra에서는 O 180도를 Rust/C 모두에 추가하고, C I 180도를 두 후보로 정정한다. 기본 SRS+도 Rust canonical profile을 검증된 descriptor로 투영하여 C 실행기에 전달한다. 독립 C builtin 호출은 같은 fixture와 대조한다.
+
+Neyra의 기존 손복사 84전이는 공식 fixture와 수치·순서 모두 같았다. 해당 코드를 fixture에서 생성한 Rust 모듈로 교체하므로 데이터 원천이 통일되며 정상적인 회전 결과를 불필요하게 바꾸지 않는다.
 
 RulesFingerprint에는 upstream commit, descriptor hash, 미노 셀 좌표와 원점, 순서 있는 kick 배열, 허용 입력, spawn, 천장, 스핀·drop 정책을 포함한다. 이 값이 달라지면 물리·P7·전이표 캐시를 재사용하지 않는다.
 
@@ -483,6 +496,25 @@ null move로 미노를 건너뛰거나, 무클리어 수라는 이유만으로 �
 
 Stockfish의 공식 용어와 Lc0의 policy/value 기반 MCTS 설명은 탐색 제어를 비교하는 참고 자료다. 체스 엔진의 성능을 Neyra의 예상 속도로 옮겨 주장하지 않는다. 특히 “MCTS는 10가방 이상을 원천적으로 못 찾는다”는 일반 정리를 주장하지 않는다. 현재 구현의 표현·후보 생성·평가가 부적절하다는 진단이 근거 있는 결론이다.
 
+### 12.1 테트리스 봇 소스에서 추가로 반영하는 원리
+
+[Cold Clear·CC2·공개 fusion 감사](research/COLD_CLEAR_FUSION_AUDIT.md)를 추가했다. MochBot 제작자 공개 설명은 본체가 비공개이고 클라이언트 일부만 공개라고 밝히므로, fusion 코칭 엔진의 알고리즘을 MochBot 본체의 것으로 단정하지 않는다. 협업 저장소의 Pensilbot도 별도로 확인했으며 비공개 소스 사본은 이 공개 저장소에 포함하지 않는다.
+
+이번 검토로 주 제어기를 다시 바꾸지는 않는다. 가방 경계 branch-and-bound와 정확한 P7를 유지하고, 다음 내부 구조를 보강한다.
+
+- **정확한 상태 DAG:** 같은 가방 경계는 후속 후보 stream과 인증을 공유한다. 물리 상태와 경로별 비용·확률·witness label을 분리하며, 여러 결과의 최소 비용과 최대 확률을 섞어 가상의 후보를 만들지 않는다.
+- **재개 가능한 frontier:** 후보 생성 cursor, 물리 witness, P7 결과를 폭 확대·비용 contour 변경·pause/resume 사이에 유지한다. root부터 계산을 반복하지 않는다.
+- **진행 중 질의 합치기:** 같은 정확한 필드·미노·목표·규칙의 물리 질의는 한 작업만 예약한다. 여러 P7 간선은 그 결과를 함께 사용한다.
+- **점진적 후보 할당:** 이번 작업에서 상위 후보 일부를 확인하되 나머지는 Deferred로 남긴다. 낮은 순위나 점수 차이는 불가능 증명이 아니다.
+- **포켓 소비 후 평가:** 스핀을 실제로 얻은 보상과 미래 구조의 추정 가치를 분리한다. TSD/TST 가상 처리나 공격량 평가를 가져오지 않고, 모든 관련 미노의 Spin Single과 후속 구조로 다시 정의한다.
+- **충돌 anchor mask:** 반복되는 exact board·piece·orientation 충돌 질의를 bitset으로 공유한다. 물리 충돌과 24행 사망 판정은 별도 조건으로 유지한다.
+- **마감 의무에 따른 extension:** 현재 포켓의 소비와 공통 경계 확인을 위해서만 제한적으로 더 본다. 과거에 스핀했다는 사실만으로 계속 확장하지 않는다.
+- **완료 결과의 원자적 반영:** activePreview는 작업 중에도 갱신하지만 인증 incumbent은 완결된 결과로만 바꾼다. runId/config fingerprint가 다른 늦은 worker 결과는 폐기한다.
+
+스케줄러는 GenerateGoals, RefineP7, DescendBoundary의 작은 작업을 번갈아 진행한다. 생성 시도 수, 새 고유 상태 수, 중복 작업량, 물리 질의 수, P7 정밀화 비용을 따로 계측한다. 캐시 hit가 높다는 이유로 반복 생성 비용을 숨기지 않는다.
+
+Live bot의 미지 next 기대값·생존 fallback·평균 평가를 구축률로 사용하지 않는다. 단일 ply와 가방 하나의 탐색 깊이도 구분한다. 이러한 원리를 가져왔다는 사실만으로 10가방 이상 완주 성능을 검증한 것은 아니다.
+
 ## 13. Rust 모듈과 데이터 흐름
 
 | 모듈 | 책임 |
@@ -553,8 +585,8 @@ Stockfish의 공식 용어와 Lc0의 policy/value 기반 MCTS 설명은 탐색 �
 
 ### 단계 A: 규칙과 재생 기준
 
-- canonical 80개 회전 전이와 순서 있는 offset 대조.
-- O 180도 불허.
+- 공식 fixture의 84개 회전 전이와 순서 있는 offset 대조.
+- O 180도 원위치 허용, 추가 O kick 불허.
 - 셀 기준 천장·first-success 사망·가짜 ceiling spin 방지.
 - 회전별 padding 원점 사례.
 - strict24 기준 reference forward와 reverse target 동치 검사.
@@ -622,6 +654,9 @@ Stockfish의 공식 용어와 Lc0의 policy/value 기반 MCTS 설명은 탐색 �
 
 ### 현재 구현 및 Clearra
 
+- [공식 SRS+ 대조와 재현 설명](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/tests/fixtures/rules/tetrio-srs-plus.md)
+- [정정한 canonical Rust 프로필](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/crates/clearra-rules/src/kicks/srs_kicks.rs)
+- [Rust→C 기본 descriptor 연결](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/crates/clearra-core-ffi/src/rules/rule_descriptor_compiler.rs)
 - [Neyra 검토 기준](https://github.com/daejunnom/Neyra/tree/2baf90f97eb60994b35f570198c5e25d64ad0606)
 - [Neyra physics.rs](https://github.com/daejunnom/Neyra/blob/2baf90f97eb60994b35f570198c5e25d64ad0606/crates/neyra-core/src/physics.rs)
 - [Neyra supply.rs](https://github.com/daejunnom/Neyra/blob/2baf90f97eb60994b35f570198c5e25d64ad0606/crates/neyra-core/src/supply.rs)

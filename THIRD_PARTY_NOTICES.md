@@ -8,7 +8,7 @@ Neyra adapts the following Clearra source:
 
 | Clearra source | Neyra use |
 | --- | --- |
-| `core-c/src/rules/srs_kicks.c` | Ordered JLSTZ 90°/180° and I 90° kick tables in `crates/neyra-core/src/physics.rs` |
+| `core-c/src/rules/srs_kicks.c` | Historical reference for the original handwritten tables; replaced by the reviewed official-source fixture and generated Rust module described below |
 | `packages/clearra-ui/src/lib/workspace/SolutionBoardPreview.svelte` | Board grid and cell semantics in `apps/neyra-web/src/lib/BoardPreview.svelte`; tetromino colors in `src/routes/+page.svelte` |
 | `packages/clearra-ui/src/lib/workspace/WorkspaceProgressStatus.svelte` | Progress status and track presentation in `apps/neyra-web/src/lib/ProgressStrip.svelte` |
 | `packages/clearra-ui/src/lib/workspace/WorkspaceShell.svelte` | Workspace structure in `apps/neyra-web/src/routes/+page.svelte` and `styles.css` |
@@ -45,7 +45,7 @@ SOFTWARE.
 
 Source bundle: [daejunnom/Spilink — `src/lib/vendor/engine.js`](https://github.com/daejunnom/Spilink/blob/3f209d1fd7e2961ca4fde5cdb58d5ea6ee11413f/src/lib/vendor/engine.js), revision `3f209d1fd7e2961ca4fde5cdb58d5ea6ee11413f`.
 
-The bundle identifies Triangle.js revision `7837ee5bde8de2719472e0de3458abe6708593f5`. Neyra's `crates/neyra-core/src/physics.rs` adapts or references its SRS piece matrices, I 180° offsets, spawn placement, and All-mini+ spin behavior. Embedded source paths include `.cache/triangle/src/engine/utils/kicks/data.ts`, `.cache/triangle/src/engine/utils/kicks/index.ts`, and `.cache/triangle/src/engine/utils/tetromino/data.ts`.
+The bundle identifies Triangle.js revision `7837ee5bde8de2719472e0de3458abe6708593f5`. Neyra's `crates/neyra-core/src/physics.rs` adapts or references its SRS piece matrices, spawn placement, and All-mini+ spin behavior. Its I 180° offsets were also an original reference, before all kick data moved to the official-source fixture described below. Embedded source paths include `.cache/triangle/src/engine/utils/kicks/data.ts`, `.cache/triangle/src/engine/utils/kicks/index.ts`, and `.cache/triangle/src/engine/utils/tetromino/data.ts`.
 
 Original bundle notice, reproduced without modification:
 
@@ -61,3 +61,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 */
 ```
+
+## Official TETR.IO SRS+ data
+
+Authority: [TETR.IO client bundle](https://tetr.io/js/tetrio.js), retrieved on 2026-10-31, source SHA-256 `9e57c958c43520deb5dd91f5e1773bf779bfb91e7d273dc8494a93a3a0866d2f`.
+
+The reviewed [Clearra fixture](https://github.com/daejunnom/Clearra/blob/6232031047ea93a139ec2bc86819fb42e5c4ceff/tests/fixtures/rules/tetrio_srs_plus_standard_tetromino_kicks.json), revision `6232031047ea93a139ec2bc86819fb42e5c4ceff`, is shared as Neyra's `crates/neyra-core/tests/fixtures/tetrio_srs_plus_standard_tetromino_kicks.json`. `scripts/generate-srs-plus.py` generates `crates/neyra-core/src/srs_plus.rs` from its ordered numeric transitions; it neither downloads nor executes the client. The fixture also supplies independent geometry for rotation regression tests.
+
+The complete TETR.IO bundle is not distributed here, and this project's MIT license does not claim to relicense that bundle. The data records 84 standard transitions, the implicit origin attempt, y-axis conversion, source spans and hashes. Clearra's corrected Rust profile is the canonical implementation reference; the old C I 180° table is not a current authority.

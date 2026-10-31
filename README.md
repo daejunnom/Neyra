@@ -10,7 +10,7 @@ Rust/Wasm 탐색기와 Svelte 화면으로 구성됩니다. 빈 필드에서 40�
 
 ## MVP 범위
 
-- **10×24 필드**, 중력 대기와 한 칸 낙하 없이 이동·회전·Sonic Drop으로 도달하는 배치.
+- **10×24 필드**, 중력 대기와 한 칸 낙하 없이 이동·회전·Sonic Drop으로 도달하는 배치. 실제 미노 셀이 상단을 넘으면 그 경로를 종료하며, 상단을 스핀 판정을 위한 벽으로 사용하지 않습니다.
 - 가방별 고정 배치를 새로 만드는 **single-tiling 탐색**. UCT 선택과 제한된 배치 탐색으로 후보를 제안하며, 기존 빌드나 반복 구조를 시작점으로 사용하지 않습니다.
 - 제안한 배치의 가능한 실행 순서와 홀드를 검사하는 **정확한 P7 검증**. 가방의 5,040개 순열을 확인하고, 검증 결과를 JSON에 보존합니다.
 - 마지막 가방의 일부 미노만 쓰는 완주를 허용하며, 사용 미노 수에 따른 성공률을 평가합니다.
@@ -19,6 +19,14 @@ Rust/Wasm 탐색기와 Svelte 화면으로 구성됩니다. 빈 필드에서 40�
 최소 성공률, 목표 미노 수, 탐색 상한과 시작 예산을 조정할 수 있습니다. **112개는 개선 목표이며 합격 조건이 아닙니다.** 목표보다 긴 완주도 성공률 기준을 만족하면 보관합니다.
 
 MVP의 후보 생성은 시간과 메모리를 제한하는 휴리스틱입니다. 완주 발견이나 전역 최적성을 보장하지 않으며, 탐색하지 못한 상태를 불가능으로 판정하지 않습니다. 같은 모양의 다른 타일링을 합치는 교차 배치, 미러 결합, 재시작 비용 가중치는 아직 포함하지 않습니다. P7 검증의 정확성은 구현한 24행 물리·홀드 모델과 해당 고정 배치에 대한 것입니다.
+
+## 회전 규칙과 다음 탐색기
+
+SRS+의 기준은 [공식 tetrio.js](https://tetr.io/js/tetrio.js)입니다. Clearra에서 원문과 대조한 fixture를 공유하고, `scripts/generate-srs-plus.py`가 Rust 테이블을 생성합니다. 원위치 회전을 포함하는 표준 7종의 **84개 전이**를 사용하며, I 180도는 두 후보, O 180도는 원위치 하나입니다. 원문의 SHA-256과 전이 순서를 fixture에 보존합니다.
+
+회전은 첫 번째 물리적 성공 후보를 선택합니다. 그 후보가 24행 사망 경계를 넘으면 경로를 종료하며, 뒤쪽 킥으로 대체하지 않습니다. 행렬의 빈 패딩은 실제 미노 셀로 계산하지 않습니다.
+
+[v2 탐색 재설계](docs/SEARCH_REDESIGN_V2.md)는 구조 제약에 따른 후보 생성, 가방 경계 branch-and-bound, 공유 P7 검증을 정의합니다. [Cold Clear·CC2·공개 fusion 소스 검토](docs/research/COLD_CLEAR_FUSION_AUDIT.md)에서 상태 DAG, 충돌 질의 공유, 중단·재개 원리를 추가했습니다. **현재 배포 엔진의 후보 선택은 여전히 v1 UCT이며, v2 전체 구현과 40스핀 완주 성능은 아직 검증하지 않았습니다.**
 
 ## 개발
 
@@ -30,6 +38,7 @@ rustup toolchain install 1.90.0 --profile minimal --target wasm32-unknown-unknow
 cargo install wasm-bindgen-cli --version 0.2.104 --locked
 pnpm install --frozen-lockfile
 cargo test --locked
+python3 scripts/generate-srs-plus.py --check
 pnpm check
 pnpm build:wasm
 pnpm dev

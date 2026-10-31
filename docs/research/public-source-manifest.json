@@ -1,0 +1,119 @@
+{
+  "audited_at": "2026-10-31",
+  "method": "GitHub connector fetch at pinned commit; source reading, no upstream execution or performance claim",
+  "public_sources_only": true,
+  "files": [
+    {
+      "repo": "MinusKelvin/cold-clear",
+      "commit": "279edd7c3177ff8077f6a930193397814b281f27",
+      "path": "bot/src/dag.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/bot/src/dag.rs",
+      "retrieved_characters": 36627
+    },
+    {
+      "repo": "MinusKelvin/cold-clear",
+      "commit": "279edd7c3177ff8077f6a930193397814b281f27",
+      "path": "bot/src/modes/normal.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/bot/src/modes/normal.rs",
+      "retrieved_characters": 10026
+    },
+    {
+      "repo": "MinusKelvin/cold-clear",
+      "commit": "279edd7c3177ff8077f6a930193397814b281f27",
+      "path": "bot/src/evaluation/standard.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/bot/src/evaluation/standard.rs",
+      "retrieved_characters": 22190
+    },
+    {
+      "repo": "MinusKelvin/cold-clear",
+      "commit": "279edd7c3177ff8077f6a930193397814b281f27",
+      "path": "libtetris/src/moves.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/libtetris/src/moves.rs",
+      "retrieved_characters": 14135
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/dag.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/dag.rs",
+      "retrieved_characters": 9316
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/dag/known.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/dag/known.rs",
+      "retrieved_characters": 6056
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/dag/speculated.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/dag/speculated.rs",
+      "retrieved_characters": 8269
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/bot/freestyle.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/bot/freestyle.rs",
+      "retrieved_characters": 9954
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/map.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/map.rs",
+      "retrieved_characters": 2840
+    },
+    {
+      "repo": "MinusKelvin/cold-clear-2",
+      "commit": "ed8b19327b6bd1410ddd873d8611485bd45d8fae",
+      "path": "src/movegen.rs",
+      "url": "https://github.com/MinusKelvin/cold-clear-2/blob/ed8b19327b6bd1410ddd873d8611485bd45d8fae/src/movegen.rs",
+      "retrieved_characters": 10486
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "src/search.rs",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/search.rs",
+      "retrieved_characters": 77382
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "src/search_expand.rs",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/search_expand.rs",
+      "retrieved_characters": 82003
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "src/search_config.rs",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/search_config.rs",
+      "retrieved_characters": 7556
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "src/bag.rs",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/bag.rs",
+      "retrieved_characters": 8457
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "src/movegen.rs",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/movegen.rs",
+      "retrieved_characters": 70919
+    },
+    {
+      "repo": "MosaicTETR/fusion",
+      "commit": "1eb879f34a77b868ef3ef0025714e0094bf06eca",
+      "path": "Cargo.toml",
+      "url": "https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/Cargo.toml",
+      "retrieved_characters": 1621
+    }
+  ]
+}

@@ -1,25 +1,26 @@
 //! Bounded-board, no-wait TETR.IO-style movement for Neyra.
 //!
-//! The locked board is 10 × 24. The active piece may briefly occupy the empty
-//! sky above it; that search envelope is never treated as a solid ceiling.
+//! The board is 10 × 24. A move that puts any actual mino cell above row 23
+//! kills that route. This boundary is not collision material: it cannot create
+//! a spin, support a piece, or make the engine try a later ordered kick.
 //! `Pose` uses the top-left corner of the SRS matrix, with positive y upwards.
 //! Thus a matrix cell (dx, dy) occupies (pose.x + dx, pose.y - dy).
 //!
-//! Ordered JLSTZ 90/180 and I 90 kick data are adapted from Clearra's
-//! core-c/src/rules/srs_kicks.c at 5c98563332706a718330bc7ae8e403d2583afe9d
-//! (MIT, Copyright (c) 2026 Clearra contributors). I 180 uses the two-candidate
-//! SRS+ transitions in the pinned Spilink/Triangle engine, not Clearra's longer
-//! I 180 sequences. See THIRD_PARTY_NOTICES.md for source pins and licenses.
+//! Ordered kick attempts come from the generated `srs_plus` module and
+//! Clearra's reviewed official-source SRS+ fixture, including I and O half
+//! turns. See THIRD_PARTY_NOTICES.md for source pins and licenses.
 //! The movement graph deliberately has no one-row down or gravity-wait edge.
 
+use crate::srs_plus::kicks;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 pub const WIDTH: usize = 10;
 pub const HEIGHT: usize = 24;
 pub const FULL_ROW: u16 = (1 << WIDTH) - 1;
-const SKY_CELLS: i8 = 4;
-const MAX_POSE_Y: i8 = HEIGHT as i8 + SKY_CELLS + 2;
+// A south-facing I has two empty matrix rows above its cells. Its origin may
+// therefore be 25 while all four actual cells remain on the legal top row 23.
+const MAX_POSE_Y: i8 = HEIGHT as i8 + 1;
 const MIN_POSE_X: i8 = -3;
 const X_COUNT: usize = WIDTH + 3;
 const STATE_COUNT: usize = 4 * X_COUNT * (MAX_POSE_Y as usize + 1) * 2;
@@ -157,7 +158,8 @@ impl Board {
             .map_or(0, |y| y as u8 + 1)
     }
 
-    /// Walls/floor are occupied; the sky above the 24 locked rows is empty.
+    /// Only walls, floor and locked cells provide collision support. The
+    /// ceiling rejects routes separately; it never supplies spin corners.
     pub fn occupied(&self, x: i8, y: i8) -> bool {
         if x < 0 || x >= WIDTH as i8 || y < 0 {
             return true;
@@ -178,10 +180,7 @@ impl Board {
             && pose.x < WIDTH as i8
             && pose.y >= 0
             && pose.y <= MAX_POSE_Y
-            && pose
-                .cells()
-                .iter()
-                .all(|&(_, y)| y < HEIGHT as i8 + SKY_CELLS)
+            && pose.cells().iter().all(|&(_, y)| y < HEIGHT as i8)
     }
 
     pub fn legal(&self, pose: Pose) -> bool {
@@ -213,9 +212,8 @@ impl Board {
         Some(pose)
     }
 
-    /// First physically successful kick is authoritative. A candidate that
-    /// leaves our finite sky envelope is discarded, never replaced by a later
-    /// kick; otherwise the envelope could manufacture a different rotation.
+    /// First physically successful kick is authoritative. If any actual cell
+    /// crosses the ceiling, that route dies without trying a later kick.
     pub fn rotate(&self, pose: Pose, input: Input) -> Option<Pose> {
         let delta = rotation_delta(input)?;
         if !self.legal(pose) {
@@ -564,63 +562,6 @@ fn rotation_delta(input: Input) -> Option<i8> {
     }
 }
 
-// All kick coordinates below are x-right, y-up; origin is tested first.
-const ORIGIN: &[(i8, i8)] = &[(0, 0)];
-const J_A: &[(i8, i8)] = &[(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)];
-const J_B: &[(i8, i8)] = &[(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)];
-const J_C: &[(i8, i8)] = &[(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)];
-const J_D: &[(i8, i8)] = &[(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)];
-const J_02: &[(i8, i8)] = &[(0, 0), (0, 1), (1, 1), (-1, 1), (1, 0), (-1, 0)];
-const J_20: &[(i8, i8)] = &[(0, 0), (0, -1), (-1, -1), (1, -1), (-1, 0), (1, 0)];
-const J_13: &[(i8, i8)] = &[(0, 0), (1, 0), (1, 2), (1, 1), (0, 2), (0, 1)];
-const J_31: &[(i8, i8)] = &[(0, 0), (-1, 0), (-1, 2), (-1, 1), (0, 2), (0, 1)];
-const I_01: &[(i8, i8)] = &[(0, 0), (1, 0), (-2, 0), (-2, -1), (1, 2)];
-const I_10: &[(i8, i8)] = &[(0, 0), (-1, 0), (2, 0), (-1, -2), (2, 1)];
-const I_12: &[(i8, i8)] = &[(0, 0), (-1, 0), (2, 0), (-1, 2), (2, -1)];
-const I_21: &[(i8, i8)] = &[(0, 0), (-2, 0), (1, 0), (-2, 1), (1, -2)];
-const I_23: &[(i8, i8)] = &[(0, 0), (2, 0), (-1, 0), (2, 1), (-1, -2)];
-const I_32: &[(i8, i8)] = &[(0, 0), (1, 0), (-2, 0), (1, 2), (-2, -1)];
-const I_30: &[(i8, i8)] = &[(0, 0), (1, 0), (-2, 0), (1, -2), (-2, 1)];
-const I_03: &[(i8, i8)] = &[(0, 0), (-1, 0), (2, 0), (2, -1), (-1, 2)];
-const I_02: &[(i8, i8)] = &[(0, 0), (0, 1)];
-const I_13: &[(i8, i8)] = &[(0, 0), (1, 0)];
-const I_20: &[(i8, i8)] = &[(0, 0), (0, -1)];
-const I_31: &[(i8, i8)] = &[(0, 0), (-1, 0)];
-
-fn kicks(piece: Piece, from: u8, to: u8) -> &'static [(i8, i8)] {
-    if piece == Piece::O {
-        return ORIGIN;
-    }
-    if piece == Piece::I {
-        return match (from, to) {
-            (0, 1) => I_01,
-            (1, 0) => I_10,
-            (1, 2) => I_12,
-            (2, 1) => I_21,
-            (2, 3) => I_23,
-            (3, 2) => I_32,
-            (3, 0) => I_30,
-            (0, 3) => I_03,
-            (0, 2) => I_02,
-            (1, 3) => I_13,
-            (2, 0) => I_20,
-            (3, 1) => I_31,
-            _ => &[],
-        };
-    }
-    match (from, to) {
-        (0, 1) | (2, 1) => J_A,
-        (1, 0) | (1, 2) => J_B,
-        (2, 3) | (0, 3) => J_C,
-        (3, 2) | (3, 0) => J_D,
-        (0, 2) => J_02,
-        (2, 0) => J_20,
-        (1, 3) => J_13,
-        (3, 1) => J_31,
-        _ => &[],
-    }
-}
-
 const fn three_by_three(base: [(i8, i8); 4]) -> [[(i8, i8); 4]; 4] {
     let mut result = [base; 4];
     let mut r = 1;
@@ -717,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_four_rows_do_not_make_a_solid_ceiling() {
+    fn ceiling_rejects_routes_without_supplying_spin_support() {
         let mut board = Board::default();
         let pose = Pose {
             piece: Piece::O,
@@ -729,15 +670,89 @@ mod tests {
         board.rows[22] = (1 << 3) | (1 << 6);
         assert!(board.lockable(pose));
         assert!(board.legal_physical(pose.shifted(0, 1)));
+        assert!(!board.legal(pose.shifted(0, 1)));
+        assert!(board.sonic_pose(pose.shifted(0, 1)).is_none());
         assert!(
             !board.spin_at(pose),
-            "the empty sky must not award an O spin"
+            "a fatal upward move must not award an immobility spin"
         );
         assert!(
             !board.lockable(pose.shifted(0, 1)),
             "row 24 cannot be locked"
         );
         assert!(!board.occupied(4, 24));
+
+        // A south-facing T has two real lower corners and two empty corners
+        // above the ceiling. Counting the boundary as occupied would invent
+        // a three-corner spin, and treating a fatal up-shift as blocked would
+        // independently invent an immobility spin.
+        let mut board = Board::default();
+        board.rows[22] = (1 << 3) | (1 << 5);
+        let pose = Pose {
+            piece: Piece::T,
+            x: 3,
+            y: 24,
+            rotation: 2,
+        };
+        assert!(board.lockable(pose));
+        assert!(board.legal_physical(pose.shifted(0, 1)));
+        assert!(!board.legal(pose.shifted(0, 1)));
+        assert!(!board.spin_at(pose));
+    }
+
+    #[test]
+    fn padded_i_origins_above_the_ceiling_are_legal_when_the_cells_are_not() {
+        let board = Board::default();
+        for (rotation, y) in [(0, 24), (2, 25)] {
+            let pose = Pose {
+                piece: Piece::I,
+                x: 3,
+                y,
+                rotation,
+            };
+            assert!(pose.cells().iter().all(|&(_, cell_y)| cell_y == 23));
+            assert!(board.legal(pose));
+            assert!(board.legal_physical(pose.shifted(0, 1)));
+            assert!(!board.legal(pose.shifted(0, 1)));
+            assert!(board.sonic_pose(pose.shifted(0, 1)).is_none());
+        }
+    }
+
+    #[test]
+    fn a_first_successful_kick_above_the_ceiling_kills_the_route() {
+        let board = Board::default();
+        let pose = Pose {
+            piece: Piece::I,
+            x: 3,
+            y: 24,
+            rotation: 0,
+        };
+        assert!(board.legal(pose));
+        let origin_attempt = Pose {
+            rotation: 1,
+            ..pose
+        };
+        assert!(board.legal_physical(origin_attempt));
+        assert!(!board.legal(origin_attempt));
+        // The fourth 0->R attempt would fit, but the first physical success
+        // already crossed the boundary. Admission failure is not a kick miss.
+        let later_attempt = Pose {
+            x: 1,
+            y: 23,
+            rotation: 1,
+            ..pose
+        };
+        assert!(board.legal(later_attempt));
+        assert_eq!(board.rotate(pose, Input::Cw), None);
+        let mut inverse = Vec::new();
+        board.predecessors(
+            State {
+                pose: later_attempt,
+                spin: false,
+            },
+            |state, input| inverse.push((state, input)),
+        );
+        assert!(!inverse.contains(&(State { pose, spin: false }, Input::Cw)));
     }
 
     #[test]
@@ -902,11 +917,17 @@ mod tests {
     fn reverse_matches_forward_and_replays_in_caves() {
         // Ragged stacks and overhangs exercise floor kicks, spin histories,
         // sonic components, and physically legal but unreachable cavity poses.
+        // The last field also exercises legal and fatal routes near the ceiling.
+        let mut high_sides = Board::default();
+        high_sides.rows[..20].fill(0b1110000111);
+        high_sides.rows[20..22].fill(0b1100000011);
+        high_sides.rows[22..24].fill(0b1000000001);
         let boards = [
             Board::default(),
             board(&[0b1110011111, 0b1100011111, 0b1000011111]),
             board(&[0b1111101111, 0b1110001111, 0b1100011111, 0b0000000111]),
             board(&[0b1100000011, 0b1000000001, 0b1010000101, 0b0000000100]),
+            high_sides,
         ];
         for board in boards {
             for piece in Piece::ALL {
@@ -917,7 +938,7 @@ mod tests {
                     .collect();
                 for rotation in 0..4 {
                     for x in -2..10 {
-                        for y in 0..=7 {
+                        for y in 0..=MAX_POSE_Y {
                             let pose = Pose {
                                 piece,
                                 x,

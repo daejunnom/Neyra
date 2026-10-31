@@ -4,6 +4,10 @@
 //! retained here, with a 24-row SonicDropOnly physics backend.
 
 use crate::physics::{Board, Input, Piece, Placement, Pose, HEIGHT};
+use crate::structure::{
+    map_after_clear, mask_count, remaining_cells, single_goals, single_targets, BoardFacts,
+    CellMask, SingleGoal,
+};
 use crate::supply::{
     decode_order, minimum_finish, permutation, LanguageNode, ALL_PIECES, P7_COUNT,
 };
@@ -142,6 +146,11 @@ struct SeedState {
     targets: Vec<TargetOperation>,
     frames: Vec<DisplayFrame>,
     score: f64,
+    pursuit: Option<Rc<SingleGoal>>,
+    /// Newly buried cells created by quiet setup placements. Row deletion and
+    /// actual filling pay this debt; merely opening a roof does not.
+    debt: CellMask,
+    future: Continuation,
 }
 
 #[derive(Clone, Serialize)]
@@ -156,6 +165,11 @@ struct Plan {
     targets: Vec<TargetOperation>,
     seed_frames: Vec<DisplayFrame>,
     terminal: bool,
+    /// A bounded, exact geometric continuation, not a supply certificate.
+    #[serde(skip)]
+    future: Continuation,
+    #[serde(skip)]
+    debt: CellMask,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -570,6 +584,260 @@ impl VerificationJob {
     }
 }
 
+#[derive(Clone, Default)]
+struct Continuation {
+    placements: Vec<Placement>,
+    score: f64,
+    paid: u16,
+}
+
+#[derive(Clone)]
+struct ProbeState {
+    board: Board,
+    inventory: u8,
+    debt: CellMask,
+    quiet: u8,
+    spins: u8,
+    placements: Vec<Placement>,
+    pursuit: Option<Rc<SingleGoal>>,
+}
+
+enum ProbeTask {
+    Expand(ProbeState),
+    Finish(ProbeState, Pose),
+    Support(ProbeState, Rc<SingleGoal>, Piece),
+}
+
+/// A small geometric continuation search. It consumes each available piece at
+/// most once and never crosses a bag. A miss or exhausted budget is Unknown;
+/// it never changes the exact P7 failure language or the cost lower bound.
+struct ContinuationProbe {
+    tasks: Vec<ProbeTask>,
+    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>)>,
+    work: u16,
+    debt_count: u16,
+    base_score: f64,
+    best: Continuation,
+}
+
+impl ContinuationProbe {
+    fn new(board: Board, debt: CellMask) -> Self {
+        Self {
+            tasks: vec![ProbeTask::Expand(ProbeState {
+                board,
+                inventory: ALL_PIECES,
+                debt,
+                quiet: 0,
+                spins: 0,
+                placements: vec![],
+                pursuit: None,
+            })],
+            seen: vec![],
+            work: 0,
+            debt_count: mask_count(&debt),
+            base_score: BoardFacts::new(&board).score(),
+            best: Continuation::default(),
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.work >= 64 || self.tasks.is_empty()
+    }
+
+    fn step(&mut self, cache: &mut PhysicsCache) {
+        if self.finished() {
+            return;
+        }
+        self.work += 1;
+        let Some(task) = self.tasks.pop() else { return };
+        match task {
+            ProbeTask::Expand(state) => {
+                if state.placements.len() >= 4 || state.inventory == 0 {
+                    return;
+                }
+                // A one- or two-piece preparation may create the corner,
+                // floor, or row cells needed by a final rotation. Looking only
+                // for currently grounded spin slots would miss these plans.
+                if state.quiet < 2 && state.placements.len() < 3 {
+                    let goals = if let Some(goal) = &state.pursuit {
+                        vec![Rc::clone(goal)]
+                    } else {
+                        single_goals(&state.board, state.inventory, 12)
+                            .into_iter()
+                            .map(Rc::new)
+                            .collect()
+                    };
+                    for goal in goals.into_iter().rev() {
+                        if goal.ready(&state.board) || goal.remaining(&state.board) > 8 {
+                            continue;
+                        }
+                        for piece in Piece::ALL.into_iter().rev() {
+                            if state.inventory & piece.bit() != 0 && piece != goal.pose.piece {
+                                self.tasks.push(ProbeTask::Support(
+                                    state.clone(),
+                                    Rc::clone(&goal),
+                                    piece,
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Ready goals are generated from the exact missing-row
+                // footprint; only these targets pay for reverse reachability.
+                for pose in single_targets(&state.board, state.inventory)
+                    .into_iter()
+                    .rev()
+                {
+                    self.tasks.push(ProbeTask::Finish(state.clone(), pose));
+                }
+            }
+            ProbeTask::Finish(state, pose) => {
+                let Some(placement) = cache.target(state.board, pose, true) else {
+                    return;
+                };
+                let Some(result) = state.board.apply(&placement) else {
+                    return;
+                };
+                if result.lines != 1 || !result.spin {
+                    return;
+                }
+                self.accept(
+                    state,
+                    placement,
+                    result.board,
+                    result.cleared_rows,
+                    true,
+                    None,
+                );
+            }
+            ProbeTask::Support(state, goal, piece) => {
+                let locks = cache.locks(state.board, piece);
+                let mut best = Vec::<(f64, Placement, Board)>::new();
+                for placement in locks.iter() {
+                    if !goal.accepts_support(&state.board, placement.pose) {
+                        continue;
+                    }
+                    let Some(result) = state.board.apply(placement) else {
+                        continue;
+                    };
+                    if result.lines != 0 {
+                        continue;
+                    }
+                    let score = BoardFacts::new(&result.board).score()
+                        - goal.remaining(&result.board) as f64 * 8.0;
+                    if best.iter().any(|(_, _, board)| *board == result.board) {
+                        continue;
+                    }
+                    let at = best.iter().position(|b| b.0 < score).unwrap_or(best.len());
+                    best.insert(at, (score, placement.clone(), result.board));
+                    best.truncate(2);
+                }
+                for (_, placement, board) in best.into_iter().rev() {
+                    self.accept(
+                        state.clone(),
+                        placement,
+                        board,
+                        0,
+                        false,
+                        Some(Rc::clone(&goal)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn accept(
+        &mut self,
+        mut state: ProbeState,
+        placement: Placement,
+        board: Board,
+        cleared_rows: u32,
+        spin: bool,
+        pursuit: Option<Rc<SingleGoal>>,
+    ) {
+        state.inventory &= !placement.pose.piece.bit();
+        state.board = board;
+        state.debt = remaining_cells(&map_after_clear(&state.debt, cleared_rows), &board);
+        state.spins += u8::from(spin);
+        state.quiet += u8::from(!spin);
+        state.placements.push(placement);
+        state.pursuit = pursuit;
+        if state.spins != 0 {
+            let facts = BoardFacts::new(&board);
+            let paid = self.debt_count.saturating_sub(mask_count(&state.debt));
+            let opened = (0..HEIGHT)
+                .map(|y| (state.debt[y] & !facts.holes[y]).count_ones() as u16)
+                .sum::<u16>();
+            // Use one coherent route. Do not sum incompatible pockets or
+            // spend the same finisher several times for hypothetical rewards.
+            let score = state.spins as f64 * 24.0 - state.quiet as f64 * 6.0
+                + paid as f64 * 5.0
+                + opened as f64 * 0.75
+                + (facts.score() - self.base_score) * 0.25;
+            if self.best.placements.is_empty() || score > self.best.score {
+                self.best = Continuation {
+                    placements: state.placements.clone(),
+                    score,
+                    paid,
+                };
+            }
+        }
+        let key = (
+            state.board,
+            state.inventory,
+            state.debt,
+            state.pursuit.clone(),
+        );
+        if !self.seen.contains(&key) {
+            self.seen.push(key);
+            self.tasks.push(ProbeTask::Expand(state));
+        }
+    }
+}
+
+struct RefinementJob {
+    pending: Vec<SeedState>,
+    current: Option<(SeedState, ContinuationProbe)>,
+    complete: Vec<SeedState>,
+}
+
+impl RefinementJob {
+    fn new(mut pending: Vec<SeedState>) -> Self {
+        pending.reverse();
+        Self {
+            pending,
+            current: None,
+            complete: vec![],
+        }
+    }
+
+    fn step(&mut self, goal: u8, cache: &mut PhysicsCache) {
+        if let Some((mut seed, mut probe)) = self.current.take() {
+            probe.step(cache);
+            if probe.finished() {
+                seed.future = probe.best;
+                let unexplained = mask_count(&seed.debt).saturating_sub(seed.future.paid);
+                seed.score += seed.future.score - unexplained as f64 * 12.0;
+                insert_seed(&mut self.complete, seed, 8);
+            } else {
+                self.current = Some((seed, probe));
+            }
+        } else if let Some(seed) = self.pending.pop() {
+            if seed.spins >= goal {
+                // The final partial bag needs no useful future field.
+                insert_seed(&mut self.complete, seed, 8);
+            } else {
+                let probe = ContinuationProbe::new(seed.board, seed.debt);
+                self.current = Some((seed, probe));
+            }
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.pending.is_empty() && self.current.is_none()
+    }
+}
+
 struct GenerationJob {
     parent: usize,
     start: Board,
@@ -583,37 +851,119 @@ struct GenerationJob {
     width: usize,
     depth: u8,
     setup: bool,
+    variant: u64,
+    refinement: Option<RefinementJob>,
 }
 
 impl GenerationJob {
-    fn new(parent: usize, node: &TreeNode, width: usize, setup: bool) -> Self {
+    fn new(
+        parent: usize,
+        node: &TreeNode,
+        width: usize,
+        setup: bool,
+        variant: u64,
+        goal: u8,
+    ) -> Self {
+        let mut seed = SeedState {
+            board: node.board,
+            spins: node.spins,
+            used: 0,
+            deleted: 0,
+            targets: vec![],
+            frames: vec![],
+            score: 0.0,
+            pursuit: None,
+            debt: node.debt,
+            future: Continuation::default(),
+        };
+        // The earlier bounded probe found these placements from this exact
+        // boundary. Use that coherent route as a geometric proposal prefix;
+        // the final bag still goes through all 5040 normalized hold queues.
+        // Other rounds explore independently instead of fixing this prefix.
+        if !setup && variant % 3 != 2 {
+            for placement in &node.future.placements {
+                if seed.spins >= goal || seed.used & placement.pose.piece.bit() != 0 {
+                    break;
+                }
+                let Some(result) = seed.board.apply(placement) else {
+                    break;
+                };
+                if result.lines > 1 || (result.lines == 1 && !result.spin) {
+                    break;
+                }
+                let Some(target) = normalize_target(placement.pose, seed.deleted) else {
+                    break;
+                };
+                let Some(deleted) = deleted_after(seed.deleted, result.cleared_rows) else {
+                    break;
+                };
+                seed.debt = next_debt(&seed, &result.board, result.cleared_rows);
+                seed.board = result.board;
+                seed.used |= placement.pose.piece.bit();
+                seed.deleted = deleted;
+                seed.spins += result.lines;
+                seed.targets.push(target);
+                seed.frames.push(DisplayFrame {
+                    rows: result.board.rows,
+                    piece: piece_name(placement.pose.piece),
+                    spins: seed.spins,
+                    placed: node.pieces + seed.targets.len() as u16,
+                    lines: result.lines,
+                    spin: result.spin,
+                });
+            }
+        }
+        seed.score = board_score(&seed.board) + (seed.spins - node.spins) as f64 * 100.0;
+        let depth = seed.targets.len() as u8;
+        let terminal = seed.spins >= goal;
         Self {
             parent,
             start: node.board,
             start_spins: node.spins,
             start_pieces: node.pieces,
-            frontier: vec![SeedState {
-                board: node.board,
-                spins: node.spins,
-                used: 0,
-                deleted: 0,
-                targets: vec![],
-                frames: vec![],
-                score: 0.0,
-            }],
+            frontier: if terminal { vec![] } else { vec![seed.clone()] },
             next: vec![],
-            complete: vec![],
+            complete: if terminal { vec![seed] } else { vec![] },
             state_index: 0,
             piece_index: 0,
             width: width.clamp(4, 32),
-            depth: 0,
+            depth,
             setup,
+            variant,
+            refinement: None,
         }
     }
 
     fn advance(&mut self, rng: &mut Random, goal: u8, cache: &mut PhysicsCache) -> u64 {
+        if let Some(refinement) = &mut self.refinement {
+            refinement.step(goal, cache);
+            return 0;
+        }
         if self.state_index >= self.frontier.len() {
             return 0;
+        }
+        let foundation_ready = !self.setup
+            || self.variant % 3 == 0
+            || (self.variant % 3 == 2
+                && self
+                    .frontier
+                    .get(self.state_index)
+                    .is_some_and(|state| state.targets.len() >= 3));
+        if self.piece_index == 0
+            && foundation_ready
+            && self.frontier[self.state_index].pursuit.is_none()
+        {
+            let state = &mut self.frontier[self.state_index];
+            let inventory = if self.setup {
+                ALL_PIECES
+            } else {
+                ALL_PIECES & !state.used
+            };
+            let goals = single_goals(&state.board, inventory, 12);
+            if !goals.is_empty() {
+                let choice = (self.variant as usize + self.state_index) % goals.len();
+                state.pursuit = goals.into_iter().nth(choice).map(Rc::new);
+            }
         }
         let state = &self.frontier[self.state_index];
         let piece = Piece::ALL[self.piece_index];
@@ -626,6 +976,7 @@ impl GenerationJob {
             return 0;
         }
         let locks = cache.locks(state.board, piece);
+        let before_holes = BoardFacts::new(&state.board).holes;
         let mut expanded = 0;
         for placement in locks.iter() {
             expanded += 1;
@@ -640,6 +991,20 @@ impl GenerationJob {
             // long before its supply flexibility can be measured.
             if self.setup && result.lines != 0 {
                 continue;
+            }
+            if result.lines == 0 {
+                if let Some(pursuit) = &state.pursuit {
+                    // Preserve a concrete finisher footprint while preparing
+                    // it. Unrelated side-stack placements remain available.
+                    if placement
+                        .pose
+                        .cells()
+                        .iter()
+                        .any(|&(x, y)| pursuit.required_empty[y as usize] & (1 << x) != 0)
+                    {
+                        continue;
+                    }
+                }
             }
             let Some(target) = normalize_target(placement.pose, state.deleted) else {
                 continue;
@@ -659,13 +1024,49 @@ impl GenerationJob {
                 lines: result.lines,
                 spin: result.spin,
             });
-            let score = if self.setup {
-                setup_score(&self.start, &result.board, &targets) + rng.unit() * 6.0
+            let pursuit = if result.lines == 0 {
+                state.pursuit.clone()
             } else {
-                board_score(&result.board)
-                    + (spins - self.start_spins) as f64 * 160.0
-                    + setup_score(&self.start, &result.board, &targets) * 0.35
-                    + rng.unit() * 3.5
+                None
+            };
+            let facts = BoardFacts::new(&result.board);
+            let debt = next_debt_with_holes(
+                state,
+                &result.board,
+                result.cleared_rows,
+                &before_holes,
+                &facts.holes,
+            );
+            let mut structural = facts.score() * 2.0;
+            if let Some(pursuit) = &pursuit {
+                structural += (facts.roughness - facts.side_roughness(pursuit.working_columns()))
+                    as f64
+                    * 0.32;
+                structural -= pursuit.remaining(&result.board) as f64 * 8.0;
+                structural -= facts.unplanned_holes(&pursuit.required_empty) as f64 * 4.0;
+                structural += if pursuit.ready(&result.board) {
+                    18.0
+                } else {
+                    0.0
+                };
+                // Spending the intended finisher quietly may still be needed
+                // to finish a fixed bag. Keep the footprint for a later bag,
+                // but do not value it as an available same-bag spin.
+                if !self.setup && (state.used | piece.bit()) & pursuit.pose.piece.bit() != 0 {
+                    structural -= 16.0;
+                }
+            }
+            let score = if self.setup {
+                // The first bag must first leave independent landing slots
+                // for all seven pieces. A strong flatness/slot reward here
+                // spends the floor too early and destroys P7 robustness.
+                // Continuation refinement compares the completed foundations.
+                setup_score(&self.start, &targets) + structural * 0.06 + rng.unit() * 6.0
+            } else {
+                structural
+                    + (spins - self.start_spins) as f64 * 100.0
+                    + setup_score(&self.start, &targets) * 0.25
+                    + rng.unit() * 2.0
             };
             let next = SeedState {
                 board: result.board,
@@ -675,6 +1076,9 @@ impl GenerationJob {
                 targets,
                 frames,
                 score,
+                pursuit,
+                debt,
+                future: Continuation::default(),
             };
             if spins >= goal || next.used == ALL_PIECES {
                 insert_seed(&mut self.complete, next, 8);
@@ -686,6 +1090,17 @@ impl GenerationJob {
     }
 
     fn next_layer(&mut self) -> bool {
+        if self
+            .refinement
+            .as_ref()
+            .is_some_and(RefinementJob::finished)
+        {
+            self.complete = self.refinement.take().unwrap().complete;
+            return true;
+        }
+        if self.refinement.is_some() {
+            return false;
+        }
         if self.state_index < self.frontier.len() {
             return false;
         }
@@ -693,15 +1108,57 @@ impl GenerationJob {
         self.state_index = 0;
         self.piece_index = 0;
         self.depth += 1;
-        self.frontier.is_empty() || self.depth >= 7
+        if self.frontier.is_empty() || self.depth >= 7 {
+            if self.complete.is_empty() {
+                true
+            } else {
+                self.refinement = Some(RefinementJob::new(std::mem::take(&mut self.complete)));
+                false
+            }
+        } else {
+            false
+        }
     }
 
     fn display_seed(&self) -> Option<&SeedState> {
+        if let Some(refinement) = &self.refinement {
+            return refinement
+                .complete
+                .first()
+                .or_else(|| refinement.current.as_ref().map(|(seed, _)| seed))
+                .or_else(|| refinement.pending.last());
+        }
         self.complete
             .first()
             .or_else(|| self.next.first())
             .or_else(|| self.frontier.first())
     }
+}
+
+fn next_debt(state: &SeedState, board: &Board, cleared_rows: u32) -> CellMask {
+    next_debt_with_holes(
+        state,
+        board,
+        cleared_rows,
+        &BoardFacts::new(&state.board).holes,
+        &BoardFacts::new(board).holes,
+    )
+}
+
+fn next_debt_with_holes(
+    state: &SeedState,
+    board: &Board,
+    cleared_rows: u32,
+    before: &CellMask,
+    after: &CellMask,
+) -> CellMask {
+    let mut debt = remaining_cells(&map_after_clear(&state.debt, cleared_rows), board);
+    if cleared_rows == 0 {
+        for y in 0..HEIGHT {
+            debt[y] |= after[y] & !before[y];
+        }
+    }
+    debt
 }
 
 fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
@@ -712,6 +1169,8 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
             && s.used == seed.used
             && s.deleted == seed.deleted
             && s.spins == seed.spins
+            && s.pursuit == seed.pursuit
+            && s.debt == seed.debt
     }) {
         if list[index].score >= seed.score {
             return;
@@ -741,51 +1200,14 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
 
 /// A proposal heuristic, deliberately not an impossibility test.
 fn board_score(board: &Board) -> f64 {
-    let mut heights = [0_u8; 10];
-    let mut holes = 0;
-    let mut near_rows = 0.0;
-    let mut overhangs: f64 = 0.0;
-    for (x, height) in heights.iter_mut().enumerate() {
-        for y in (0..HEIGHT).rev() {
-            if board.rows[y] & (1 << x) != 0 {
-                *height = (y + 1) as u8;
-                break;
-            }
-        }
-        for y in 0..*height as usize {
-            if board.rows[y] & (1 << x) == 0 {
-                holes += 1;
-                let sides = (x == 0 || board.rows[y] & (1 << (x - 1)) != 0) as u8
-                    + (x == 9 || board.rows[y] & (1 << (x + 1)) != 0) as u8;
-                if sides == 2 && y + 1 < HEIGHT && board.rows[y + 1] & (1 << x) != 0 {
-                    overhangs += 1.0;
-                }
-            }
-        }
-    }
-    for row in board.rows {
-        let filled = row.count_ones() as f64;
-        if filled >= 6.0 {
-            near_rows += (filled - 5.0).powi(2) * 1.8;
-        }
-    }
-    let aggregate = heights.iter().map(|h| *h as f64).sum::<f64>();
-    let roughness = heights
-        .windows(2)
-        .map(|v| (v[0] as f64 - v[1] as f64).abs())
-        .sum::<f64>();
-    near_rows + overhangs.min(6.0) * 2.5
-        - holes as f64 * 1.8
-        - aggregate * 0.28
-        - roughness * 0.14
-        - (board.height() as f64).powi(2) * 0.06
+    BoardFacts::new(board).score() * 2.0
 }
 
 /// An intentionally conservative *ordering score*, never an eligibility test.
 /// Direct-drop interference and missing base support expose fragile setup bags
 /// cheaply. Actual rotation, OR support and hold possibilities remain the exact
 /// execution verifier's responsibility.
-fn setup_score(base: &Board, board: &Board, targets: &[TargetOperation]) -> f64 {
+fn setup_score(base: &Board, targets: &[TargetOperation]) -> f64 {
     let unsupported = targets
         .iter()
         .filter(|target| {
@@ -827,8 +1249,7 @@ fn setup_score(base: &Board, board: &Board, targets: &[TargetOperation]) -> f64 
         .filter(|piece| !targets.iter().any(|target| target.piece == **piece))
         .map(|piece| if *piece == Piece::O { 2 } else { 1 })
         .sum();
-    board_score(board) * 0.12
-        - unsupported as f64 * 18.0
+    -(unsupported as f64) * 18.0
         - (foundation_used + remaining_foundation) as f64 * 5.0
         - constrained.saturating_sub(1) as f64 * 9.0
         - edges as f64 * 1.0
@@ -846,6 +1267,8 @@ struct TreeNode {
     frames: Vec<DisplayFrame>,
     visits: u64,
     reward: f64,
+    future: Continuation,
+    debt: CellMask,
 }
 
 #[derive(Clone)]
@@ -946,6 +1369,8 @@ impl SearchSession {
             frames: vec![],
             visits: 0,
             reward: 0.0,
+            future: Continuation::default(),
+            debt: [0; HEIGHT],
         };
         let lower_bound = cost_lower_bound(&Board::default(), 0, TARGET_SPINS);
         let active_budget = if config.budget_start == 0 {
@@ -1028,6 +1453,8 @@ impl SearchSession {
                             targets: state.targets,
                             seed_frames: state.frames,
                             terminal: state.spins >= self.goal,
+                            future: state.future,
+                            debt: state.debt,
                         };
                         if self.remember_plan(parent, &plan) {
                             self.candidates += 1;
@@ -1047,12 +1474,16 @@ impl SearchSession {
                 break;
             };
             self.tree[parent].visits += 1;
-            let setup = self.generation_rounds % 3 != 2;
+            // Reserve quiet foundation rounds only at the empty starting
+            // field. Later bags actively prepare and consume spin contracts.
+            let setup = parent == 0 && self.generation_rounds % 4 != 3;
             self.generation = Some(GenerationJob::new(
                 parent,
                 &self.tree[parent],
                 self.config.beam_width,
                 setup,
+                self.generation_rounds,
+                self.goal,
             ));
             self.generation_rounds += 1;
             // A heuristic miss at a budget is not an impossibility proof. Broaden
@@ -1219,6 +1650,8 @@ impl SearchSession {
                 targets: seed.targets.clone(),
                 seed_frames: seed.frames.clone(),
                 terminal: seed.spins >= self.goal,
+                future: seed.future.clone(),
+                debt: seed.debt,
             }),
         });
     }
@@ -1392,6 +1825,8 @@ impl SearchSession {
                     frames,
                     visits: 0,
                     reward: 0.0,
+                    future: job.plan.future.clone(),
+                    debt: job.plan.debt,
                 };
                 self.insert_boundary(job.parent, new_node);
             }
@@ -1400,7 +1835,8 @@ impl SearchSession {
             2.0
         } else if qualified {
             job.plan.expected_spins as f64 / self.goal as f64
-                + (board_score(&job.plan.expected) / 200.0).clamp(-0.2, 0.2)
+                + ((board_score(&job.plan.expected) + job.plan.future.score) / 200.0)
+                    .clamp(-0.2, 0.2)
                 + 0.2
         } else {
             0.0
@@ -1427,7 +1863,7 @@ impl SearchSession {
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    n.spins as f64 * 8.0 + board_score(&n.board) * 0.05
+                    n.spins as f64 * 8.0 + (board_score(&n.board) + n.future.score) * 0.05
                         - n.pieces as f64 * 0.1
                         - (n.visits as f64).sqrt() * 0.1
                 };
@@ -1616,6 +2052,8 @@ mod tests {
             targets: vec![normalize_target(placement.pose, 0).unwrap()],
             seed_frames: vec![],
             terminal: true,
+            future: Continuation::default(),
+            debt: [0; HEIGHT],
         };
         let mut job = VerificationJob::new(0, plan);
         let mut cache = PhysicsCache::default();
@@ -1672,6 +2110,8 @@ mod tests {
             targets: vec![normalize_target(placement.pose, 0).unwrap()],
             seed_frames: vec![],
             terminal: true,
+            future: Continuation::default(),
+            debt: [0; HEIGHT],
         };
         let mut graph = ExecutionGraph::new(&plan);
         graph.expand_one(&plan, 40, &mut PhysicsCache::default());

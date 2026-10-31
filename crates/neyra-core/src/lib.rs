@@ -1,6 +1,7 @@
 pub mod physics;
 pub mod search;
 mod srs_plus;
+mod structure;
 pub mod supply;
 
 use search::{SearchConfig, SearchSession};

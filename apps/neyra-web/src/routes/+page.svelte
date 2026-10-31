@@ -24,6 +24,7 @@
   let playing = false;
   let visibleCandidateId = '';
   let savedMessage = '';
+  let notice = '';
 
   // Clearra SolutionBoardPreview.svelte palette (MIT, pinned in THIRD_PARTY_NOTICES).
   const pieceColors: Record<string, string> = {
@@ -45,7 +46,7 @@
   $: statusLabel = ({
     idle: '탐색 준비',
     loading: '탐색기 준비 중',
-    running: verifying ? '가방 구축 가능성 확인 중' : '새로운 배치 탐색 중',
+    running: '새로운 빌드 탐색 중',
     paused: '일시정지',
     cancelled: '탐색 중지',
     completed: '이번 탐색 완료',
@@ -85,6 +86,8 @@
     } else if (event.type === 'error') {
       status = 'failed';
       error = event.message;
+    } else if (event.type === 'warning') {
+      notice = event.message;
     } else if (event.type === 'export') {
       download(event.data, 'neyra-result.json');
     }
@@ -116,6 +119,7 @@
     status = 'loading';
     error = '';
     savedMessage = '';
+    notice = '';
     elapsedMs = 0;
     snapshot = null;
     view = 'current';
@@ -126,7 +130,13 @@
     client.start(runConfig);
   }
   function pause() { client.pause(); }
-  function resume() { previousTick = performance.now(); client.resume(); }
+  function resume() {
+    view = 'current';
+    frameIndex = -1;
+    playing = false;
+    previousTick = performance.now();
+    client.resume();
+  }
   function stop() { playing = false; client.cancel(); }
   function validateConfig(value: SearchConfig) {
     if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '성공률은 0% 초과, 100% 이하로 입력해 주세요.';
@@ -135,6 +145,7 @@
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
     if (!Number.isSafeInteger(value.seed) || value.seed < 1 || value.seed > 4294967295) return '시드는 1–4,294,967,295 사이의 정수로 입력해 주세요.';
     if (![16, 32, 64, 128].includes(value.beam_width)) return '탐색 폭 설정을 다시 선택해 주세요.';
+    if (![0, 1, 2, 4].includes(value.worker_count)) return '동시 탐색 수를 다시 선택해 주세요.';
     return '';
   }
   function openSettings() { draft = { ...config }; settingsError = ''; settings.showModal(); }
@@ -156,7 +167,7 @@
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     savedMessage = '결과를 저장했어요.';
   }
-  function exportResult() { client.export(); }
+  function exportResult() { client.export(view); }
   function togglePlayback() {
     if (frames.length < 2) return;
     if (selectedIndex === frames.length - 1) frameIndex = 0;
@@ -186,7 +197,7 @@
 
   <section class="page-heading">
     <div><p class="eyebrow">NAGA EYES / BUILD SEARCH</p><h1>더 적은 미노, 새로운 빌드.</h1></div>
-    <button class="settings-button" onclick={openSettings}><Icon name="settings" size={17} /><span>탐색 설정</span></button>
+    <button class="settings-button" onclick={openSettings} aria-label="탐색 설정"><Icon name="settings" size={17} /><span>탐색 설정</span></button>
   </section>
 
   <section class="workspace" aria-label="빌드 탐색 작업 공간">
@@ -205,7 +216,7 @@
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
           <div class="field-stat"><span>현재 가방</span><strong>{candidate ? Math.max(1, Math.ceil(boardPlaced / 7)) : '—'}</strong></div>
-          <div class="candidate-label" class:complete={candidate?.complete}>{candidate?.complete ? '완주 후보' : candidate ? '구축 중' : '빈 필드'}</div>
+          <div class="candidate-label" class:complete={candidate?.complete}>{candidate?.complete ? '완주 후보' : candidate?.verified && candidate.qualified ? '검증 통과' : candidate ? '탐색 후보' : '빈 필드'}</div>
           {#if frame?.piece}<div class="last-piece" style={'--piece-color:' + (pieceColors[frame.piece] || '#96c7b5')}><span>{frame.piece}</span><small>{frame.lines > 0 && frame.spin ? 'SPIN SINGLE' : 'LOCK'}</small></div>{/if}
         </div>
       </div>
@@ -240,6 +251,7 @@
           {/if}
         </div>
         {#if error}<div class="error-message" role="alert">{error}</div>{/if}
+        {#if notice}<p class="session-notice" role="status">{notice}</p>{/if}
       </section>
 
       <section class="progress-section" aria-label="작업 진척도">
@@ -248,12 +260,13 @@
           <div><dt>살펴본 배치</dt><dd>{compactNumber.format(snapshot?.expanded ?? 0)}</dd></div>
           <div><dt>가방 후보</dt><dd>{number.format(snapshot?.candidates ?? 0)}</dd></div>
           <div><dt>확인한 가방</dt><dd>{number.format(snapshot?.verifiedCandidates ?? 0)}</dd></div>
-          <div><dt>최대 진행</dt><dd>{snapshot?.deepestSpins ?? 0}<small> / 40</small></dd></div>
+          <div><dt>검증 통과 깊이</dt><dd>{snapshot?.qualifiedBags ?? 0}<small> 가방</small></dd></div>
         </dl>
+        <p class="verified-progress">검증 통과 최대 {snapshot?.qualifiedSpins ?? 0}스핀<span>{snapshot?.workers ?? 0}개 동시 탐색</span></p>
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />현재 최선</h3><button class="text-button" disabled={!snapshot?.best && !snapshot?.current} onclick={exportResult}><Icon name="download" size={14} />저장</button></div>
+        <div class="section-heading"><h3><Icon name="spark" size={16} />현재 최선</h3><button class="text-button" disabled={!candidate} onclick={exportResult} aria-label="선택한 후보 저장"><Icon name="download" size={14} />저장</button></div>
         {#if snapshot?.best}
           <button class="best-card" onclick={() => view = 'best'}>
             <div><strong>{snapshot.best.budgetPieces ?? snapshot.best.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
@@ -265,9 +278,7 @@
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
         {/if}
-        {#if candidate && !candidate.verified && candidate.checked > 0}
-          <p class="verification-note">선택한 후보의 구축률 확인 중 · {coverageLabel(candidate)}</p>
-        {/if}
+        <p class="verification-note">{candidate ? candidate.verified ? `선택한 후보 구축률 · ${coverageLabel(candidate)}` : candidate.checked > 0 ? `구축률 확인 중 · ${coverageLabel(candidate)}` : '선택한 후보 · 구축률 미검증' : '발견한 후보의 구축률을 여기에 표시합니다.'}</p>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
     </aside>
@@ -284,9 +295,10 @@
       <label><span>개선 목표 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>목표보다 긴 결과도 보관해요.</small></label>
       <label class="full-row"><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
-    <details class="advanced-options"><summary>추가 설정 <span>시드 · 탐색 범위</span></summary><div class="settings-grid">
+    <details class="advanced-options"><summary>추가 설정 <span>동시 탐색 · 시드 · 범위</span></summary><div class="settings-grid">
       <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
+      <label class="full-row"><span>동시 탐색</span><select bind:value={draft.worker_count}><option value={0}>자동 · 기기에 맞게</option><option value={1}>1개</option><option value={2}>2개</option><option value={4}>4개</option></select><small>서로 다른 구조를 나누어 탐색합니다.</small></label>
       <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div></label>
     </div></details>
     {#if active || status === 'paused'}<p class="settings-note">변경한 설정은 다음 탐색부터 적용됩니다.</p>{/if}

@@ -101,7 +101,10 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .best-card p{font-size:10px;color:#a3c083;display:flex;justify-content:space-between;align-items:center;margin:10px 0 0}
 .secondary-result{display:flex;justify-content:space-between;margin-top:14px;font-size:10px;color:#d8c48f}
 .secondary-result strong{font-weight:550}
-.verification-note{font-size:9px;color:#9aaf88;margin:13px 0 0;line-height:1.5}
+.verification-note{font-size:9px;color:#9aaf88;margin:13px 0 0;line-height:1.5;min-height:27px}
+.verified-progress{display:flex;justify-content:space-between;gap:8px;font-size:9px;line-height:1.5;color:#9aaf88;margin:15px 0 0}
+.verified-progress span{white-space:nowrap;color:#7f977c}
+.session-notice{font-size:10px;line-height:1.5;color:#c6b98a;margin:12px 0 0}
 .save-status{display:block;font-size:9px;color:#a2c084;min-height:12px;margin-top:9px}
 .error-message{color:#efb2a1;background:#8c493a20;border:1px solid #8d594759;border-radius:5px;padding:10px 11px;font-size:11px;line-height:1.55;margin-top:13px;overflow-wrap:anywhere;max-height:120px;overflow:auto}
 .app-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:9px;color:#687f6b;padding:17px 0 22px;letter-spacing:.1px}

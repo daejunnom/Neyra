@@ -34,4 +34,8 @@ impl NeyraEngine {
     pub fn export_json(&self) -> String {
         self.session.export_json()
     }
+
+    pub fn export_selected_json(&self, selection: &str) -> String {
+        self.session.export_selected_json(selection)
+    }
 }

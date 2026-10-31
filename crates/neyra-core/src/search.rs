@@ -5,8 +5,8 @@
 
 use crate::physics::{Board, Input, Piece, Placement, Pose, HEIGHT};
 use crate::structure::{
-    map_after_clear, mask_count, remaining_cells, single_goals, single_targets, BoardFacts,
-    CellMask, SingleGoal,
+    map_after_clear, mask_count, placement_bias, remaining_cells, single_goals_for, single_targets,
+    BoardFacts, CellMask, SingleGoal,
 };
 use crate::supply::{
     decode_order, minimum_finish, permutation, LanguageNode, ALL_PIECES, P7_COUNT,
@@ -33,17 +33,21 @@ pub struct SearchConfig {
     pub seed: u64,
     #[serde(alias = "beamWidth")]
     pub beam_width: usize,
+    /// Independent geometric portfolio lane, never a supply/physics rule.
+    #[serde(alias = "searchProfile")]
+    pub search_profile: u8,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            min_success_percent: 95.0,
+            min_success_percent: 100.0,
             piece_goal: 112,
             max_pieces: 140,
             budget_start: 0,
             seed: 1,
             beam_width: 64,
+            search_profile: 0,
         }
     }
 }
@@ -64,7 +68,10 @@ impl SearchConfig {
         if self.max_pieces == 0 || self.max_pieces > 700 || self.piece_goal == 0 {
             return Err("미노 상한은 1–700, 목표는 1 이상이어야 합니다.".into());
         }
-        if self.budget_start > self.max_pieces || !(4..=256).contains(&self.beam_width) {
+        if self.budget_start > self.max_pieces
+            || !(4..=256).contains(&self.beam_width)
+            || self.search_profile > 3
+        {
             return Err("탐색 시작 예산 또는 탐색 폭을 확인해 주세요.".into());
         }
         Ok(())
@@ -118,6 +125,9 @@ pub struct ProgressSnapshot {
     pub expanded: u64,
     pub candidates: u64,
     pub verified_candidates: u64,
+    pub qualified_bags: u16,
+    pub qualified_spins: u8,
+    pub pruned: u64,
     pub deepest_spins: u8,
     pub bags: u16,
     pub checked: u16,
@@ -151,6 +161,8 @@ struct SeedState {
     /// actual filling pay this debt; merely opening a roof does not.
     debt: CellMask,
     future: Continuation,
+    /// Optimistic first-lock choices before this bag's row deletions.
+    first_mask: u8,
 }
 
 #[derive(Clone, Serialize)]
@@ -210,6 +222,20 @@ struct PhysicsCache {
 }
 
 impl PhysicsCache {
+    fn proposals(&mut self, board: Board, piece: Piece, broad: bool) -> Rc<Vec<Placement>> {
+        if broad {
+            return self.locks(board, piece);
+        }
+        let mut placements = board.surface_locks(piece);
+        for pose in single_targets(&board, piece.bit()) {
+            if let Some(placement) = self.target(board, pose, true) {
+                if !placements.iter().any(|p| p.pose == pose && p.spin) {
+                    placements.push(placement);
+                }
+            }
+        }
+        Rc::new(placements)
+    }
     fn locks(&mut self, board: Board, piece: Piece) -> Rc<Vec<Placement>> {
         if let Some(locks) = self.locks.get(&(board, piece)) {
             return Rc::clone(locks);
@@ -346,6 +372,34 @@ fn projected_poses(target: &TargetOperation, deleted: u32) -> Vec<Pose> {
     poses
 }
 
+/// Every ordered held/current pair represents 5! queues. Unknown future
+/// targets may overestimate this mask; never remove a choice on a heuristic.
+fn first_pair_upper(available: u8, spawn: u8, accepting: bool) -> u16 {
+    if accepting {
+        return P7_COUNT as u16;
+    }
+    let mut pairs = 0;
+    for held in 0..7 {
+        for current in 0..7 {
+            if held != current
+                && spawn & (1 << current) != 0
+                && available & ((1 << held) | (1 << current)) != 0
+            {
+                pairs += 1;
+            }
+        }
+    }
+    pairs * 120
+}
+
+fn can_be_first(start: &Board, target: &TargetOperation) -> bool {
+    projected_poses(target, 0).into_iter().any(|pose| {
+        start
+            .place_geometry(pose)
+            .is_some_and(|result| result.lines == 0 || (result.lines == 1 && start.spin_at(pose)))
+    })
+}
+
 impl ExecutionGraph {
     fn new(plan: &Plan) -> Self {
         let key = ExecutionKey {
@@ -460,6 +514,56 @@ impl ExecutionGraph {
         !self.overflow && self.cursor == self.nodes.len()
     }
 
+    fn first_upper(&self) -> u16 {
+        if self.overflow || self.cursor == 0 {
+            return P7_COUNT as u16;
+        }
+        let root = &self.nodes[0];
+        first_pair_upper(
+            root.edges
+                .iter()
+                .fold(0, |mask, edge| mask | (1 << edge.piece)),
+            root.spawn_mask,
+            root.accepting,
+        )
+    }
+
+    fn prefix_possible(&self, queue: &[u8; 7], index: usize, cursor: u8, held: u8) -> bool {
+        let node = &self.nodes[index];
+        // An unexpanded node is optimistically accepting. Goal acceptance
+        // precedes every next-spawn check, including partial terminal bags.
+        if node.accepting || index >= self.cursor || cursor >= 3 {
+            return true;
+        }
+        let current = queue[cursor as usize];
+        if node.spawn_mask & (1 << current) == 0 {
+            return false;
+        }
+        node.edges.iter().any(|edge| {
+            let next_hold = if edge.piece == current {
+                held
+            } else if edge.piece == held {
+                current
+            } else {
+                return false;
+            };
+            self.prefix_possible(queue, edge.child, cursor + 1, next_hold)
+        })
+    }
+
+    fn two_lock_upper(&self) -> u16 {
+        if self.overflow {
+            return P7_COUNT as u16;
+        }
+        (0..210)
+            .filter(|prefix| {
+                let queue = permutation(prefix * 24);
+                self.prefix_possible(&queue, 0, 1, queue[0])
+            })
+            .count() as u16
+            * 24
+    }
+
     fn language(&self) -> Vec<LanguageNode> {
         self.nodes
             .iter()
@@ -542,6 +646,8 @@ struct VerificationJob {
     costs: Vec<u8>,
     codes: Vec<u32>,
     bits: Vec<u64>,
+    upper: u16,
+    prefix_checked: bool,
 }
 
 impl VerificationJob {
@@ -556,12 +662,26 @@ impl VerificationJob {
             costs: vec![0; P7_COUNT],
             codes: vec![0; P7_COUNT],
             bits: vec![0; 79],
+            upper: P7_COUNT as u16,
+            prefix_checked: false,
         }
     }
 
     fn advance(&mut self, goal: u8, cache: &mut PhysicsCache) {
         if !self.graph.complete() {
             self.graph.expand_one(&self.plan, goal, cache);
+            self.upper = self.upper.min(self.graph.first_upper());
+            if !self.prefix_checked
+                && !self.graph.overflow
+                && self.graph.cursor > 1
+                && self.graph.nodes[0]
+                    .edges
+                    .iter()
+                    .all(|e| e.child < self.graph.cursor)
+            {
+                self.upper = self.upper.min(self.graph.two_lock_upper());
+                self.prefix_checked = true;
+            }
             return;
         }
         if self.language.is_none() {
@@ -581,6 +701,9 @@ impl VerificationJob {
             }
         }
         self.checked = end;
+        self.upper = self
+            .upper
+            .min((self.success + P7_COUNT - self.checked) as u16);
     }
 }
 
@@ -589,6 +712,8 @@ struct Continuation {
     placements: Vec<Placement>,
     score: f64,
     paid: u16,
+    spins: u8,
+    anchor: Option<Rc<SingleGoal>>,
 }
 
 #[derive(Clone)]
@@ -600,6 +725,9 @@ struct ProbeState {
     spins: u8,
     placements: Vec<Placement>,
     pursuit: Option<Rc<SingleGoal>>,
+    anchor: Option<Rc<SingleGoal>>,
+    deleted: u32,
+    first_mask: u8,
 }
 
 enum ProbeTask {
@@ -613,15 +741,19 @@ enum ProbeTask {
 /// it never changes the exact P7 failure language or the cost lower bound.
 struct ContinuationProbe {
     tasks: Vec<ProbeTask>,
-    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>)>,
+    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>, u32, u8)>,
     work: u16,
     debt_count: u16,
     base_score: f64,
     best: Continuation,
+    start: Board,
+    minimum_success: u16,
+    profile: u8,
+    budget: u16,
 }
 
 impl ContinuationProbe {
-    fn new(board: Board, debt: CellMask) -> Self {
+    fn new(board: Board, debt: CellMask, profile: u8, minimum_success: u16) -> Self {
         Self {
             tasks: vec![ProbeTask::Expand(ProbeState {
                 board,
@@ -631,17 +763,24 @@ impl ContinuationProbe {
                 spins: 0,
                 placements: vec![],
                 pursuit: None,
+                anchor: None,
+                deleted: 0,
+                first_mask: ALL_PIECES,
             })],
             seen: vec![],
             work: 0,
             debt_count: mask_count(&debt),
             base_score: BoardFacts::new(&board).score(),
             best: Continuation::default(),
+            start: board,
+            minimum_success,
+            profile,
+            budget: if profile == 3 { 96 } else { 64 },
         }
     }
 
     fn finished(&self) -> bool {
-        self.work >= 64 || self.tasks.is_empty()
+        self.work >= self.budget || self.tasks.is_empty()
     }
 
     fn step(&mut self, cache: &mut PhysicsCache) {
@@ -662,7 +801,7 @@ impl ContinuationProbe {
                     let goals = if let Some(goal) = &state.pursuit {
                         vec![Rc::clone(goal)]
                     } else {
-                        single_goals(&state.board, state.inventory, 12)
+                        single_goals_for(&state.board, state.inventory, 12, self.profile)
                             .into_iter()
                             .map(Rc::new)
                             .collect()
@@ -711,7 +850,7 @@ impl ContinuationProbe {
                 );
             }
             ProbeTask::Support(state, goal, piece) => {
-                let locks = cache.locks(state.board, piece);
+                let locks = cache.proposals(state.board, piece, self.profile == 3);
                 let mut best = Vec::<(f64, Placement, Board)>::new();
                 for placement in locks.iter() {
                     if !goal.accepts_support(&state.board, placement.pose) {
@@ -723,7 +862,7 @@ impl ContinuationProbe {
                     if result.lines != 0 {
                         continue;
                     }
-                    let score = BoardFacts::new(&result.board).score()
+                    let score = BoardFacts::new(&result.board).terrain_score(Some(&goal))
                         - goal.remaining(&result.board) as f64 * 8.0;
                     if best.iter().any(|(_, _, board)| *board == result.board) {
                         continue;
@@ -755,6 +894,38 @@ impl ContinuationProbe {
         spin: bool,
         pursuit: Option<Rc<SingleGoal>>,
     ) {
+        let Some(target) = normalize_target(placement.pose, state.deleted) else {
+            return;
+        };
+        if !can_be_first(&self.start, &target) {
+            state.first_mask &= !placement.pose.piece.bit();
+        }
+        if first_pair_upper(state.first_mask, spawn_mask(&self.start), false) < self.minimum_success
+        {
+            return;
+        }
+        let Some(deleted) = deleted_after(state.deleted, cleared_rows) else {
+            return;
+        };
+        state.deleted = deleted;
+        // Quiet support may accidentally enable a different spin than its
+        // proposed goal. Only the first *executed* spin owns a terrain region.
+        if state.anchor.is_none() && spin {
+            let mut empty = [0; HEIGHT];
+            for (x, y) in placement.pose.cells() {
+                empty[y as usize] |= 1 << x;
+            }
+            let row = cleared_rows.trailing_zeros() as usize;
+            let mut filled = [0; HEIGHT];
+            filled[row] = crate::physics::FULL_ROW & !empty[row];
+            state.anchor = Some(Rc::new(SingleGoal {
+                pose: placement.pose,
+                clear_row: row as u8,
+                required_filled: filled,
+                required_empty: empty,
+                support_any: vec![],
+            }));
+        }
         state.inventory &= !placement.pose.piece.bit();
         state.board = board;
         state.debt = remaining_cells(&map_after_clear(&state.debt, cleared_rows), &board);
@@ -765,20 +936,18 @@ impl ContinuationProbe {
         if state.spins != 0 {
             let facts = BoardFacts::new(&board);
             let paid = self.debt_count.saturating_sub(mask_count(&state.debt));
-            let opened = (0..HEIGHT)
-                .map(|y| (state.debt[y] & !facts.holes[y]).count_ones() as u16)
-                .sum::<u16>();
             // Use one coherent route. Do not sum incompatible pockets or
             // spend the same finisher several times for hypothetical rewards.
-            let score = state.spins as f64 * 24.0 - state.quiet as f64 * 6.0
-                + paid as f64 * 5.0
-                + opened as f64 * 0.75
+            let score = state.spins as f64 * 60.0 - state.quiet as f64 * 10.0
+                + paid as f64 * 6.0
                 + (facts.score() - self.base_score) * 0.25;
             if self.best.placements.is_empty() || score > self.best.score {
                 self.best = Continuation {
                     placements: state.placements.clone(),
                     score,
                     paid,
+                    spins: state.spins,
+                    anchor: state.anchor.clone(),
                 };
             }
         }
@@ -787,6 +956,8 @@ impl ContinuationProbe {
             state.inventory,
             state.debt,
             state.pursuit.clone(),
+            state.deleted,
+            state.first_mask,
         );
         if !self.seen.contains(&key) {
             self.seen.push(key);
@@ -799,15 +970,19 @@ struct RefinementJob {
     pending: Vec<SeedState>,
     current: Option<(SeedState, ContinuationProbe)>,
     complete: Vec<SeedState>,
+    profile: u8,
+    minimum_success: u16,
 }
 
 impl RefinementJob {
-    fn new(mut pending: Vec<SeedState>) -> Self {
+    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16) -> Self {
         pending.reverse();
         Self {
             pending,
             current: None,
             complete: vec![],
+            profile,
+            minimum_success,
         }
     }
 
@@ -827,7 +1002,12 @@ impl RefinementJob {
                 // The final partial bag needs no useful future field.
                 insert_seed(&mut self.complete, seed, 8);
             } else {
-                let probe = ContinuationProbe::new(seed.board, seed.debt);
+                let probe = ContinuationProbe::new(
+                    seed.board,
+                    seed.debt,
+                    self.profile,
+                    self.minimum_success,
+                );
                 self.current = Some((seed, probe));
             }
         }
@@ -853,6 +1033,10 @@ struct GenerationJob {
     setup: bool,
     variant: u64,
     refinement: Option<RefinementJob>,
+    profile: u8,
+    minimum_success: u16,
+    broad: bool,
+    pruned: u64,
 }
 
 impl GenerationJob {
@@ -863,6 +1047,8 @@ impl GenerationJob {
         setup: bool,
         variant: u64,
         goal: u8,
+        profile: u8,
+        minimum_success: u16,
     ) -> Self {
         let mut seed = SeedState {
             board: node.board,
@@ -875,6 +1061,7 @@ impl GenerationJob {
             pursuit: None,
             debt: node.debt,
             future: Continuation::default(),
+            first_mask: ALL_PIECES,
         };
         // The earlier bounded probe found these placements from this exact
         // boundary. Use that coherent route as a geometric proposal prefix;
@@ -897,11 +1084,20 @@ impl GenerationJob {
                 let Some(deleted) = deleted_after(seed.deleted, result.cleared_rows) else {
                     break;
                 };
+                let first_mask = if can_be_first(&node.board, &target) {
+                    seed.first_mask
+                } else {
+                    seed.first_mask & !placement.pose.piece.bit()
+                };
+                if first_pair_upper(first_mask, spawn_mask(&node.board), false) < minimum_success {
+                    break;
+                }
                 seed.debt = next_debt(&seed, &result.board, result.cleared_rows);
                 seed.board = result.board;
                 seed.used |= placement.pose.piece.bit();
                 seed.deleted = deleted;
                 seed.spins += result.lines;
+                seed.first_mask = first_mask;
                 seed.targets.push(target);
                 seed.frames.push(DisplayFrame {
                     rows: result.board.rows,
@@ -926,11 +1122,15 @@ impl GenerationJob {
             complete: if terminal { vec![seed] } else { vec![] },
             state_index: 0,
             piece_index: 0,
-            width: width.clamp(4, 32),
+            width: width.clamp(4, 128),
             depth,
             setup,
             variant,
             refinement: None,
+            profile,
+            minimum_success,
+            broad: variant % 4 == 3,
+            pruned: 0,
         }
     }
 
@@ -959,7 +1159,7 @@ impl GenerationJob {
             } else {
                 ALL_PIECES & !state.used
             };
-            let goals = single_goals(&state.board, inventory, 12);
+            let goals = single_goals_for(&state.board, inventory, 12, self.profile);
             if !goals.is_empty() {
                 let choice = (self.variant as usize + self.state_index) % goals.len();
                 state.pursuit = goals.into_iter().nth(choice).map(Rc::new);
@@ -975,8 +1175,9 @@ impl GenerationJob {
         if state.used & (1 << (piece as u8)) != 0 {
             return 0;
         }
-        let locks = cache.locks(state.board, piece);
-        let before_holes = BoardFacts::new(&state.board).holes;
+        let locks = cache.proposals(state.board, piece, self.broad);
+        let before_facts = BoardFacts::new(&state.board);
+        let before_holes = before_facts.holes;
         let mut expanded = 0;
         for placement in locks.iter() {
             expanded += 1;
@@ -1009,6 +1210,23 @@ impl GenerationJob {
             let Some(target) = normalize_target(placement.pose, state.deleted) else {
                 continue;
             };
+            let first_mask = if can_be_first(&self.start, &target) {
+                state.first_mask
+            } else {
+                state.first_mask & !piece.bit()
+            };
+            let complete = state.spins + result.lines >= goal;
+            let available = if complete {
+                first_mask & (state.used | piece.bit())
+            } else {
+                first_mask
+            };
+            if first_pair_upper(available, spawn_mask(&self.start), self.start_spins >= goal)
+                < self.minimum_success
+            {
+                self.pruned += 1;
+                continue;
+            }
             let Some(deleted) = deleted_after(state.deleted, result.cleared_rows) else {
                 continue;
             };
@@ -1037,18 +1255,21 @@ impl GenerationJob {
                 &before_holes,
                 &facts.holes,
             );
-            let mut structural = facts.score() * 2.0;
+            let mut structural = facts.terrain_score(pursuit.as_deref()) * 2.0;
+            structural -= mask_count(&debt) as f64 * 4.0;
+            if result.lines == 0 {
+                structural += placement_bias(
+                    &before_facts,
+                    &facts,
+                    &result.board,
+                    placement.pose,
+                    ALL_PIECES & !(state.used | piece.bit()),
+                    pursuit.as_deref(),
+                );
+            }
             if let Some(pursuit) = &pursuit {
-                structural += (facts.roughness - facts.side_roughness(pursuit.working_columns()))
-                    as f64
-                    * 0.32;
                 structural -= pursuit.remaining(&result.board) as f64 * 8.0;
                 structural -= facts.unplanned_holes(&pursuit.required_empty) as f64 * 4.0;
-                structural += if pursuit.ready(&result.board) {
-                    18.0
-                } else {
-                    0.0
-                };
                 // Spending the intended finisher quietly may still be needed
                 // to finish a fixed bag. Keep the footprint for a later bag,
                 // but do not value it as an available same-bag spin.
@@ -1064,7 +1285,8 @@ impl GenerationJob {
                 setup_score(&self.start, &targets) + structural * 0.06 + rng.unit() * 6.0
             } else {
                 structural
-                    + (spins - self.start_spins) as f64 * 100.0
+                    + (spins - self.start_spins) as f64
+                        * if self.variant % 4 == 2 { 72.0 } else { 112.0 }
                     + setup_score(&self.start, &targets) * 0.25
                     + rng.unit() * 2.0
             };
@@ -1079,9 +1301,10 @@ impl GenerationJob {
                 pursuit,
                 debt,
                 future: Continuation::default(),
+                first_mask,
             };
             if spins >= goal || next.used == ALL_PIECES {
-                insert_seed(&mut self.complete, next, 8);
+                insert_seed(&mut self.complete, next, 12);
             } else {
                 insert_seed(&mut self.next, next, self.width);
             }
@@ -1112,7 +1335,11 @@ impl GenerationJob {
             if self.complete.is_empty() {
                 true
             } else {
-                self.refinement = Some(RefinementJob::new(std::mem::take(&mut self.complete)));
+                self.refinement = Some(RefinementJob::new(
+                    std::mem::take(&mut self.complete),
+                    self.profile,
+                    self.minimum_success,
+                ));
                 false
             }
         } else {
@@ -1171,6 +1398,7 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
             && s.spins == seed.spins
             && s.pursuit == seed.pursuit
             && s.debt == seed.debt
+            && s.first_mask == seed.first_mask
     }) {
         if list[index].score >= seed.score {
             return;
@@ -1183,7 +1411,7 @@ fn insert_seed(list: &mut Vec<SeedState>, seed: SeedState, limit: usize) {
         .unwrap_or(list.len());
     list.insert(at, seed);
     if list.len() > limit {
-        let quota = if limit >= 16 { 2 } else { 1 };
+        let quota = if limit >= 8 { 2 } else { 1 };
         let victim = (0..list.len())
             .rev()
             .find(|index| {
@@ -1269,6 +1497,13 @@ struct TreeNode {
     reward: f64,
     future: Continuation,
     debt: CellMask,
+    attempts: u32,
+    allowance: u32,
+    last_selected: u64,
+    quality: f64,
+    last_improved_attempt: u32,
+    best_extension_spins: u8,
+    best_extension_quality: f64,
 }
 
 #[derive(Clone)]
@@ -1306,6 +1541,28 @@ fn threshold_met(counts: &[u16], percent: f64) -> bool {
         .iter()
         .fold(BigUint::from(threshold), |n, _| n * (P7_COUNT as u32));
     numerator >= denominator
+}
+
+fn required_success(counts: &[u16], percent: f64) -> u16 {
+    let (mut lo, mut hi) = (0, P7_COUNT as u16);
+    let mut prefix = counts.to_vec();
+    prefix.push(0);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        *prefix.last_mut().unwrap() = mid;
+        if threshold_met(&prefix, percent) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+fn boundary_quality(board: &Board, debt: &CellMask, future: &Continuation) -> f64 {
+    let unexplained = mask_count(debt).saturating_sub(future.paid);
+    BoardFacts::new(board).terrain_score(future.anchor.as_deref()) * 2.0 + future.score
+        - unexplained as f64 * 12.0
 }
 
 fn compare_probability(a: &[u16], b: &[u16]) -> std::cmp::Ordering {
@@ -1348,6 +1605,11 @@ pub struct SearchSession {
     generation_rounds: u64,
     active_budget: u16,
     physics_cache: PhysicsCache,
+    focus: Option<usize>,
+    pruned: u64,
+    qualified_bags: u16,
+    qualified_spins: u8,
+    preview_steps: u32,
 }
 
 impl SearchSession {
@@ -1371,6 +1633,13 @@ impl SearchSession {
             reward: 0.0,
             future: Continuation::default(),
             debt: [0; HEIGHT],
+            attempts: 0,
+            allowance: 4,
+            last_selected: 0,
+            quality: 0.0,
+            last_improved_attempt: 0,
+            best_extension_spins: 0,
+            best_extension_quality: f64::NEG_INFINITY,
         };
         let lower_bound = cost_lower_bound(&Board::default(), 0, TARGET_SPINS);
         let active_budget = if config.budget_start == 0 {
@@ -1402,6 +1671,11 @@ impl SearchSession {
             generation_rounds: 0,
             active_budget,
             physics_cache: PhysicsCache::default(),
+            focus: Some(0),
+            pruned: 0,
+            qualified_bags: 0,
+            qualified_spins: 0,
+            preview_steps: 0,
         })
     }
 
@@ -1412,32 +1686,34 @@ impl SearchSession {
             if self.finished {
                 break;
             }
+            self.preview_steps = self.preview_steps.wrapping_add(1);
             if let Some(mut job) = self.verification.take() {
                 job.advance(self.goal, &mut self.physics_cache);
                 self.last_checked = job.checked as u16;
                 self.last_success = job.success as u16;
-                self.update_verifying_preview(&job);
+                if self.preview_steps % 16 == 0 {
+                    self.update_verifying_preview(&job);
+                }
                 if job.graph.overflow {
                     // Incomplete analysis is not inserted into any failure bitset.
                     self.backpropagate(job.parent, 0.0);
                 } else if job.checked == P7_COUNT {
                     self.finish_verification(job);
-                } else if !job.plan.terminal && job.checked > 0 && !self.can_still_qualify(&job) {
+                } else if !self.can_still_qualify(&job) {
+                    self.pruned += 1;
                     self.backpropagate(job.parent, 0.0);
                 } else {
                     self.verification = Some(job);
                 }
                 continue;
             }
-            if let Some((parent, plan)) = self.waiting_plans.pop() {
-                self.verification = Some(VerificationJob::new(parent, plan));
-                self.last_checked = 0;
-                self.last_success = 0;
-                continue;
-            }
             if let Some(mut job) = self.generation.take() {
+                let prior_pruned = job.pruned;
                 self.expanded += job.advance(&mut self.rng, self.goal, &mut self.physics_cache);
-                self.update_generation_preview(&job);
+                self.pruned += job.pruned - prior_pruned;
+                if self.preview_steps % 16 == 0 {
+                    self.update_generation_preview(&job);
+                }
                 if job.next_layer() {
                     let parent = job.parent;
                     for state in job.complete.into_iter().rev() {
@@ -1469,31 +1745,87 @@ impl SearchSession {
                 }
                 continue;
             }
+            // A newly certified child is extended before its waiting siblings.
+            // Within a focus, finish its proposed bags before spending another
+            // generation round. A finite allowance eventually returns to peers.
+            if let Some(parent) = self.focus {
+                if let Some(index) = self.waiting_plans.iter().rposition(|(p, _)| *p == parent) {
+                    let (_, plan) = self.waiting_plans.remove(index);
+                    self.begin_verification(parent, plan);
+                    continue;
+                }
+                if self.can_expand(parent)
+                    && self.tree[parent].attempts < self.tree[parent].allowance
+                {
+                    self.begin_generation(parent);
+                    continue;
+                }
+                self.focus = None;
+            }
+            if let Some((parent, plan)) = self.waiting_plans.pop() {
+                self.begin_verification(parent, plan);
+                continue;
+            }
             let Some(parent) = self.select_node() else {
                 self.finished = true;
                 break;
             };
-            self.tree[parent].visits += 1;
-            // Reserve quiet foundation rounds only at the empty starting
-            // field. Later bags actively prepare and consume spin contracts.
-            let setup = parent == 0 && self.generation_rounds % 4 != 3;
-            self.generation = Some(GenerationJob::new(
-                parent,
-                &self.tree[parent],
-                self.config.beam_width,
-                setup,
-                self.generation_rounds,
-                self.goal,
-            ));
-            self.generation_rounds += 1;
-            // A heuristic miss at a budget is not an impossibility proof. Broaden
-            // the scheduling preference periodically; acceptance never uses it.
-            if self.generation_rounds % 12 == 0 {
-                self.active_budget = self
-                    .active_budget
-                    .saturating_add(7)
-                    .min(self.config.max_pieces);
-            }
+            self.focus = Some(parent);
+            let stale = self.tree[parent]
+                .attempts
+                .saturating_sub(self.tree[parent].last_improved_attempt);
+            let extra = 1 + u32::from(self.tree[parent].future.spins != 0 && stale < 4) * 2;
+            self.tree[parent].allowance = self.tree[parent].attempts + extra;
+            self.begin_generation(parent);
+        }
+    }
+
+    fn begin_verification(&mut self, parent: usize, plan: Plan) {
+        self.verification = Some(VerificationJob::new(parent, plan));
+        self.last_checked = 0;
+        self.last_success = 0;
+    }
+
+    fn cost_cap(&self) -> u16 {
+        self.best
+            .as_ref()
+            .and_then(|b| b.summary.budget_pieces)
+            .unwrap_or(self.config.max_pieces)
+            .min(self.config.max_pieces)
+    }
+
+    fn can_expand(&self, index: usize) -> bool {
+        let node = &self.tree[index];
+        node.spins < self.goal
+            && node.pieces < self.config.max_pieces
+            && node.pieces + cost_lower_bound(&node.board, node.spins, self.goal) <= self.cost_cap()
+    }
+
+    fn begin_generation(&mut self, parent: usize) {
+        let attempt = self.tree[parent].attempts;
+        let minimum = required_success(&self.tree[parent].counts, self.config.min_success_percent);
+        // Re-search only selected boundaries more broadly; siblings start cheap.
+        let stage = (attempt / 4).min(2);
+        let width = (self.config.beam_width >> (2 - stage)).max(4);
+        let setup = parent == 0 && attempt % 4 != 3;
+        self.generation = Some(GenerationJob::new(
+            parent,
+            &self.tree[parent],
+            width,
+            setup,
+            attempt as u64,
+            self.goal,
+            self.config.search_profile,
+            minimum,
+        ));
+        self.tree[parent].attempts += 1;
+        self.tree[parent].last_selected = self.generation_rounds;
+        self.generation_rounds += 1;
+        if self.generation_rounds % 12 == 0 {
+            self.active_budget = self
+                .active_budget
+                .saturating_add(7)
+                .min(self.config.max_pieces);
         }
     }
 
@@ -1523,70 +1855,49 @@ impl SearchSession {
         self.seen_plans.insert(key)
     }
 
-    fn select_node(&mut self) -> Option<usize> {
-        let cap = self
-            .best
-            .as_ref()
-            .and_then(|b| b.summary.budget_pieces)
-            .unwrap_or(self.config.max_pieces);
-        let can_expand = |node: &TreeNode| {
-            node.pieces < self.config.max_pieces
-                && node.spins < self.goal
-                && node.pieces + cost_lower_bound(&node.board, node.spins, self.goal) <= cap
-        };
-        if !can_expand(&self.tree[0]) {
-            return None;
-        }
-        let mut index = 0;
-        for _ in 0..100 {
-            let node = &self.tree[index];
-            let widening = (2.0 * ((node.visits + 1) as f64).sqrt()).floor() as usize;
-            if node.children.is_empty()
-                || (node.children.len() < widening.min(12) && self.rng.unit() < 0.35)
-                || self.rng.unit() < 0.08
-            {
-                return Some(index);
-            }
-            let log = ((node.visits + 2) as f64).ln();
-            let choice = node
-                .children
-                .iter()
-                .copied()
-                .filter(|child| can_expand(&self.tree[*child]))
-                .max_by(|a, b| {
-                    let score = |i: usize| {
-                        let c = &self.tree[i];
-                        let bound = c.pieces + cost_lower_bound(&c.board, c.spins, self.goal);
-                        let preference = self
-                            .best
-                            .as_ref()
-                            .and_then(|b| b.summary.budget_pieces)
-                            .map(|n| n.saturating_sub(1))
-                            .unwrap_or(self.active_budget);
-                        let budget_penalty = bound.saturating_sub(preference) as f64 * 0.015;
-                        let target_penalty =
-                            bound.saturating_sub(self.config.piece_goal) as f64 * 0.005;
-                        c.reward / (c.visits.max(1) as f64)
-                            + 0.8 * (log / (c.visits + 1) as f64).sqrt()
-                            + c.spins as f64 / self.goal as f64 * 0.25
-                            - budget_penalty
-                            - target_penalty
-                    };
-                    score(*a).total_cmp(&score(*b))
-                });
-            if let Some(child) = choice {
-                index = child;
-            } else {
-                return Some(index);
-            }
-        }
-        Some(index)
+    fn select_node(&self) -> Option<usize> {
+        // Bounded best-first resumption between focused depth-first stretches.
+        // The exact mass/cost bound prunes; this priority only schedules effort.
+        (0..self.tree.len())
+            .filter(|&i| self.can_expand(i))
+            .max_by(|&a, &b| {
+                let priority = |i: usize| {
+                    let node = &self.tree[i];
+                    let bound = node.pieces + cost_lower_bound(&node.board, node.spins, self.goal);
+                    let age = self
+                        .generation_rounds
+                        .saturating_sub(node.last_selected)
+                        .min(128);
+                    let stale = node.attempts.saturating_sub(node.last_improved_attempt) as f64;
+                    // A geometric continuation is not a P7 extension. Its
+                    // speculative credit fades when repeated rounds cannot
+                    // improve a certified child. Real progress resets the age.
+                    let speculative = node.future.score.max(0.0)
+                        + f64::from(node.future.paid.min(mask_count(&node.debt))) * 12.0;
+                    let quality = node.quality - speculative * stale / (stale + 4.0);
+                    // Stored cells can pay for later singles. Charging every
+                    // prefix lock again here permanently starves deeper setup
+                    // boundaries even when their optimistic total cost is the
+                    // same. Compare that total bound below, not raw depth.
+                    node.spins as f64 * 18.0 + quality * 0.25 + age as f64 * 0.30
+                        - stale * 1.5
+                        - ((node.attempts + 1) as f64).log2() * 8.0
+                        - bound.saturating_sub(self.active_budget) as f64 * 0.5
+                        - bound.saturating_sub(self.config.piece_goal) as f64 * 0.2
+                };
+                priority(a).total_cmp(&priority(b))
+            })
     }
 
     fn backpropagate(&mut self, mut index: usize, reward: f64) {
         loop {
             self.tree[index].visits += 1;
-            self.tree[index].reward += reward;
+            self.tree[index].reward = self.tree[index].reward.max(reward);
+            if reward > 0.0 {
+                self.tree[index].allowance = self.tree[index]
+                    .allowance
+                    .max(self.tree[index].attempts + 2);
+            }
             let Some(parent) = self.tree[index].parent else {
                 break;
             };
@@ -1596,7 +1907,7 @@ impl SearchSession {
 
     fn can_still_qualify(&self, job: &VerificationJob) -> bool {
         let mut counts = self.tree[job.parent].counts.clone();
-        counts.push((job.success + P7_COUNT - job.checked) as u16);
+        counts.push(job.upper);
         threshold_met(&counts, self.config.min_success_percent)
     }
 
@@ -1607,15 +1918,6 @@ impl SearchSession {
         self.deepest_spins = self.deepest_spins.max(seed.spins);
         let parent = &self.tree[job.parent];
         let placed = job.start_pieces + seed.targets.len() as u16;
-        let should_update = self.current.as_ref().is_none_or(|c| {
-            seed.spins > c.summary.spins
-                || (seed.spins == c.summary.spins
-                    && placed >= c.summary.placed
-                    && !c.summary.verified)
-        });
-        if !should_update {
-            return;
-        }
         let mut frames = parent.frames.clone();
         frames.extend(seed.frames.clone());
         let upper = probability(&parent.counts);
@@ -1660,16 +1962,9 @@ impl SearchSession {
         self.deepest_spins = self.deepest_spins.max(job.plan.expected_spins);
         let parent = &self.tree[job.parent];
         let id = format!("plan-{}", job.plan.id);
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|c| c.summary.spins > job.plan.expected_spins && c.summary.id != id)
-        {
-            return;
-        }
         let prefix = probability(&parent.counts);
         let lower = prefix * job.success as f64 / P7_COUNT as f64;
-        let upper = prefix * (job.success + P7_COUNT - job.checked) as f64 / P7_COUNT as f64;
+        let upper = prefix * job.upper as f64 / P7_COUNT as f64;
         let mut frames = parent.frames.clone();
         frames.extend(job.plan.seed_frames.clone());
         self.current = Some(Archived {
@@ -1782,12 +2077,10 @@ impl SearchSession {
             certificates: certificates.clone(),
             pending_plan: None,
         };
-        if self
-            .current
-            .as_ref()
-            .is_none_or(|c| summary.spins >= c.summary.spins)
-        {
-            self.current = Some(archived.clone());
+        self.current = Some(archived.clone());
+        if qualified {
+            self.qualified_bags = self.qualified_bags.max(counts.len() as u16);
+            self.qualified_spins = self.qualified_spins.max(summary.spins);
         }
         if job.plan.terminal {
             if qualified
@@ -1827,15 +2120,37 @@ impl SearchSession {
                     reward: 0.0,
                     future: job.plan.future.clone(),
                     debt: job.plan.debt,
+                    attempts: 0,
+                    allowance: 2
+                        + u32::from(job.plan.future.spins.min(2)) * 2
+                        + u32::from(job.plan.expected_spins > parent.spins) * 2,
+                    last_selected: self.generation_rounds,
+                    quality: boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future),
+                    last_improved_attempt: 0,
+                    best_extension_spins: 0,
+                    best_extension_quality: f64::NEG_INFINITY,
                 };
-                self.insert_boundary(job.parent, new_node);
+                let gain = new_node.spins - parent.spins;
+                let quality = new_node.quality;
+                if let Some(child) = self.insert_boundary(job.parent, new_node) {
+                    let source = &mut self.tree[job.parent];
+                    if gain > source.best_extension_spins
+                        || (gain == source.best_extension_spins
+                            && quality > source.best_extension_quality)
+                    {
+                        source.best_extension_spins = gain;
+                        source.best_extension_quality = quality;
+                        source.last_improved_attempt = source.attempts;
+                    }
+                    self.focus = Some(child);
+                }
             }
         }
         let reward = if job.plan.terminal && qualified {
             2.0
         } else if qualified {
             job.plan.expected_spins as f64 / self.goal as f64
-                + ((board_score(&job.plan.expected) + job.plan.future.score) / 200.0)
+                + (boundary_quality(&job.plan.expected, &job.plan.debt, &job.plan.future) / 200.0)
                     .clamp(-0.2, 0.2)
                 + 0.2
         } else {
@@ -1844,37 +2159,39 @@ impl SearchSession {
         self.backpropagate(job.parent, reward);
     }
 
-    fn insert_boundary(&mut self, parent: usize, node: TreeNode) {
+    fn insert_boundary(&mut self, parent: usize, node: TreeNode) -> Option<usize> {
         let limit = self.config.beam_width * 8;
         if self.tree.len() < limit {
             let index = self.tree.len();
             self.tree.push(node);
             self.tree[parent].children.push(index);
-            return;
+            return Some(index);
         }
         // Stable slots keep pending jobs and ancestral certificates valid. Only
         // unreferenced leaves are replaced; completed incumbents live separately.
         let victim = (1..self.tree.len())
             .filter(|i| {
                 *i != parent
+                    && self.focus != Some(*i)
                     && self.tree[*i].children.is_empty()
                     && !self.waiting_plans.iter().any(|(pending, _)| pending == i)
             })
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    n.spins as f64 * 8.0 + (board_score(&n.board) + n.future.score) * 0.05
+                    n.spins as f64 * 8.0 + n.quality * 0.05
                         - n.pieces as f64 * 0.1
                         - (n.visits as f64).sqrt() * 0.1
                 };
                 score(*a).total_cmp(&score(*b))
             });
-        let Some(index) = victim else { return };
+        let Some(index) = victim else { return None };
         if let Some(old_parent) = self.tree[index].parent {
             self.tree[old_parent].children.retain(|i| *i != index);
         }
         self.tree[index] = node;
         self.tree[parent].children.push(index);
+        Some(index)
     }
 
     pub fn snapshot(&self) -> ProgressSnapshot {
@@ -1890,6 +2207,9 @@ impl SearchSession {
             expanded: self.expanded,
             candidates: self.candidates,
             verified_candidates: self.verified_candidates,
+            qualified_bags: self.qualified_bags,
+            qualified_spins: self.qualified_spins,
+            pruned: self.pruned,
             deepest_spins: self.deepest_spins,
             bags: self
                 .current
@@ -1912,6 +2232,18 @@ impl SearchSession {
             .as_ref()
             .or(self.other_complete.as_ref())
             .or(self.current.as_ref());
+        self.export_archive(archive)
+    }
+
+    pub fn export_selected_json(&self, selection: &str) -> String {
+        self.export_archive(match selection {
+            "best" => self.best.as_ref(),
+            "current" => self.current.as_ref(),
+            _ => None,
+        })
+    }
+
+    fn export_archive(&self, archive: Option<&Archived>) -> String {
         let certificates: Vec<_> = archive
             .map(|a| a.certificates.iter().map(|c| c.as_ref()).collect())
             .unwrap_or_default();

@@ -29,3 +29,10 @@
   adopting it; worker-local caches do not imply a global shared search DAG.
 - Use explicit static board features and structural obligations for evaluation.
   Do not introduce NNUE, training data dependencies, or learned evaluation.
+- New settings default to 100% construction success; preserve explicit saved
+  user settings. Independent worker profiles must keep separate certificates.
+  Combining their displayed results does not combine their P7 success sets.
+- Keep proposal ordering distinct from proven bounds. An open passage or an
+  unfinished preparation goal is not an executed spin witness. A canonical
+  terminal plan can contain seven targets while each supply needs fewer locks;
+  never prune it using that canonical placement count as its minimum cost.

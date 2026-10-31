@@ -305,6 +305,68 @@ impl Board {
         })
     }
 
+    /// Cheap, witnessed surface proposals: rotate at spawn, move horizontally,
+    /// then drop to the floor. This intentionally omits tucks; missing choices
+    /// are not a reachability proof. The full move generator stays available.
+    pub fn surface_locks(&self, piece: Piece) -> Vec<Placement> {
+        if !self.can_spawn(piece) {
+            return vec![];
+        }
+        let spawn = State {
+            pose: piece.spawn(),
+            spin: false,
+        };
+        let mut locks = Vec::<Placement>::new();
+        let rotations = [None, Some(Input::Cw), Some(Input::Half), Some(Input::Ccw)];
+        for rotation in rotations
+            .into_iter()
+            .take(if piece == Piece::O { 1 } else { 4 })
+        {
+            let rotated = if let Some(input) = rotation {
+                let Some(state) = self.advance(spawn, input) else {
+                    continue;
+                };
+                state
+            } else {
+                spawn
+            };
+            for direction in [Input::Left, Input::Right] {
+                let mut state = rotated;
+                let mut path: Vec<_> = rotation.into_iter().collect();
+                loop {
+                    if let Some(landed) = self.advance(state, Input::HardDrop) {
+                        if self.lockable(landed.pose) {
+                            let mut cells = landed.pose.cells();
+                            cells.sort_unstable();
+                            if !locks.iter().any(|p| {
+                                let mut other = p.pose.cells();
+                                other.sort_unstable();
+                                other == cells
+                            }) {
+                                let mut witness = path.clone();
+                                witness.push(Input::HardDrop);
+                                locks.push(Placement {
+                                    pose: landed.pose,
+                                    spin: landed.spin,
+                                    path: witness,
+                                });
+                            }
+                        }
+                    }
+                    let Some(next) = self.advance(state, direction) else {
+                        break;
+                    };
+                    if next.pose == state.pose {
+                        break;
+                    }
+                    state = next;
+                    path.push(direction);
+                }
+            }
+        }
+        locks
+    }
+
     /// Cheap geometric placement for structural analysis. It provides no spin
     /// evidence: use `apply` for an accepted/replayable placement.
     pub fn place_geometry(&self, pose: Pose) -> Option<LockResult> {

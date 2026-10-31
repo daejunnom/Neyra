@@ -158,25 +158,199 @@ impl BoardFacts {
             .sum()
     }
 
-    /// Exclude the chosen working columns, rather than assuming column five.
-    pub(crate) fn side_roughness(&self, working_columns: u16) -> u16 {
-        (0..WIDTH - 1)
-            .filter(|&x| working_columns & (3 << x) == 0)
-            .map(|x| self.heights[x].abs_diff(self.heights[x + 1]) as u16)
-            .sum()
-    }
-
     /// Defect ordering only. Enclosures and almost-full rows earn no reward.
     pub(crate) fn score(&self) -> f64 {
-        -(self.hole_count as f64 * 2.0
+        self.terrain_score(None)
+    }
+
+    /// Evaluate the two banks separately from a concrete working pocket.
+    /// A low central passage is not a rough side stack. Conversely, selecting
+    /// a low goal must not hide arbitrary towers in the same columns: the
+    /// exemption ends one support cell above the goal's highest actual cell.
+    /// This is an ordering preference, never a reachability certificate.
+    pub(crate) fn terrain_score(&self, goal: Option<&SingleGoal>) -> f64 {
+        let defects = self.hole_count as f64 * 2.0
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
             + self.cover_depth as f64 * 0.25
             + self.split_gaps as f64 * 2.0
-            + self.roughness as f64 * 0.16
             + (self.height as f64).powi(2) * 0.06
-            + self.cells as f64 * 0.04)
+            + self.cells as f64 * 0.04;
+        let Some((working, roof_top)) = goal.and_then(working_region) else {
+            return -defects - self.roughness as f64 * 0.16;
+        };
+        let footprint = goal.map_or(0, SingleGoal::working_columns);
+        let mut linear = 0_u16;
+        let mut squared = 0_u16;
+        for x in 0..WIDTH - 1 {
+            if working & (3 << x) == 0 {
+                let change = self.heights[x].abs_diff(self.heights[x + 1]) as u16;
+                linear += change;
+                squared += change * change;
+            }
+        }
+        let excess = self.heights.iter().enumerate().fold(0_u16, |sum, (x, h)| {
+            // The rim can be a tall legitimate bank alongside a low pocket.
+            // Only towers over the final mino's own columns are capped here.
+            let above = if footprint & (1 << x) != 0 {
+                h.saturating_sub(roof_top) as u16
+            } else {
+                0
+            };
+            sum + above * above
+        });
+        -defects - linear as f64 * 0.20 - squared as f64 * 0.045 - excess as f64 * 0.10
     }
+}
+
+fn working_region(goal: &SingleGoal) -> Option<(u16, u8)> {
+    let cells = goal.pose.cells();
+    if cells
+        .iter()
+        .any(|&(x, y)| x < 0 || x >= WIDTH as i8 || y < 0 || y >= HEIGHT as i8)
+    {
+        return None;
+    }
+    let footprint = cells.iter().fold(0, |mask, &(x, _)| mask | (1 << x));
+    // The one-column rim contains lateral blockers and the space occupied
+    // by neighbouring orientations during the final rotation. Treating only
+    // a vertical T's two final columns as its working area would penalize the
+    // bank along the adjacent entry pocket as an accidental cliff.
+    let columns = (footprint | footprint << 1 | footprint >> 1) & FULL_ROW;
+    let highest = cells.iter().map(|&(_, y)| y).max()? as u8;
+    // Height is the first empty row: highest + 2 includes the row immediately
+    // above the final mino, where a necessary roof blocker can be located.
+    Some((columns, highest.saturating_add(2).min(HEIGHT as u8)))
+}
+
+fn ridge_pressure(heights: &[u8; WIDTH], column: usize, working: u16) -> u16 {
+    let mut pressure = 0;
+    for neighbour in [column - 1, column + 1] {
+        if working & ((1 << column) | (1 << neighbour)) == 0 {
+            let rise = heights[column].saturating_sub(heights[neighbour]) as u16;
+            pressure += rise * rise;
+        }
+    }
+    pressure
+}
+
+/// Quiet-placement ordering for an interior vertical I. Horizontal and edge I
+/// placements, cavity insertions that do not raise the skyline, and filling an
+/// existing valley receive no extra penalty. A remaining tetromino that can
+/// geometrically level the new ridge reduces the penalty; it is not claimed
+/// to be reachable or independently placeable until the normal verifier runs.
+/// Existing BoardFacts are passed in to avoid another full-board analysis.
+pub(crate) fn placement_bias(
+    before: &BoardFacts,
+    after: &BoardFacts,
+    board_after: &Board,
+    pose: Pose,
+    remaining: u8,
+    goal: Option<&SingleGoal>,
+) -> f64 {
+    if pose.piece != Piece::I {
+        return 0.0;
+    }
+    let cells = pose.cells();
+    let column = cells[0].0;
+    if column <= 0 || column >= WIDTH as i8 - 1 || cells.iter().any(|&(x, _)| x != column) {
+        return 0.0;
+    }
+    let column = column as usize;
+    if after.heights[column] <= before.heights[column] {
+        return 0.0;
+    }
+    let working = goal.and_then(working_region).map_or(0, |r| r.0);
+    let prior = ridge_pressure(&before.heights, column, working);
+    let current = ridge_pressure(&after.heights, column, working);
+    let introduced = current.saturating_sub(prior);
+    if introduced == 0 {
+        return 0.0;
+    }
+    let mut best = current;
+    // The intended finisher cannot also be spent as a quiet repair in this
+    // same proposal. Geometry here is an optimistic, single-use resource hint.
+    let available = remaining & !goal.map_or(0, |g| g.pose.piece.bit());
+    for piece in Piece::ALL {
+        if available & piece.bit() == 0 {
+            continue;
+        }
+        let rotations = match piece {
+            Piece::O => 1,
+            Piece::I | Piece::S | Piece::Z => 2,
+            _ => 4,
+        };
+        for rotation in 0..rotations {
+            let shape = Pose {
+                piece,
+                rotation,
+                x: 0,
+                y: 0,
+            }
+            .cells();
+            let min_x = shape.iter().map(|p| p.0).min().unwrap();
+            let max_x = shape.iter().map(|p| p.0).max().unwrap();
+            // A useful repair must touch the ridge or either neighbour.
+            let start = (-min_x).max(column as i8 - 1 - max_x);
+            let end = (WIDTH as i8 - max_x).min(column as i8 + 2 - min_x);
+            for x in start..end {
+                let mut bottoms = [i8::MAX; WIDTH];
+                for &(dx, dy) in &shape {
+                    let at = (x + dx) as usize;
+                    bottoms[at] = bottoms[at].min(dy);
+                }
+                let y = (0..WIDTH)
+                    .filter(|&at| bottoms[at] != i8::MAX)
+                    .map(|at| after.heights[at] as i8 - bottoms[at])
+                    .max()
+                    .unwrap();
+                // Every used column is supported without creating a new
+                // buried gap. Necessary roofs are handled by goal generation,
+                // not by pretending these arbitrary gaps are free repairs.
+                if (0..WIDTH)
+                    .any(|at| bottoms[at] != i8::MAX && y + bottoms[at] != after.heights[at] as i8)
+                {
+                    continue;
+                }
+                let repair = Pose {
+                    piece,
+                    rotation,
+                    x,
+                    y,
+                };
+                if !board_after.legal(repair) {
+                    continue;
+                }
+                let mut heights = after.heights;
+                let mut filled = [0_u16; HEIGHT];
+                let mut preserves = true;
+                for (at, row) in repair.cells() {
+                    let (at, row) = (at as usize, row as usize);
+                    if goal.is_some_and(|g| g.required_empty[row] & (1 << at) != 0) {
+                        preserves = false;
+                        break;
+                    }
+                    heights[at] = heights[at].max(row as u8 + 1);
+                    filled[row] |= 1 << at;
+                }
+                if !preserves
+                    || filled.iter().enumerate().any(|(row, cells)| {
+                        *cells != 0 && board_after.rows[row] | cells == FULL_ROW
+                    })
+                {
+                    continue;
+                }
+                best = best.min(ridge_pressure(&heights, column, working));
+                if current.saturating_sub(best) >= introduced {
+                    return -(introduced as f64) * 0.20;
+                }
+            }
+        }
+    }
+    // Retain a small cost even for an optimistic repair: spending one specific
+    // remaining piece is a dependency, not unconditional terrain flexibility.
+    let recoverable = current.saturating_sub(best).min(introduced);
+    -(introduced as f64 - recoverable as f64 * 0.75) * 0.8
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -468,9 +642,34 @@ fn support_height(clauses: &[CellMask], heights: &[u8; WIDTH]) -> u16 {
 
 type GoalRank = (u16, u16, u8, Pose);
 
-/// Select a few inexpensive support contracts. This is deliberately incomplete:
-/// rejected shortlist entries are not physical or probability failures.
-pub(crate) fn single_goals(board: &Board, inventory: u8, limit: usize) -> Vec<SingleGoal> {
+fn goal_profile_cost(pose: Pose, profile: u8) -> u16 {
+    let cells = pose.cells();
+    let left = cells.iter().map(|p| p.0).min().unwrap();
+    let right = cells.iter().map(|p| p.0).max().unwrap();
+    let center_twice = left + right;
+    match profile % 4 {
+        // Preferences participate before per-piece shortlisting. Applying
+        // these after a shortlist dominated by wall-supported goals would
+        // leave the workers exploring essentially the same geometry.
+        0 => center_twice.abs_diff(9) as u16 * 2,
+        1 => center_twice.abs_diff(5) as u16 * 2,
+        2 => center_twice.abs_diff(13) as u16 * 2,
+        // A wider working pocket, including horizontal I use, with a weak
+        // central preference. No lane bans a displaced or narrower fallback.
+        _ => (4 - (right - left + 1)) as u16 * 5 + center_twice.abs_diff(9) as u16 / 3,
+    }
+}
+
+/// Portfolio lanes prefer different working regions before truncating each
+/// finisher's pool. The region may move as the board evolves; it is not a fixed
+/// well, a mirrored probability union, or a restriction on physical legality.
+/// Rejected shortlist entries are not physical or probability failures.
+pub(crate) fn single_goals_for(
+    board: &Board,
+    inventory: u8,
+    limit: usize,
+    profile: u8,
+) -> Vec<SingleGoal> {
     let finishers = (inventory & 127 & !Piece::O.bit()).count_ones() as usize;
     if limit == 0 || finishers == 0 {
         return Vec::new();
@@ -495,7 +694,7 @@ pub(crate) fn single_goals(board: &Board, inventory: u8, limit: usize) -> Vec<Si
                 return;
             }
             let rank = (
-                debt(board, &filled, clauses.slice()),
+                debt(board, &filled, clauses.slice()) * 4 + goal_profile_cost(pose, profile),
                 support_height(clauses.slice(), &heights),
                 clear_row,
                 pose,

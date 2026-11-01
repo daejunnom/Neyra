@@ -7,6 +7,7 @@ URLs, log output or public browser code. Redirects are refused.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ from spin_contract import (EXPLORATION_POLICY, MAX_RECORD_BYTES, POLICY, integer
                            validate_model, validate_sample)
 
 EXPORT_KINDS = ("boards", "labels", "models", "runs", "traces")
+MAX_EXCLUDED_GROUPS = 10000
 
 
 class ResponseTooLarge(ValueError):
@@ -131,6 +133,85 @@ def record_bytes(value):
     return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
 
+def bounded_text(value, name, maximum=256):
+    if (not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or re.search(r"[\x00-\x1f\x7f]", value)):
+        raise ValueError(f"Invalid bounded {name}")
+    return value
+
+
+def manifest_exclusions(manifest):
+    """Validate the immutable exclusion list before creating any local files."""
+    corpus = manifest.get("corpus")
+    if "corpus" in manifest:
+        bounded_text(corpus, "manifest corpus", 128)
+    entries = manifest.get("excludedTrainingGroups", [])
+    if not isinstance(entries, list) or len(entries) > MAX_EXCLUDED_GROUPS:
+        raise ValueError("Manifest excluded training groups exceed their bounded contract")
+    groups = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"group", "reason", "excludedAt"}:
+            raise ValueError("Malformed manifest training exclusion")
+        group = bounded_text(entry["group"], "excluded training group")
+        if group in groups:
+            raise ValueError("Duplicate manifest training exclusion group")
+        groups.add(group)
+        timestamp = integer(entry["excludedAt"], "exclusion timestamp", 0, 2**53 - 1)
+        if "createdAt" in manifest and timestamp > integer(manifest["createdAt"], "manifest timestamp", 0, 2**53 - 1):
+            raise ValueError("Training exclusion postdates its immutable snapshot")
+        reason = entry["reason"]
+        if not isinstance(reason, dict) or not reason:
+            raise ValueError("Training exclusion needs a structured reason")
+        bounded_text(reason.get("kind"), "exclusion reason kind", 128)
+        if "group" in reason and reason["group"] != group:
+            raise ValueError("Exclusion reason names a different training group")
+        if "trainingTarget" in reason and reason["trainingTarget"] is not False:
+            raise ValueError("Training exclusion cannot be a supervised target")
+        # Reasons are retained metadata, never labels. Bound their shape without
+        # requiring one particular exclusion cause or silently ignoring one.
+        pending, visited = [(reason, 0)], 0
+        while pending:
+            value, depth = pending.pop()
+            visited += 1
+            if depth > 12 or visited > 512:
+                raise ValueError("Exclusion reason exceeds its structural bounds")
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    bounded_text(key, "exclusion reason key", 128)
+                    pending.append((child, depth + 1))
+            elif isinstance(value, list):
+                pending.extend((child, depth + 1) for child in value)
+            elif isinstance(value, str):
+                if len(value) > 4096 or "\0" in value:
+                    raise ValueError("Exclusion reason text is too large or invalid")
+            elif value is not None and type(value) is not bool:
+                if (type(value) not in (int, float)
+                        or (type(value) is int and abs(value) > 2**53 - 1)
+                        or (type(value) is float and not math.isfinite(value))):
+                    raise ValueError("Exclusion reason must contain finite JSON values")
+        if len(record_bytes(reason)) > 8192:
+            raise ValueError("Exclusion reason exceeds its byte limit")
+    # Explicit algorithm avoids depending on incoming JSON key order. The exact
+    # original exclusion metadata also remains in the verified manifest.json.
+    encoded = (json.dumps(sorted(entries, key=lambda entry: entry["group"]), sort_keys=True,
+                          ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    return groups, hashlib.sha256(encoded).hexdigest()
+
+
+def excluded_label_groups(record, exclusions):
+    if not exclusions:
+        return set()  # Old snapshots retain exactly their previous behavior.
+    source = record["input"]["source"]
+    candidates = {bounded_text(source["family"], "source family")}
+    for container, key in ((source, "group"), (record, "measurementGroup")):
+        if key in container:
+            candidates.add(bounded_text(container[key], key))
+    if "runId" in source:
+        run = bounded_text(source["runId"], "source runId", 128)
+        candidates.update((run, "search:" + run))
+    return candidates & exclusions
+
+
 def download_snapshot(origin, token, opener, identity, destination, *, manifest_hash=None,
                       max_records=250000, max_bytes=512 * 1024 * 1024):
     identity = snapshot_id(identity)
@@ -148,6 +229,7 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
         integer(bounds[kind], "manifest rowid bound", counts[kind], 2**53 - 1)
     if sum(counts.values()) > max_records:
         raise ValueError("Snapshot exceeds --max-records; raise the explicit local download bound")
+    exclusions, exclusion_hash = manifest_exclusions(manifest)
     folder = destination / identity
     if folder.exists():
         raise ValueError("Snapshot destination already exists; retained snapshots are never overwritten")
@@ -156,6 +238,9 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
     (folder / "manifest.json").write_bytes(encoded)
     downloaded_bytes, observed, file_hashes = len(encoded), {}, {}
     policy_counts = {POLICY: 0, EXPLORATION_POLICY: 0}
+    eligible_counts = {POLICY: 0, EXPLORATION_POLICY: 0}
+    excluded_counts = {POLICY: 0, EXPLORATION_POLICY: 0}
+    applied_exclusions = set()
     fixed_path, exploration_path = folder / "fixed-labels.jsonl", folder / "exploration-labels.jsonl"
     try:
         with fixed_path.open("xb") as fixed_file, exploration_path.open("xb") as exploration_file:
@@ -201,7 +286,13 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
                             stream_hash.update(data)
                             if kind == "labels":
                                 policy_counts[record["policy"]] += 1
-                                (fixed_file if record["policy"] == POLICY else exploration_file).write(data)
+                                excluded = excluded_label_groups(record, exclusions)
+                                if excluded:
+                                    excluded_counts[record["policy"]] += 1
+                                    applied_exclusions.update(excluded)
+                                else:
+                                    eligible_counts[record["policy"]] += 1
+                                    (fixed_file if record["policy"] == POLICY else exploration_file).write(data)
                             seen.add(record_id)
                         if len(seen) > counts[kind]:
                             raise ValueError("Export exceeded its immutable manifest count")
@@ -226,8 +317,20 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
             file_hashes[path.name] = digest_file.hexdigest()
         receipt = {"schemaVersion": 1, "snapshotId": identity, "manifestSha256": digest,
                    "counts": observed, "labelPolicies": policy_counts, "filesSha256": file_hashes,
+                   "trainingSelection": {
+                       "schemaVersion": 1, "corpus": manifest.get("corpus"),
+                       "exclusionManifestPresent": "excludedTrainingGroups" in manifest,
+                       "excludedTrainingGroupsDeclared": len(exclusions),
+                       "excludedTrainingGroupsApplied": sorted(applied_exclusions),
+                       "excludedTrainingGroupsSha256": exclusion_hash,
+                       "exclusionHashAlgorithm": "sha256-utf8-json-sorted-group-and-keys-newline-v1",
+                       "eligibleLabelPolicies": eligible_counts, "excludedLabelPolicies": excluded_counts,
+                       "files": {fixed_path.name: {"records": eligible_counts[POLICY], "sha256": file_hashes[fixed_path.name]},
+                                 exploration_path.name: {"records": eligible_counts[EXPLORATION_POLICY], "sha256": file_hashes[exploration_path.name]}},
+                       "rule": "Exclude a label if measurementGroup or input source group/family/run matches an immutable manifest exclusion. Raw labels and received traces remain complete.",
+                   },
                    "responseBytesVerified": downloaded_bytes, "complete": True,
-                   "scope": "Complete retained snapshot; full proofs and traces preserved. Training uses fixed-labels.jsonl only."}
+                   "scope": "Complete retained snapshot; full proofs and received traces preserved. Derived fixed/exploration files omit excluded training groups. Fixed-policy fitting uses fixed-labels.jsonl; full labels.jsonl is an archival file, not the training input."}
         (folder / "download-receipt.json").write_bytes(record_bytes(receipt))
         # Only complete, verified snapshots can become the local latest pointer.
         temporary = destination / ("latest-" + str(uuid.uuid4()) + ".tmp")

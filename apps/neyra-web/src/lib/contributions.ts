@@ -1,15 +1,19 @@
-import type { TrainingContribution } from './types';
+import type { FocusedObservation, TrainingContribution } from './types';
 
 export type ContributionPhase = 'ready' | 'sending' | 'retrying' | 'paused' | 'disabled' | 'unavailable';
 export interface ContributionState {
   enabled: boolean;
   phase: ContributionPhase;
   queued: number;
+  observationQueued: number;
   acknowledged: number;
   dropped: number;
 }
 
 type Pending = { field: TrainingContribution; key: string; order: number };
+type PendingObservation = { observation: FocusedObservation; key: string };
+export type ObservationDelivery = { id: string; status: 'acknowledged' | 'rejected' };
+type Batch = { entries: Pending[]; observation?: PendingObservation; body: string };
 type PublicIngestion = { url: string; anonKey: string };
 export const CONTRIBUTION_CONSENT_KEY = 'neyra-contribution-consent-v2';
 
@@ -31,6 +35,10 @@ const MAX_BATCH = 8;
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_FIELD_BYTES = 6144;
 const MAX_SEEN = 4096;
+// The coordinator uses the same cap for active jobs and unacknowledged labels.
+// Observations never evict another observation: descendants need its receipt.
+export const MAX_PENDING_OBSERVATIONS = 8;
+const MAX_OBSERVATION_BYTES = 512 * 1024;
 const MAX_ATTEMPTS = 6;
 const FLUSH_DELAY = 3000;
 
@@ -45,9 +53,10 @@ function publicIngestion(config: PublicIngestion): boolean {
   } catch { return false; }
 }
 
-/** Bounded, anonymous field contribution. It has no search or model-training API. */
+/** Bounded anonymous transport for retained traces and measured continuations. */
 export class ContributionClient {
   private queue: Pending[] = [];
+  private observations: PendingObservation[] = [];
   private seen = new Map<string, true>();
   private acknowledged = 0;
   private dropped = 0;
@@ -62,7 +71,8 @@ export class ContributionClient {
   private phase: ContributionPhase = 'ready';
   private readonly configured: boolean;
 
-  constructor(private config: PublicIngestion, private receive: (state: ContributionState) => void) {
+  constructor(private config: PublicIngestion, private receive: (state: ContributionState) => void,
+    private delivered: (delivery: ObservationDelivery) => void = () => {}) {
     this.configured = publicIngestion(config);
     this.publish();
   }
@@ -70,7 +80,8 @@ export class ContributionClient {
   get state(): ContributionState {
     return { enabled: this.enabled,
       phase: !this.enabled ? 'disabled' : !this.configured ? 'unavailable' : this.phase,
-      queued: this.queue.length, acknowledged: this.acknowledged, dropped: this.dropped };
+      queued: this.queue.length + this.observations.length, observationQueued: this.observations.length,
+      acknowledged: this.acknowledged, dropped: this.dropped };
   }
 
   setEnabled(enabled: boolean) {
@@ -82,7 +93,9 @@ export class ContributionClient {
       this.timer = undefined;
       this.inFlight?.abort();
       for (const entry of this.queue) this.seen.delete(entry.key);
+      for (const entry of this.observations) this.seen.delete(entry.key);
       this.queue = [];
+      this.observations = [];
       this.attempts = 0;
       this.phase = 'ready';
     } else this.schedule();
@@ -118,6 +131,27 @@ export class ContributionClient {
     this.publish();
   }
 
+  /** The caller retains descendants until an acknowledgement for this ID.
+   * Saturation rejects new work instead of silently dropping its parent. */
+  enqueueObservation(observation: FocusedObservation): boolean {
+    if (this.disposed || !this.enabled || !this.configured ||
+        this.observations.length >= MAX_PENDING_OBSERVATIONS) return false;
+    const key = `observation:${observation.id}`;
+    if (this.seen.has(key)) return false;
+    const serialized = JSON.stringify(observation);
+    if (new TextEncoder().encode(serialized).byteLength > MAX_OBSERVATION_BYTES) {
+      this.dropped++;
+      this.publish();
+      return false;
+    }
+    this.observations.push({ observation: JSON.parse(serialized) as FocusedObservation, key });
+    this.seen.set(key, true);
+    if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
+    this.schedule(0);
+    this.publish();
+    return true;
+  }
+
   /** A deliberate retry or an online transition gives a stopped batch a new bounded lease. */
   retry() {
     if (this.disposed || !this.enabled || !this.configured || this.inFlight) return;
@@ -134,18 +168,25 @@ export class ContributionClient {
     this.timer = undefined;
     this.inFlight?.abort();
     this.queue = [];
+    this.observations = [];
     this.seen.clear();
   }
 
   private publish() { this.receive(this.state); }
 
   private schedule(delay = FLUSH_DELAY) {
-    if (this.disposed || !this.enabled || !this.configured || !this.queue.length ||
+    if (this.disposed || !this.enabled || !this.configured || (!this.queue.length && !this.observations.length) ||
         this.inFlight || this.timer || this.phase === 'paused') return;
     this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, delay);
   }
 
-  private batch(): { entries: Pending[]; body: string } {
+  private batch(): Batch {
+    // A single observation leaves enough room for all bounded proof frames.
+    // Parents are sent before the coordinator admits their descendants.
+    const observation = this.observations[0];
+    if (observation) return { entries: [], observation, body: JSON.stringify({ schemaVersion: 4,
+      consent: { version: 2, scope: 'verified-search-process', decision: 'allow' },
+      observations: [observation.observation] }) };
     const entries: Pending[] = [];
     const encoder = new TextEncoder();
     let body = '';
@@ -165,10 +206,22 @@ export class ContributionClient {
     this.queue = this.queue.filter((entry) => !removed.has(entry.key));
   }
 
+  private settle(batch: Batch, status: ObservationDelivery['status']) {
+    if (batch.observation) {
+      const entry = batch.observation;
+      this.observations = this.observations.filter((pending) => pending.key !== entry.key);
+      // Delivery callbacks cannot turn a successful HTTP receipt into a retry.
+      try { this.delivered({ id: entry.observation.id, status }); } catch { /* Consumer is optional. */ }
+    } else this.remove(batch.entries);
+  }
+
   private async flush() {
-    if (this.disposed || !this.enabled || !this.configured || this.inFlight || !this.queue.length) return;
-    const { entries, body } = this.batch();
-    if (!entries.length) {
+    if (this.disposed || !this.enabled || !this.configured || this.inFlight ||
+        (!this.queue.length && !this.observations.length)) return;
+    const batch = this.batch();
+    const { entries, observation, body } = batch;
+    const count = observation ? 1 : entries.length;
+    if (!count) {
       this.queue.shift();
       this.dropped++;
       this.schedule();
@@ -178,7 +231,7 @@ export class ContributionClient {
     const controller = new AbortController();
     const generation = this.generation;
     this.inFlight = controller;
-    this.inFlightKeys = new Set(entries.map((entry) => entry.key));
+    this.inFlightKeys = new Set(observation ? [observation.key] : entries.map((entry) => entry.key));
     this.phase = 'sending';
     this.publish();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -194,8 +247,8 @@ export class ContributionClient {
       if (!response.ok) {
         // Invalid records cannot become valid by retrying unchanged bytes.
         if ([400, 413, 422].includes(response.status)) {
-          this.remove(entries);
-          this.dropped += entries.length;
+          this.settle(batch, 'rejected');
+          this.dropped += count;
           this.attempts = 0;
           this.phase = 'ready';
           return;
@@ -213,11 +266,11 @@ export class ContributionClient {
       const result = await response.json() as { accepted?: number; duplicates?: number };
       if (this.disposed || !this.enabled || generation !== this.generation) return;
       if (!Number.isInteger(result.accepted) || !Number.isInteger(result.duplicates) ||
-          result.accepted! < 0 || result.duplicates! < 0 || result.accepted! + result.duplicates! !== entries.length) {
+          result.accepted! < 0 || result.duplicates! < 0 || result.accepted! + result.duplicates! !== count) {
         throw new Error('Contribution acknowledgement does not match the batch');
       }
-      this.remove(entries);
-      this.acknowledged += entries.length;
+      this.settle(batch, 'acknowledged');
+      this.acknowledged += count;
       this.attempts = 0;
       this.phase = 'ready';
     } catch {

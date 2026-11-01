@@ -60,15 +60,32 @@
   model, but keep datasets, new tests, one-time experiments and result reports
   outside this repository. Record dataset, labeling-source and model hashes.
 - The developer learning Site stays owner-private with sharing and learning on,
-  without mode selectors. Sites D1/R2 holds observations and model artifacts;
-  Supabase is the bounded public input queue. Public claims remain unverified
-  until private collection measures them. Keep depth-qualified queue receipts,
+  without mode selectors. Analyze received fixed-policy observations first;
+  do not rerun the collector to consume an already supplied observation. Only
+  when both the received analysis queue and relay are empty may the unchanged
+  collector continue from an actual received result board or its certified
+  descendant. Do not generate empty first-bag or bootstrap-example searches.
+  Sites D1/R2 holds observations and model artifacts; Supabase is the bounded
+  public relay. Received labels remain client-reported even after structural
+  validation; independent private measurements retain their separate trust.
+  Keep depth-qualified trace receipts and identity-qualified observation receipts,
   acknowledge only stored or explicitly excluded inputs, and preserve source
   groups across descendants. Never expose privileged keys in browser bundles,
   logs or commits, or allow anonymous access to private labels or model writes.
 - Capture public search traces only after explicit consent, using existing
-  retained frames and worker totals. No retrospective upload or extra search
-  sampling is permitted. Keep heuristic scores and bounded path observations
+  retained frames and worker totals. Do not retrospectively upload old traces.
+  With consent on, use a verified boundary of at least two bags as an origin
+  for the unchanged fixed-policy collector, then prioritize deeper certified
+  result fields. An existing retained board may seed a new post-consent job.
+  Use the selected worker count, a bounded global frontier, and parent delivery
+  acknowledgement before dispatching descendants. Keep queued observations
+  under backpressure rather than evicting parents. With consent off, discard
+  new collector outputs, stop new collection/upload and resume ordinary search.
+  Per run, cap each shallow origin depth (bags two and three) at two broad roots
+  and four total jobs; then let ordinary search find deeper eligible origins.
+  Preserve these limits through consent toggles, and refund unstarted jobs when
+  a worker completes before dispatch. Do not invent certified deeper fields.
+  Keep heuristic scores and bounded path observations
   in separate untrusted trace records, never in the CNN's supervised targets.
   Reject old default-on ingress envelopes. Deduplicate trace identity separately
   from training occupancy so different runs of a known board retain evidence.
@@ -78,6 +95,23 @@
   enter fixed-policy collection, but stochastic labels must not silently mix
   with the fixed-policy training set. Pin the served champion independently of
   newer private candidates; training never promotes a checkpoint automatically.
+- Retire old opener/bootstrap/perturbed examples from the active corpus. Keep
+  immutable historical proofs/exports only for previous model provenance.
+  Use corpus-qualified canonical board identity so old labels cannot silently
+  enter the new public-results training set. Preserve all physical witness
+  orientations and per-link trust when attaching ancestor feedback.
+  Keep historical geometry/run split constraints even after corpus retirement.
+  Exclude a conflicting whole run and its descendants from all learning splits;
+  check actual measurementGroup as well as canonical provenance. Full exports
+  retain evidence; derived offline training files honor manifest exclusions.
+- CPU remains the default. Optional private GPU learning must finish an active
+  unit before switching off and retry failed GPU work from retained CPU weights
+  and optimizer state. Native training uses epoch boundaries; ORT inference
+  uses batch boundaries. The Site uses bounded parallel candidate workers and
+  actual backend metadata, with validation-only selection and the unchanged
+  parent eligible. A portable model's device=cpu does not describe training
+  hardware. ONNX export must verify CPU parity without replacing the frozen
+  JSON checkpoint. Rust placement search remains CPU; do not label it GPU search.
 - Limit private CNN decision capture to the supplied board and one selected
   successor. Keep predicted values, allocated work, consumed work and measured
   outcomes distinct. Ancestor feedback needs an exact physical certified bridge
@@ -416,15 +450,17 @@
 - Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
-  Show the best and runner-up for each placed bag count with actual spins per
-  bag, counted chance and field quality. Explicit selection controls replay,
-  the shown bag probabilities and exports together; returning to the recommended
+  Show the best and runner-up for each placed bag count beside the board's lower
+  right, with actual spins per bag and field quality. Keep the selector compact
+  and the desktop controls free of an internal vertical scroller. Omit public
+  construction-probability displays while retaining settings and exact proofs.
+  Explicit selection controls replay and exports together; returning to the recommended
   route resumes automatic best selection. At equal chance, six spins in three
   bags outranks nine in five, while both depths remain separately inspectable.
   Keep playback on the retained best route; the current-search tab shows only
-  its final board and has no autoplay or replay controls. Show all certified
-  per-bag construction probabilities on the best route, including 100%, and
-  identify the first bag when excluded from the counted cumulative probability.
+  its final board and has no autoplay or replay controls. A focused-learning
+  view shows its real origin board and relative two-bag observations, never
+  inventing cumulative progress toward 40 clears from that isolated board.
   The compact best-route field evaluation displays that route's final raw
   fieldQuality, not normalized rankingScore or the currently replayed frame.
   Same-ID quality improvements must update it; missing values remain unknown.

@@ -1,13 +1,17 @@
-"""Train an occupancy-only Naga Eyes spin CNN on CPU.
+"""Train an occupancy-only Naga Eyes spin CNN, on CPU by default.
 
 V2 accepts fresh bounded-search observations only. Legacy board teachers, opener
 priors and path-count objectives are rejected, including in source metadata.
+Optional CUDA training drains one epoch before applying a changed GPU request.
+Failed CUDA epochs restore the preceding CPU model/optimizer snapshot and retry
+on CPU. The exported JSON remains a portable, CPU-compatible checkpoint.
 """
 import argparse
 import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -142,6 +146,136 @@ def metrics(pred, target, horizon):
     }
 
 
+def cpu_snapshot(value):
+    """Detach mutable model/Adam state so a failed GPU epoch cannot corrupt it."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu").clone()
+    if isinstance(value, dict):
+        return {key: cpu_snapshot(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [cpu_snapshot(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(cpu_snapshot(child) for child in value)
+    return copy.deepcopy(value)
+
+
+class EpochRuntime:
+    """Serial epochs with multithreaded CPU kernels and optional CUDA work.
+
+    Only an explicit --gpu or a control file containing {"gpu":true} permits
+    CUDA. Replace that file atomically when changing it. A missing/malformed
+    control file requests CPU; it does not terminate learning. A CUDA failure
+    blocks further GPU attempts until an OFF then ON request is observed.
+    """
+
+    def __init__(self, model, optimizer, *, gpu=False, control=None):
+        self.model, self.optimizer = model, optimizer
+        self.device = "cpu"
+        self.requested_gpu = gpu
+        self.control = control
+        self.blocked = False
+        self.fallback = None
+        self.control_error = None
+        self.cuda_available = None  # Never probe/initialize CUDA by default.
+        self.snapshot = self._snapshot()
+
+    def _snapshot(self):
+        return (cpu_snapshot(self.model.state_dict()), cpu_snapshot(self.optimizer.state_dict()))
+
+    def _request(self):
+        requested = self.requested_gpu
+        self.control_error = None
+        if self.control is not None:
+            try:
+                with self.control.open("rb") as source:
+                    raw = source.read(4097)
+                if len(raw) > 4096:
+                    raise ValueError("GPU control exceeds 4096 bytes")
+                value = json.loads(raw, object_pairs_hook=unique_keys, parse_constant=reject_constant)
+                if not isinstance(value, dict) or set(value) != {"gpu"} or type(value["gpu"]) is not bool:
+                    raise ValueError("GPU control requires exactly one boolean gpu field")
+                requested = value["gpu"]
+            except (OSError, ValueError):
+                requested = False
+                self.control_error = "unreadable-or-invalid-control-using-cpu"
+        if requested != self.requested_gpu:
+            self.requested_gpu = requested
+            self.blocked, self.fallback = False, None
+        return requested
+
+    def _restore(self, device):
+        # Construction consumes CPU RNG. Preserve the sampler's sequence across
+        # backend switches and retries; this network has no stochastic layers.
+        with torch.random.fork_rng(devices=[]):
+            model = BoardCNN().to(device=device)
+        model.load_state_dict(self.snapshot[0], strict=True)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+        optimizer.load_state_dict(cpu_snapshot(self.snapshot[1]))
+        self.model, self.optimizer, self.device = model, optimizer, device
+
+    def _run(self, train_x, train_y, val_x, val_y, permutation):
+        self.model.train()
+        for batch in permutation.split(8):
+            self.optimizer.zero_grad(set_to_none=True)
+            loss = criterion(self.model(train_x[batch].to(self.device)), train_y[batch].to(self.device))
+            if not torch.isfinite(loss).item():
+                raise ValueError("Training produced a nonfinite loss")
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 2.0, error_if_nonfinite=True)
+            self.optimizer.step()
+        self.model.eval()
+        with torch.inference_mode():
+            validation = criterion(self.model(val_x.to(self.device)), val_y.to(self.device)).item()
+        if not math.isfinite(validation):
+            raise ValueError("Training produced a nonfinite validation loss")
+        if self.device == "cuda":
+            torch.cuda.synchronize()  # Includes queued kernels before OFF takes effect.
+        return validation
+
+    def epoch(self, train_x, train_y, val_x, val_y, permutation):
+        requested = self._request()
+        desired = "cpu"
+        if requested and not self.blocked:
+            # Set before CUDA initialization; deterministic matmul needs it.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            try:
+                self.cuda_available = bool(torch.cuda.is_available())
+            except Exception:
+                self.cuda_available = False
+            if self.cuda_available:
+                desired = "cuda"
+            else:
+                self.blocked, self.fallback = True, "cuda-unavailable"
+        if desired != self.device:
+            try:
+                self._restore(desired)
+            except Exception:
+                if desired != "cuda":
+                    raise
+                self.blocked, self.fallback = True, "cuda-initialization-failed"
+                self._restore("cpu")
+        rng_state = torch.random.get_rng_state()
+        retried = False
+        try:
+            validation = self._run(train_x, train_y, val_x, val_y, permutation)
+            following = self._snapshot()
+        except Exception:
+            if self.device != "cuda":
+                raise
+            # Do not read any possibly broken GPU tensors. The CPU snapshot is
+            # from before the entire epoch, including Adam moments and steps.
+            self.blocked, self.fallback = True, "cuda-epoch-failed-retried-on-cpu"
+            self._restore("cpu")
+            torch.random.set_rng_state(rng_state)
+            retried = True
+            validation = self._run(train_x, train_y, val_x, val_y, permutation)
+            following = self._snapshot()
+        self.snapshot = following
+        return validation, {"device": self.device, "gpuRequested": requested,
+                            "cudaAvailable": self.cuda_available, "fallbackReason": self.fallback,
+                            "controlError": self.control_error, "retriedOnCpu": retried}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", type=Path, required=True)
@@ -151,6 +285,9 @@ def main():
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--seed", type=int, default=20261101)
     p.add_argument("--threads", type=int, default=2)
+    p.add_argument("--gpu", action="store_true", help="Opt in to native PyTorch CUDA training; unavailable or failed GPU work resumes on CPU")
+    p.add_argument("--gpu-control", type=Path,
+                   help='Optional live JSON file, {"gpu":true|false}; read between epochs, default/malformed/missing means CPU')
     p.add_argument("--initial-model", type=Path,
                    help="Optional compatible private v2 checkpoint; never automatically promoted")
     p.add_argument("--initial-labels", type=Path,
@@ -159,7 +296,7 @@ def main():
                    help="Earlier lineage JSONL artifacts for repeated warm-starts; may be supplied more than once")
     a = p.parse_args()
     if not 1 <= a.threads <= 16 or not 1 <= a.epochs <= 5000 or a.patience < 1:
-        p.error("Invalid CPU training limits")
+        p.error("Invalid training limits")
     if bool(a.initial_model) != bool(a.initial_labels):
         p.error("--initial-model and --initial-labels must be supplied together")
     if a.history_labels and not a.initial_model:
@@ -176,6 +313,7 @@ def main():
     assert sum(x.numel() for x in model.parameters()) == ARCHITECTURE["parameters"]
     initial = initialize_from_checkpoint(model, a.initial_model, a.initial_labels, records, a.history_labels) if a.initial_model else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    compute = EpochRuntime(model, optimizer, gpu=a.gpu, control=a.gpu_control)
     best_loss, best_epoch, best_state, history = math.inf, 0, None, []
     started = time.monotonic()
     train_x, train_y, _ = data["train"]
@@ -187,23 +325,17 @@ def main():
         best_epoch, best_state = 0, copy.deepcopy(model.state_dict())
         initial["validationLoss"] = best_loss
     for epoch in range(1, a.epochs + 1):
-        model.train()
         permutation = torch.randperm(len(train_x), device="cpu")
-        for batch in permutation.split(8):
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(train_x[batch]), train_y[batch])
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            optimizer.step()
-        model.eval()
-        with torch.inference_mode():
-            validation = criterion(model(val_x), val_y).item()
-        history.append({"epoch": epoch, "validationLoss": validation})
+        validation, execution = compute.epoch(train_x, train_y, val_x, val_y, permutation)
+        history.append({"epoch": epoch, "validationLoss": validation, "compute": execution})
         if validation < best_loss - 1e-7:
             best_loss, best_epoch = validation, epoch
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = cpu_snapshot(compute.snapshot[0])
+        print(json.dumps({"epochComplete": epoch, "validationLoss": validation, "compute": execution}), flush=True)
         if epoch - best_epoch >= a.patience:
             break
+    with torch.random.fork_rng(devices=[]):
+        model = BoardCNN().to(device="cpu")
     model.load_state_dict(best_state)
     model.eval()
     config = records[0]["config"]
@@ -229,6 +361,7 @@ def main():
         # A retained epoch-zero checkpoint can be evaluated against a new
         # dataset without overwriting the original immutable model artifact.
         "modelId": "naga-spin-v2-" + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
+        # The artifact device describes portable inference, not the training host.
         "architecture": ARCHITECTURE, "trained": True, "device": "cpu",
         "datasetSha256": dataset_hash, "weightsSha256": weight_hash,
         "datasetHashAlgorithm": "sha256-raw-jsonl-v1",
@@ -246,7 +379,12 @@ def main():
     a.model_output.write_text(json.dumps(runtime, ensure_ascii=False, separators=(",", ":")) + "\n")
     a.output.mkdir(parents=True, exist_ok=True)
     training = {
-        "device": "cpu", "torch": torch.__version__, "seed": a.seed, "threads": a.threads,
+        "device": history[-1]["compute"]["device"],
+        "epochDevices": sorted({entry["compute"]["device"] for entry in history}),
+        "gpuRequestedInitially": a.gpu, "gpuControlEnabled": a.gpu_control is not None,
+        "cudaBuild": torch.version.cuda, "cudaAvailable": compute.cuda_available,
+        "finalEvaluationDevice": "cpu", "portableArtifactDevice": "cpu",
+        "torch": torch.__version__, "seed": a.seed, "threads": a.threads,
         "initialization": "Compatible v2 checkpoint; policy and historical splits audited" if initial else "Fresh random weights; no v1 checkpoint or score supervision",
         "initialCheckpoint": initial,
         "epochsRun": len(history), "selectedEpoch": best_epoch,

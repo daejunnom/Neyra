@@ -107,6 +107,90 @@ export interface RetainedSearchTrace {
 
 export type TrainingContribution = TrainingField & { trace: RetainedSearchTrace };
 
+/** New bounded observations are generated only while explicit contribution is enabled. */
+export interface FocusedInput {
+  id: string;
+  rows: number[];
+  source: {
+    kind: 'search';
+    family: string;
+    reference: string;
+    bagBoundary: number;
+    runId: string;
+    rootCandidateId: string;
+    rootBagBoundary: number;
+    rootSeed: number;
+    buildVersion: string;
+    rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
+    trust: 'client-reported';
+  };
+}
+
+export interface FocusedLabelConfig {
+  horizonBags: number;
+  workBudget: number;
+  beamWidth: number;
+  profile: number;
+  seed: number;
+  maxNodes: number;
+  attemptsPerNode: number;
+  sourceRevision: string;
+}
+
+export interface FocusedWitness {
+  id: number;
+  parentId: number | null;
+  bags: number;
+  startRows: number[];
+  endRows: number[];
+  startSpins: number;
+  endSpins: number;
+  checked: number;
+  success: number;
+  quietSafeSupplies: number;
+  firstBagSymmetryAssumed: boolean;
+  frames: BoardFrame[];
+  [key: string]: unknown;
+}
+
+export interface FocusedSpinLabel {
+  schemaVersion: 2;
+  task: 'naga-spin-observations-v2';
+  policy: 'neyra-fixed-bag-continuation-v2';
+  input: FocusedInput;
+  config: FocusedLabelConfig;
+  targets: { foundSpin: boolean; observedSpins: number };
+  measured: { workUsed: number; censored: boolean; [key: string]: unknown };
+  certifiedWitnesses: FocusedWitness[];
+  reachableWitness: unknown;
+  [key: string]: unknown;
+}
+
+export interface FocusedObservation {
+  schemaVersion: 1;
+  kind: 'focused-spin-observation';
+  id: string;
+  runId: string;
+  rootCandidateId: string;
+  sequence: number;
+  parentObservationId: string | null;
+  parentWitnessId: number | null;
+  label: FocusedSpinLabel;
+}
+
+export interface LearningFocusStatus {
+  enabled: boolean;
+  active: number;
+  queued: number;
+  awaitingDelivery: number;
+  completed: number;
+  failed: number;
+  deepestOriginBag: number;
+  activeBag: number | null;
+  latestObservedSpins: number | null;
+  rows: number[] | null;
+}
+
 export interface Candidate {
   id: string;
   rows: number[];
@@ -176,6 +260,8 @@ export interface SearchSnapshot {
   selectedCandidate?: Candidate | null;
   /** Added by the browser coordinator, not combined into any certificate. */
   workers?: number;
+  /** Conditional deep observation work; distinct from full-build progress. */
+  learningFocus?: LearningFocusStatus;
 }
 
 export type RunStatus = 'idle' | 'loading' | 'running' | 'paused' | 'cancelled' | 'completed' | 'failed';
@@ -188,12 +274,18 @@ export type EngineEvent =
   | { type: 'warning'; runId: string; message: string }
   | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
   | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
+  | { type: 'observation'; runId: string; observationId: string; label: FocusedSpinLabel }
+  | { type: 'observation-error'; runId: string; observationId: string; message: string }
   | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
   | { type: 'export'; runId: string; requestId: string; data: unknown; snapshot?: SearchSnapshot }
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean }
+  | { type: 'learning-mode'; runId: string; enabled: boolean }
+  | { type: 'observe'; runId: string; observationId: string; input: FocusedInput }
+  | { type: 'observation-idle'; runId: string }
+  | { type: 'observation-wait'; runId: string }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
   | { type: 'benchmarks'; runId: string; bestSpinsByBag: number[] }
   | { type: 'watch'; runId: string; enabled: boolean }

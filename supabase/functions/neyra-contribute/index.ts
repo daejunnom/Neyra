@@ -1,7 +1,9 @@
-/** Explicit-consent board and search-trace ingress. Labels are remeasured privately. */
+/** Explicit-consent traces and fixed-policy observations, all client-reported. */
+import { cleanObservation, ObservationError } from './observation.ts';
 const ALLOWED_ORIGIN = 'https://daejunnom.github.io';
 const RULES = 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
-const MAX_BODY = 32 * 1024;
+const MAX_BODY = 576 * 1024;
+const MAX_TRACE_BODY = 32 * 1024;
 type ObjectValue = Record<string, unknown>;
 class Rejection extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -228,19 +230,44 @@ Deno.serve(async (request: Request) => {
         return respond({acknowledged: (await response.json()).length});
       }
       if (body.action === 'stats') {
-        const response = await rest('neyra_contribution_queue?acknowledged_at=is.null&select=board_key',
-          {method: 'HEAD', headers: {'Prefer': 'count=exact'}});
-        return respond({pending: Number(response.headers.get('content-range')?.split('/')[1] ?? 0)});
+        const [response, observations] = await Promise.all([
+          rest('neyra_contribution_queue?acknowledged_at=is.null&select=board_key', {method: 'HEAD', headers: {'Prefer': 'count=exact'}}),
+          rest('neyra_observation_queue?select=queue_key', {method: 'HEAD', headers: {'Prefer': 'count=exact'}})
+        ]);
+        return respond({pending: Number(response.headers.get('content-range')?.split('/')[1] ?? 0),
+          pendingObservations: Number(observations.headers.get('content-range')?.split('/')[1] ?? 0)});
+      }
+      if (body.action === 'pull-observations') {
+        const limit = number(body.limit ?? 1, 1, 4, true);
+        const records = await (await rest(`neyra_observation_queue?select=queue_key,observation&order=created_at.asc,sequence.asc,queue_key.asc&limit=${limit}`)).json();
+        return respond({observations: records.map((row: {queue_key: string; observation: unknown}) =>
+          ({queueId: row.queue_key, observation: row.observation}))});
+      }
+      if (body.action === 'ack-observations') {
+        if (!Array.isArray(body.ids) || !body.ids.length || body.ids.length > 32 ||
+          body.ids.some(id => typeof id !== 'string' || !/^[0-9a-f]{64}$/.test(id))) throw new Rejection(400, 'Invalid observation acknowledgement');
+        const response = await rest(`neyra_observation_queue?queue_key=in.(${[...new Set(body.ids)].join(',')})`,
+          {method: 'DELETE', headers: {'Prefer': 'return=representation'}});
+        return respond({acknowledged: (await response.json()).length});
       }
       throw new Rejection(400, 'Unknown consumer action');
-    }
-    onlyKeys(body, ['schemaVersion', 'consent', 'fields']);
-    if (body.schemaVersion !== 3 || !Array.isArray(body.fields) || !body.fields.length || body.fields.length > 8) {
-      throw new Rejection(400, 'Invalid contribution batch');
     }
     const consent = object(body.consent); onlyKeys(consent, ['version', 'scope', 'decision']);
     if (consent.version !== 2 || consent.scope !== 'verified-search-process' || consent.decision !== 'allow') {
       throw new Rejection(400, 'Explicit current contribution consent required');
+    }
+    if (body.schemaVersion === 4) {
+      onlyKeys(body, ['schemaVersion', 'consent', 'observations']);
+      if (!Array.isArray(body.observations) || body.observations.length !== 1) throw new Rejection(400, 'One focused observation is required');
+      const observation = cleanObservation(body.observations[0]);
+      const response = await rest('rpc/neyra_admit_observation', {method: 'POST', body: JSON.stringify({
+        p_key: await digest(observation.id), p_observation: observation
+      })});
+      return respond(await response.json());
+    }
+    onlyKeys(body, ['schemaVersion', 'consent', 'fields']);
+    if (body.schemaVersion !== 3 || !Array.isArray(body.fields) || !body.fields.length || body.fields.length > 8) {
+      throw new Rejection(400, 'Invalid contribution batch');
     }
     const records = await Promise.all(body.fields.map(async value => {
       const input = cleanInput(value);
@@ -248,11 +275,11 @@ Deno.serve(async (request: Request) => {
       // separately deduplicates occupancy; public traces keep their identity.
       return {board_key: await digest(input.id + ':' + input.rows.join(',')), bag_depth: input.source.bagBoundary, input};
     }));
-    if (new TextEncoder().encode(storageJson(records)).length > MAX_BODY) throw new Rejection(413, 'Batch exceeds storage limit');
+    if (new TextEncoder().encode(storageJson(records)).length > MAX_TRACE_BODY) throw new Rejection(413, 'Batch exceeds storage limit');
     const response = await rest('rpc/neyra_admit_contributions', {method: 'POST', body: JSON.stringify({p_records: records})});
     return respond(await response.json());
   } catch (error) {
-    return respond({error: error instanceof Rejection ? error.message : 'Service temporarily unavailable'},
-      error instanceof Rejection ? error.status : 503);
+    const rejected = error instanceof Rejection || error instanceof ObservationError;
+    return respond({error: rejected ? error.message : 'Service temporarily unavailable'}, rejected ? error.status : 503);
   }
 });

@@ -1,8 +1,9 @@
-# CPU Naga Eyes spin evaluator
+# Naga Eyes spin evaluator and observation analysis
 
 Neyra separates public search from private CNN learning. Public GitHub Pages uses
 the existing structural search evaluator. The developer-only learning Site uses
-fresh, bounded continuation observations to train an occupancy-only CNN.
+received bounded continuation observations to train an occupancy-only CNN.
+It runs new continuation collection only when no received observations remain.
 
 ## Public search
 
@@ -12,38 +13,66 @@ fresh, bounded continuation observations to train an occupancy-only CNN.
   preference is present. Only the current explicit, versioned consent enables
   transmission. Public learning is **off**. Old saved `cnn_evaluation` values do
   not enable it; a public CNN evaluator selector remains future work.
-- Only retained, verified completed-bag records are submitted. Inputs contain the
-  current rows, run and candidate identity, bag depth, seed, rules and search
-  configuration. With consent, a separate trace carries the actual final one or
-  two bags of retained frames, the preceding board, heuristic observations,
-  worker-wide work counters at that record, and the measured path outcome.
-  Heuristic scores are observations about the search, never CNN target labels.
-- Enabling transmission does not backfill records found before consent. Capture
-  reuses existing frames and progress snapshots without extra search or sampling.
-  Disabling it clears and aborts pending work, including across open tabs.
-- The bounded queue batches at most eight fields within 24 KiB, prefers deeper
-  fields and retries temporarily unavailable uploads. Each normalized field is
-  limited to 6 KiB. Manual local exports remain independent of transmission.
-- The public endpoint validates input and applies quotas. A client certificate
-  claim is untrusted metadata; the private collector measures its own labels.
+- Retained verified bag records may submit current rows, run/candidate identity,
+  bag depth, seeds, rules, settings and a separate retained-path trace. These
+  trace scores describe the heuristic search and never become CNN targets.
+- With sharing on, selected verified boards after at least two bags seed the
+  unchanged fixed-policy collector. Each job observes two further bags under
+  its fixed work budget. Certified result boards enter a bounded global frontier
+  ordered by depth, so origins can advance beyond the initial 2-to-4 window.
+  The existing selected worker pool performs this work; no extra worker pool is
+  created for public collection. Ordinary broad search resumes when no focused
+  work remains or sharing is turned off.
+- At origin bags two and three, each depth admits at most two broad roots and
+  four total jobs per run, including certified descendants. These limits survive
+  consent toggles. When those shallow opportunities are exhausted, ordinary
+  search advances until deeper roots appear. Depth is always supported by actual
+  certificates; the scheduler cannot guarantee a deeper field from every input.
+- A previous retained board may start a **new** job after consent. Previous
+  traces are not backfilled. Turning sharing off invalidates in-flight results,
+  aborts upload and clears queued collection across open tabs. The synchronous
+  collector may finish its current bounded CPU call, but that output is dropped.
+- At most eight jobs/awaiting observations share the collection capacity. A
+  descendant is not dispatched until its parent has been acknowledged by the
+  relay. Retries retain FIFO observations; saturation pauses allocation instead
+  of dropping a parent. Each observation is at most 512 KiB, sent alone in a v4
+  envelope. Existing v3 trace batches remain compatible and separately bounded.
+- The endpoint checks exact policy, source identity, work accounting, witness
+  links and physical lock/line transitions. These are structural checks, not a
+  fresh SRS/P7 execution. Received evidence remains **client-reported**.
+- Bag-depth best/runner-up selection lives at the board's lower right. Public
+  construction-probability readouts are omitted; probability settings, ranking
+  and certificates remain in force. The focused view distinguishes relative
+  future spins from a complete path's progress toward 40 clears.
 
 ## Private developer learning
 
 [Neyra Learning Studio](https://neyra-learning-studio.daejun0311.chatgpt.site)
 is owner-private. Data provision and learning are fixed **on**; there are no mode
-selectors. Start/pause controls limit CPU work without changing those modes.
-The browser must remain open for its CPU worker to run.
+selectors. Start/pause controls bound work without changing those modes.
+The browser must remain open for its learning workers to run. GPU learning is a
+separate default-off hardware preference and can change during a session.
 
-The worker prioritizes nonempty boards after at least two completed bags. It
-observes the next two or three bags under one declared policy, rather than
-restarting the empty first bag or searching for an entire completion. A session
-is bounded to three cycles, each with up to four label jobs and 20 training epochs.
-At most one in four label jobs uses seeded proposal-order exploration, within
-the same budget. Its observations keep a distinct policy and do not enter the
-ordinary fixed-policy training set. Certified deeper boards discovered by either
-policy may subsequently receive their own fixed-policy observations.
-The initial model and offline collector use the same schema and can be run by an
-agent without relying on an open browser tab.
+The studio imports full focused observations, queues them for analysis and uses
+those supplied results directly. It records CNN predictions and observed targets
+without relabeling every received board. Only an empty received queue and empty
+remote relay permit fallback collection. Fallback starts at an actual submitted
+result field or its certified descendant, uses the same fixed collector, and
+continues from its deeper result fields. No opener/bootstrap/perturbation examples
+are automatically selected. Old seeded-order artifacts remain in historical
+exports, but are not mixed into the active fixed-policy training set.
+
+The active corpus is `public-results-v1`. Historical examples are excluded from
+active counts, previews, collection and training, while their immutable proofs
+and snapshots remain available for old model provenance. Board identity includes
+the corpus before canonical occupancy hashing. The corpus activation endpoint
+first previews actual retained public records, then requires that preview digest
+when applying the migration. It does not manufacture sources for old examples.
+
+Each session remains bounded. Two candidate workers train from the same retained
+parent with different seeds, sharing the total epoch budget. Validation selects
+between candidates and the unchanged parent. Test labels do not choose a winner.
+Model records retain worker/backend details and training dataset provenance.
 
 Sites D1 stores boards, source groups, fixed splits, observation indices, model
 indices, training runs, search traces and decision records. R2 stores the full
@@ -85,8 +114,12 @@ discovery under the model's fixed finite observation policy. They are not P7
 construction probabilities, proven maxima or impossibility judgments.
 
 Rust evaluates the model using ordinary CPU arithmetic, including in WASM.
-Offline learning uses CPU PyTorch; the private Site uses TensorFlow.js core,
-layers and its CPU backend. No CUDA, WebGPU or WebGL backend is connected.
+Offline PyTorch and the private TensorFlow.js workers default to CPU. The Site
+can dynamically load its WebGL backend for GPU learning. Each active fit finishes
+before a changed GPU preference applies to the next fit; initialization/runtime
+failure retries on CPU from the retained start model. Rust placement search stays
+on CPU. Native PyTorch supports optional CUDA and ONNX Runtime supports optional
+CUDA inference with the drain/fallback boundaries described below.
 Neither public search ordering nor its archive exports automatically invoke CNN
 evaluation. `learnedOrdering.enabled` remains false for compatibility.
 
@@ -109,9 +142,16 @@ recorded so incomparable policies are not silently mixed.
 
 Whole opener families and search runs remain in one train/validation/test split.
 Descendants inherit their source group. Identical and reflected occupancy is
-deduplicated globally, while each stored physical witness retains its original
+deduplicated within its corpus, while each stored physical witness retains its original
 orientation. Checkpoint choice uses validation only; test records do not enter
 gradient updates or browser checkpoint selection.
+
+Retiring examples does not erase their historical split constraints. If a new
+run's fixed split conflicts with a known physical or reflected board in any
+retained corpus, the whole new run and its descendants are excluded from all
+three learning splits. Raw analysis evidence remains available. The actual
+`measurementGroup` is checked separately from a deduplicated board's original
+provenance. New snapshots record these exclusions explicitly.
 
 The browser dataset has a bounded recent-plus-coverage sample per split, with
 explicit total and selected counts. New observations can therefore enter training
@@ -145,7 +185,8 @@ and one selected successor. Predictions, allocated work, consumed work and actua
 outcomes are stored separately with the model and policy identity.
 
 Measured successor results may be associated with an ancestor only through exact
-physical board matches and certified bag bridges. Feedback retains witness
+physical board matches and certified bag bridges. Client-supplied bridges retain
+client-reported trust; they do not become independently verified by import. Feedback retains witness
 references, actual spins and locks across at most six bridges. It is a censored
 lower bound on an observed path, not an optimal completion value or a replacement
 for the ancestor's original two-bag label. Recording this feedback is distinct
@@ -183,7 +224,7 @@ python tools/learning/remote.py --help
 `prepare.py` imports only deep occupancy/provenance, groups sources and removes
 reflected duplicates. `neyra-label` collects new bounded continuations.
 `spin_contract.py` validates observations, model dimensions and hashes.
-`train.py` fits the CPU network and emits its model plus evaluation report.
+`train.py` fits the network with CPU as the default and emits its model plus evaluation report.
 `remote.py` uploads labels/models and checks the stored content by actual readback;
 it also downloads full private snapshots, including proofs and search traces.
 Use `NEYRA_SITE_URL` and `NEYRA_SITE_TOKEN` in the process environment for private
@@ -199,9 +240,10 @@ WASM exposes `evaluate_board`, `evaluate_board_model`, `spin_model_json`,
 ### Complete remote dataset refresh
 
 The bounded browser training sample is not the export dataset. An export captures
-committed rowid bounds and counts for **all** retained boards, labels, models,
+committed rowid bounds and counts for the **active corpus** boards and labels, plus models,
 training runs and traces. Later inserts appear in a new snapshot; earlier
-snapshots remain available. Mutable job leases and retry counters are excluded.
+snapshots remain available. Each new manifest records its corpus; manifests made
+before corpus isolation retain their original meaning. Mutable job leases and retry counters are excluded.
 Each manifest and page returns a SHA-256 of its exact UTF-8 bytes.
 
 With the private URL/token already supplied through the process environment:
@@ -220,7 +262,11 @@ atomically updating `latest.json`. Partial downloads never become the latest
 dataset; completed snapshot directories are never overwritten. Raw response
 pages and per-kind JSONL files remain available for inspection. Fixed and seeded
 labels are also written separately as `fixed-labels.jsonl` and
-`exploration-labels.jsonl`; ordinary training uses only fixed labels.
+`exploration-labels.jsonl`; ordinary training uses only fixed labels. These derived
+files honor the snapshot's `excludedTrainingGroups`, checking measurement and
+source/run groups. Full `labels.jsonl`, raw pages and received artifacts remain
+complete. The receipt records eligible/excluded counts and derived file hashes.
+Old snapshots without this optional exclusion list preserve their prior meaning.
 
 ### Reusing a retained checkpoint
 
@@ -250,24 +296,73 @@ rejects browser candidates with a specific compatibility message. Browser
 fine-tuning continues through the private worker; exported browser models and
 their selection history remain preserved for a later compatible importer.
 
+### Optional ONNX Runtime and CUDA
+
+`requirements-cpu.txt` retains the CPU PyTorch default. Install the optional pinned
+`requirements-onnx.txt` separately using the normal Python package index: the CPU
+requirements use the PyTorch CPU index. The optional export environment requires
+Python 3.12 or later.
+
+```sh
+python -m pip install -r tools/learning/requirements-cpu.txt
+python -m pip install -r tools/learning/requirements-onnx.txt
+python tools/learning/export_onnx.py \
+  --model /path/outside/repository/retained-model.json \
+  --boards /path/outside/repository/deep-boards.jsonl \
+  --output /path/outside/repository/model.onnx --checks 32 --threads 2
+python tools/learning/ort_inference.py \
+  --model /path/outside/repository/model.onnx --threads 2
+```
+
+Export checks dynamic-batch CPU outputs against the retained JSON checkpoint and
+writes an artifact/hash manifest. It never replaces the JSON or public model.
+The ORT command accepts JSONL boards (`{"rows":[24 row masks]}`) or batches
+(`{"boards":[...]}`). `{"control":{"gpu":true}}` requests CUDA; false requests CPU.
+The Python `set_gpu_enabled` API can receive a toggle while work is active. The
+current inference batch drains first; the next uses the new preference. Provider
+initialization or execution failures retry the same inputs on CPU.
+
+A CUDA host installs a compatible `onnxruntime-gpu` wheel **instead of** the CPU
+`onnxruntime` wheel, never both. Match the installed CUDA and cuDNN versions to the
+[official execution-provider requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+Do not assume that a current GPU wheel matches an arbitrary PyTorch CUDA build.
+A portable graph or provider listing alone is not evidence of GPU execution.
+
+PyTorch training accepts `--threads 2` (1–16), optional `--gpu`, and
+`--gpu-control /path/outside/repository/gpu-control.json`. The control file must
+contain exactly `{"gpu":true}` or `{"gpu":false}` and should be replaced atomically.
+Missing/malformed control requests CPU. The current epoch finishes before a new
+preference applies. GPU failure restores pre-epoch model weights **and** Adam
+optimizer state, then retries that epoch on CPU. Reports distinguish actual
+epoch devices, availability and fallback; `device: "cpu"` in the JSON checkpoint
+describes its portable inference contract, not where gradients ran.
+
+ONNX Runtime export concerns inference. PyTorch and TensorFlow.js remain the
+training backends; exporting a graph does not accelerate their backpropagation.
+No GPU switch changes the frozen public checkpoint or Rust search physics.
+
 ## Public queue and private persistence
 
 The public Pages origin cannot receive a private Site service credential.
-`supabase/contribution-schema.sql` and the `neyra-contribute` Edge Function form
+`supabase/contribution-schema.sql`, `supabase/observation-schema.sql` and the
+`neyra-contribute` Edge Function form
 a bounded bridge: Pages submits inputs with separately tagged untrusted traces,
-and the private Site pulls
+and full client-reported fixed-policy observations. The private Site pulls
 them with a separate server-only consumer secret.
 
 All queue/settings/quota tables enable RLS and deny anonymous/authenticated table
 access. Only the ingress service can admit fields; only the private consumer can
 pull or acknowledge them. Quotas bound batch size, daily volume and pending rows.
-The v3 ingress requires the current explicit consent envelope and rejects older
+The v3 trace and v4 observation ingress require the current explicit consent envelope and reject older
 default-on clients. A record key includes candidate identity and physical rows,
 so different retained paths to one board keep their own evidence. Training
 occupancy deduplication remains separate. Receipts include record key and depth
 so an old acknowledgement cannot hide a newly promoted field. Supabase is the
 transient queue; D1/R2 is the durable learning store. First-bag fields are
-explicitly excluded by the private importer.
+explicitly excluded by the private importer. Focused observations are FIFO,
+identity-keyed and removed only after durable private import. Their independent
+quota is 64 observations per run/day, 1,024 globally/day, at most 512 queued records
+and 128 MiB of queued payload. Public table/RPC access remains denied.
 
 The Site runtime needs `NEYRA_QUEUE_URL`, `NEYRA_QUEUE_ANON_KEY` and
 `NEYRA_QUEUE_SECRET`. The public build contains only the endpoint and public anon

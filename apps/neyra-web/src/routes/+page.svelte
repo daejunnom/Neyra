@@ -3,7 +3,7 @@
   import BoardPreview from '$lib/BoardPreview.svelte';
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
-  import { SearchClient, spinsPerBag, probabilityAdjustedSpinsPerBag, workerLimit, randomSeed, MAX_WORKERS } from '$lib/engine';
+  import { SearchClient, spinsPerBag, workerLimit, randomSeed, MAX_WORKERS } from '$lib/engine';
   import { ContributionClient, CONTRIBUTION_CONSENT_KEY, hasContributionConsent,
     contributionConsentValue, type ContributionState } from '$lib/contributions';
   import { contributionConfig } from '$lib/contribution-config';
@@ -31,11 +31,12 @@
   let savedMessage = '';
   let notice = '';
   let availableWorkers = 1;
+  let selectedDepth = 0;
   let contributions: ContributionClient;
-  let contributionState: ContributionState = { enabled: false, phase: 'disabled', queued: 0, acknowledged: 0, dropped: 0 };
+  let contributionState: ContributionState = { enabled: false, phase: 'disabled', queued: 0, observationQueued: 0, acknowledged: 0, dropped: 0 };
   $: contributionLabel = !contributionState.enabled ? '자료 제공 꺼짐' :
     contributionState.phase === 'unavailable' ? '자료 전송 연결을 확인하고 있어요.' :
-    contributionState.phase === 'sending' ? '확정 필드를 보내고 있어요.' :
+    contributionState.phase === 'sending' ? '탐색 자료 전송 중' :
     contributionState.phase === 'retrying' ? '연결을 기다린 뒤 다시 전송해요.' :
     contributionState.phase === 'paused' ? '전송을 기다리고 있어요. 다시 시도할 수 있습니다.' :
     contributionState.acknowledged ? `${number.format(contributionState.acknowledged)}개 전송 완료` : '확정된 가방 필드부터 전송해요.';
@@ -70,15 +71,17 @@
   $: selectedRoute = snapshot?.selectedCandidate ?? null;
   $: bestRoute = selectedRoute ?? recommendedRoute;
   $: bagCandidates = snapshot?.bestByBag ?? [];
+  $: depthGroup = bagCandidates.find((group) => group.bagCount === selectedDepth) ?? bagCandidates[bagCandidates.length - 1] ?? null;
+  $: learningFocus = snapshot?.learningFocus;
+  $: focusedBoard = view === 'current' && learningFocus?.enabled ? learningFocus.rows : null;
   $: foundationOnly = !!bestRoute && !bestRoute.complete && bestRoute.bagCount === 1;
-  $: bagProbabilities = bestRoute?.bagProbabilities ?? [];
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
   $: if (client) client.observeCurrent(view === 'current');
   $: frames = candidate?.frames ?? [];
   $: selectedIndex = view === 'current' || frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
   $: frame = frames[selectedIndex];
-  $: boardRows = view === 'current' ? candidate?.rows ?? [] : frame?.rows ?? candidate?.rows ?? [];
-  $: boardColors = piecePlayback(frames, selectedIndex);
+  $: boardRows = focusedBoard ?? (view === 'current' ? candidate?.rows ?? [] : frame?.rows ?? candidate?.rows ?? []);
+  $: boardColors = focusedBoard ? undefined : piecePlayback(frames, selectedIndex);
   $: boardSpins = view === 'current' ? candidate?.spins ?? 0 : frame?.spins ?? candidate?.spins ?? 0;
   $: boardPlaced = view === 'current' ? candidate?.placed ?? 0 : frame?.placed ?? candidate?.placed ?? 0;
   $: if (view === 'current') playing = false;
@@ -102,42 +105,16 @@
     playing = false;
   }
 
-  function percent(value: number) {
-    if (!Number.isFinite(value)) return '—';
-    return (Math.max(0, Math.min(1, value)) * 100).toLocaleString('ko-KR', { maximumFractionDigits: 2 }) + '%';
-  }
   function time(ms: number) {
     const total = Math.floor(ms / 1000);
     return String(Math.floor(total / 60)).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
   }
-  function coverageLabel(item: Candidate | null | undefined) {
-    if (!item) return '—';
-    if (item.verified) return percent(item.probability);
-    if (item.lowerProbability === item.upperProbability) return percent(item.lowerProbability);
-    return percent(item.lowerProbability) + '–' + percent(item.upperProbability);
-  }
-  function budgetCoverageLabel(item: Candidate) {
-    const point = item.cdf.find((entry) => entry.pieces === item.budgetPieces);
-    return point ? percent(point.probability) : coverageLabel(item);
-  }
   function efficiencyLabel(item: Candidate) {
     return spinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-  function adjustedEfficiencyLabel(item: Candidate) {
-    return probabilityAdjustedSpinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   function evaluationLabel(item: Candidate | null) {
     if (!item || !Number.isFinite(item.fieldQuality)) return '—';
     return evaluationNumber.format(Math.abs(item.fieldQuality) < 0.05 ? 0 : item.fieldQuality);
-  }
-  function verificationLabel(item: Candidate | null) {
-    if (!item) return '발견한 후보의 구축률을 여기에 표시합니다.';
-    if (!item.verified && item.checked === 0) return '선택한 후보 · 구축률 미검증';
-    const scope = conditionalProbability ? '2가방부터' : item.verified ? '선택한 후보 구축률' : '구축률 확인 중';
-    const first = conditionalProbability && item.firstBagProbability != null
-      ? ` · 첫 가방 ${percent(item.firstBagProbability)}` : '';
-    const symmetry = item.firstBagSymmetryAssumed ? ' · 대칭 가정' : '';
-    return `${scope} · ${coverageLabel(item)}${first}${symmetry}`;
   }
   function receive(event: EngineEvent) {
     if (event.type === 'progress') {
@@ -165,8 +142,14 @@
   onMount(() => {
     availableWorkers = workerLimit();
     clipboardAvailable = typeof navigator.clipboard?.writeText === 'function';
-    contributions = new ContributionClient(contributionConfig, (value) => contributionState = value);
-    client = new SearchClient(receive, (field) => contributions.enqueue(field));
+    contributions = new ContributionClient(contributionConfig, (value) => {
+      contributionState = value;
+      client?.setObservationTransport(value);
+    },
+      (delivery) => client?.observationDelivery(delivery.id, delivery.status));
+    client = new SearchClient(receive, (field) => contributions.enqueue(field),
+      (observation) => contributions.enqueueObservation(observation));
+    client.setObservationTransport(contributionState);
     const entrySeed = randomSeed();
     config = { ...defaultConfig, seed: entrySeed, cnn_evaluation: false };
     try {
@@ -447,12 +430,40 @@
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? selectedRoute ? '선택한 경로 필드' : '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={focusedBoard ? '후속 스핀을 관측하는 출발 필드' : view === 'best' ? selectedRoute ? '선택한 경로 필드' : '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate && !focusedBoard} /></div>
         <div class="field-summary">
+          {#if focusedBoard}
+          <div class="field-stat primary"><span>관측한 후속 스핀</span><strong>{learningFocus?.latestObservedSpins ?? '…'}<small>/ 2가방</small></strong></div>
+          <div class="field-stat"><span>관측 완료</span><strong>{learningFocus?.completed ?? 0}<small>필드</small></strong></div>
+          <div class="field-stat"><span>출발 가방</span><strong>{learningFocus?.activeBag ?? '—'}</strong></div>
+          <div class="candidate-label">{learningFocus?.active ? '후속 스핀 확인 중' : '관측 필드'}</div>
+          {:else}
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
           <div class="field-stat"><span>현재 가방</span><strong>{candidate ? Math.max(1, Math.ceil(boardPlaced / 7)) : '—'}</strong></div>
           <div class="candidate-label" class:complete={candidate?.complete}>{candidate?.complete ? '완주 후보' : candidate?.verified && candidate.qualified ? '검증 통과' : candidate ? '탐색 후보' : '빈 필드'}</div>
+          {/if}
+          <section class="depth-results" aria-label="가방 수별 최적과 차선 후보">
+            <label for="candidate-depth">가방 수별 후보</label>
+            <select id="candidate-depth" aria-label="후보 가방 수" value={depthGroup?.bagCount ?? 0}
+              disabled={!depthGroup} onchange={(event) => selectedDepth = Number(event.currentTarget.value)}>
+              {#if !depthGroup}<option value={0}>후보 대기 중</option>{/if}
+              {#each bagCandidates as group (group.bagCount)}<option value={group.bagCount}>{group.bagCount}가방 · {group.best.spins}스핀</option>{/each}
+            </select>
+            {#if depthGroup}
+              {#each [depthGroup.best, depthGroup.runnerUp] as item, rank}
+                {#if item}
+                  <button class="depth-candidate" class:selected={selectedRoute?.id === item.id}
+                    data-candidate-id={item.id} aria-pressed={selectedRoute?.id === item.id}
+                    aria-label={`${depthGroup.bagCount}가방 ${rank === 0 ? '최적' : '차선'} 후보, ${item.spins}스핀, ${efficiencyLabel(item)}스핀/가방`}
+                    onclick={() => selectRoute(item)}>
+                    <span><span>{rank === 0 ? '최적' : '차선'}</span><strong>{item.spins}스핀</strong></span>
+                    <small>{efficiencyLabel(item)}/가방 · 필드 {evaluationLabel(item)}</small>
+                  </button>
+                {:else}<span class="depth-empty">차선 후보 대기 중</span>{/if}
+              {/each}
+            {:else}<p>같은 깊이의 두 경로를 비교해요.</p>{/if}
+          </section>
         </div>
       </div>
 
@@ -471,10 +482,9 @@
         <h2>{status === 'idle' ? '가능성을 탐색하세요.' : status === 'paused' ? '잠시 쉬어가는 중.' : status === 'cancelled' ? '여기까지 탐색했어요.' : status === 'completed' ? '이번 탐색을 마쳤어요.' : status === 'failed' ? '다시 시작할 수 있어요.' : '다음 빌드를 찾는 중.'}</h2>
         <p class="run-description">{status === 'idle' ? '빈 필드에서 40번의 스핀 싱글을 완성할 새로운 구축을 찾습니다.' : status === 'paused' ? '지금까지의 결과는 그대로 유지됩니다.' : status === 'cancelled' || status === 'completed' ? '발견한 후보를 확인하거나 새 탐색을 시작하세요.' : status === 'failed' ? '아래 내용을 확인한 뒤 탐색을 다시 시작해 주세요.' : '발견한 구조와 검증 상황이 실시간으로 갱신됩니다.'}</p>
         <div class="goal-summary">
-          <div><span>전체 성공률{conditionalProbability ? ' · 2가방부터' : ''}</span><strong>{displayedConfig.min_success_percent}%{#if displayedConfig.min_success_percent < 100}<small> 이상</small>{/if}</strong></div>
+          <div><span>탐색 상한</span><strong>{displayedConfig.max_pieces}<small> 미노</small></strong></div>
           <div><span>미노 제한</span><strong>{displayedConfig.piece_goal}<small> 미노</small></strong></div>
         </div>
-        <p class="bag-floor-summary">가방별 {displayedConfig.bag_min_success_percent}%{displayedConfig.bag_min_success_percent < 100 ? ' 이상' : ''} · 첫 가방 {displayedConfig.first_bag_min_success_percent > 0 ? `${displayedConfig.first_bag_min_success_percent}% 이상` : '제한 없음'}<br />2가방부터 {displayedConfig.risk_min_spins_per_bag > 0 ? `${displayedConfig.risk_min_spins_per_bag}스핀 미만은 100%` : '확률 완화 스핀 제한 없음'}</p>
         <div class="run-actions">
           {#if status === 'running' || status === 'loading'}
             <button class="button primary" onclick={pause} disabled={status === 'loading'}><Icon name="pause" size={16} />일시정지</button>
@@ -501,8 +511,9 @@
         <p class="verified-progress">검증 통과 최대 {snapshot?.qualifiedSpins ?? 0}스핀<span>{snapshot?.workers ?? 0}개 동시 탐색</span></p>
         <section class="contribution-status" aria-label="CNN 학습 자료 제공">
           <div><label><input type="checkbox" checked={contributionState.enabled} onchange={(event) => setDataSharing(event.currentTarget.checked)} />학습 자료 제공</label><span>학습 OFF</span></div>
-          <p>기본은 꺼짐입니다. 직접 켜면 이후의 실제 탐색 과정과 확정 필드·시드·탐색 설정을 CNN 학습 자료로 보내요. 탐색은 기존 알고리즘으로 진행합니다.</p>
+          <p>켜면 선택한 필드에서 후속 스핀을 깊게 탐색해 결과를 전송합니다.</p>
           <div class="contribution-progress" role="status"><span>{contributionLabel}{#if contributionState.queued > 0} · 대기 {contributionState.queued}개{/if}</span>{#if contributionState.phase === 'paused'}<button class="text-button" onclick={() => contributions.retry()}>다시 전송</button>{/if}</div>
+          {#if learningFocus?.enabled}<div class="learning-focus" role="status"><span>관측 {learningFocus.completed}개 · 가장 깊은 출발 {learningFocus.deepestOriginBag || '—'}가방</span><span>{learningFocus.active ? `${learningFocus.active}개 진행` : learningFocus.awaitingDelivery ? '전송 대기' : '출발 필드 대기'}</span></div>{/if}
           {#if contributionState.dropped > 0}<small>전송하지 못한 필드 {contributionState.dropped}개 · 보관된 경로는 아래에서 파일로 저장할 수 있어요.</small>{/if}
         </section>
       </section>
@@ -510,20 +521,20 @@
       <section class="best-section" aria-label="현재 최선 결과">
         <div class="section-heading"><h3><Icon name="spark" size={16} />{selectedRoute ? `${selectedRoute.bagCount}가방 경로` : bestRoute?.complete ? '최선 완주' : '최선 경로'}</h3><div class="result-actions">
           <select bind:value={exportFormat} disabled={exportBusy} aria-label="내보내기 형식"><option value="ctk3">CTK3</option><option value="fumen">Fumen</option></select>
-          <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('download')} aria-label="선택한 후보 저장" title="문서 다운로드"><Icon name="download" size={15} /></button>
-          <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('copy')} aria-label="선택한 후보 복사" title="클립보드 복사"><Icon name="copy" size={15} /></button>
+          <button class="icon-button" disabled={!candidate || exportBusy || !!focusedBoard} onclick={() => exportResult('download')} aria-label="선택한 후보 저장" title="문서 다운로드"><Icon name="download" size={15} /></button>
+          <button class="icon-button" disabled={!candidate || exportBusy || !!focusedBoard} onclick={() => exportResult('copy')} aria-label="선택한 후보 복사" title="클립보드 복사"><Icon name="copy" size={15} /></button>
         </div></div>
         {#if selectedRoute}<div class="route-selection"><span>선택한 경로를 보고 있어요.</span><button class="text-button" onclick={followRecommended}>추천 경로로 돌아가기</button></div>{/if}
         {#if bestRoute}
           <button class="best-card" data-candidate-id={bestRoute.id} onclick={() => view = 'best'}>
-            {#if !bestRoute.complete}<span class="efficiency-caption">{foundationOnly ? '첫 가방 기반 평가' : '성공률 반영 효율'}{#if !foundationOnly && bestRoute.probability < 1}<small>실제 {efficiencyLabel(bestRoute)}스핀/가방</small>{/if}</span>{/if}
+            {#if !bestRoute.complete}<span class="efficiency-caption">{foundationOnly ? '첫 가방 기반 평가' : '스핀 효율'}</span>{/if}
             <div>
               {#if bestRoute.complete}
                 <strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong>
               {:else if foundationOnly}
                 <strong title="첫 가방의 작업 공간, 후속 스핀 가능성과 배치 의존성 평가">{evaluationLabel(bestRoute)}<span> 점</span></strong>
               {:else}
-                <strong title={`실제 ${efficiencyLabel(bestRoute)}스핀/가방에 ${conditionalProbability ? '2가방부터의 ' : ''}전체 성공률을 반영한 값`}>{adjustedEfficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong>
+                <strong>{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong>
               {/if}
               <span class="best-card-meta">
                 <span class="verified-tag"><Icon name="check" size={12} />{bestRoute.complete ? '완주' : `${bestRoute.bagCount}가방`}</span>
@@ -531,60 +542,14 @@
               </span>
             </div>
             {#if bestRoute.complete}
-              <p>{budgetCoverageLabel(bestRoute)} {conditionalProbability ? '2가방부터 성공률' : '성공률'} <Icon name="arrow" size={13} /></p>
+              <p>{bestRoute.spins}스핀 완주 · {bestRoute.bagCount}가방 <Icon name="arrow" size={13} /></p>
             {:else}
-              <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
+              <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 <Icon name="arrow" size={13} /></p>
             {/if}
           </button>
-          {#if bagProbabilities.length > 0}
-            <section class="bag-chances" aria-label={selectedRoute ? '선택한 경로의 가방별 구축률' : '최선 경로의 가방별 구축률'}>
-              <h4>가방별 구축률</h4>
-              <ol>
-                {#each bagProbabilities as probability, bag}
-                  <li><span>{bag + 1}가방{#if bag === 0 && conditionalProbability}<small>전체 제외</small>{/if}</span><strong>{percent(probability)}</strong></li>
-                {/each}
-              </ol>
-            </section>
-          {/if}
         {:else}
           <div class="best-empty"><span class="empty-line"></span><div class="best-empty-heading"><strong>첫 가방을 확인하고 있어요.</strong><span class="field-evaluation">필드 평가 <b>—</b></span></div><p>첫 가방은 후속 스핀을 위한 기반의 품질로 비교합니다.</p></div>
         {/if}
-        {#if bagCandidates.length > 0}
-          <section class="depth-results" aria-label="가방 수별 최적과 차선 후보">
-            <h4>가방 수별 후보</h4>
-            <div class="depth-table-wrap">
-              <table>
-                <thead><tr><th scope="col">가방</th><th scope="col">최적</th><th scope="col">차선</th></tr></thead>
-                <tbody>
-                  {#each bagCandidates as group (group.bagCount)}
-                    <tr>
-                      <th scope="row">{group.bagCount}</th>
-                      {#each [group.best, group.runnerUp] as item, rank}
-                        <td>
-                          {#if item}
-                            <button class="depth-candidate" class:selected={selectedRoute?.id === item.id}
-                              data-candidate-id={item.id}
-                              aria-pressed={selectedRoute?.id === item.id}
-                              aria-label={`${group.bagCount}가방 ${rank === 0 ? '최적' : '차선'} 후보, ${item.spins}스핀, ${efficiencyLabel(item)}스핀/가방, 성공률 ${coverageLabel(item)}`}
-                              onclick={() => selectRoute(item)}>
-                              <span><strong>{item.spins}스핀</strong><span>{efficiencyLabel(item)}<small>/가방</small></span></span>
-                              <small>{coverageLabel(item)} · 필드 {evaluationLabel(item)}</small>
-                            </button>
-                          {:else}<span class="depth-empty">아직 없음</span>{/if}
-                        </td>
-                      {/each}
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-            <p>첫 가방은 기반 품질, 이후는 성공률을 반영한 스핀/가방으로 비교해요.</p>
-          </section>
-        {/if}
-        {#if candidate?.complete && !candidate.qualified}
-          <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
-        {/if}
-        <p class="verification-note">{verificationLabel(candidate)}</p>
         <div class="learning-export"><button class="text-button" disabled={bagCandidates.length === 0 && !bestRoute?.verified} onclick={exportTrainingFields} title="보관된 가방별 후보와 선택한 경로의 검증된 경계 필드를 JSONL로 저장합니다."><Icon name="download" size={12} />학습 필드 저장</button></div>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
@@ -622,12 +587,12 @@
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
   <p>일반 배치는 홀드 없이 가능한지 확인하며, 홀드와 성공률 기준은 줄을 지우는 전개에 적용합니다.</p>
-  <p><strong>최선 경로</strong>에서는 미노별 배치를 재생할 수 있고, <strong>탐색 중</strong>에서는 후보의 마지막 필드만 보여 줍니다. 오른쪽에서 작업 진척도와 가방별 구축률을 확인할 수 있습니다.</p>
-  <p><strong>가방 수별 후보</strong>에서 같은 가방 수의 최적·차선 경로를 골라 재생하고 저장할 수 있습니다. 선택한 경로는 탐색이 진행되어도 유지되며, 추천 경로로 돌아가면 새 최선 결과를 따라갑니다.</p>
+  <p><strong>최선 경로</strong>에서는 미노별 배치를 재생할 수 있고, <strong>탐색 중</strong>에서는 후보의 마지막 필드만 보여 줍니다. 오른쪽에서 작업 진척도를 확인할 수 있습니다.</p>
+  <p>보드 오른쪽 아래의 <strong>가방 수별 후보</strong>에서 가방을 선택하고 같은 깊이의 최적·차선 경로를 골라 재생하고 저장할 수 있습니다. 선택한 경로는 탐색이 진행되어도 유지되며, 추천 경로로 돌아가면 새 최선 결과를 따라갑니다.</p>
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
-  <p>이 화면은 기존 알고리즘으로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 이후의 실제 탐색 과정과 확정 필드·시드·탐색 설정을 개발자 전용 CNN 학습 화면에 보냅니다. 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
+  <p>이 화면은 기존 알고리즘으로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 검증된 2가방 이후 필드를 시작점으로 제한된 후속 탐색을 수행하고, 실제 관측한 스핀과 결과 필드·시드·설정을 개발자 전용 CNN 학습 화면에 보냅니다. 이어서 결과 필드를 새 시작점으로 사용하므로 더 깊은 가방에서도 자료를 모읍니다. 학습 자료를 만들 때에도 기존 탐색 알고리즘과 선택한 동시 탐색 수를 사용합니다. 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

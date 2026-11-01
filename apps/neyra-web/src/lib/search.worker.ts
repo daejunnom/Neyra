@@ -1,4 +1,4 @@
-import type { Candidate, EngineCommand, EngineEvent, SearchSnapshot } from './types';
+import type { Candidate, EngineCommand, EngineEvent, FocusedInput, FocusedSpinLabel, SearchSnapshot } from './types';
 
 type WasmEngine = {
   advance(work: number): void;
@@ -11,6 +11,8 @@ type WasmEngine = {
 type WasmModule = {
   default(options: { module_or_path: string }): Promise<unknown>;
   NeyraEngine: new (config: string) => WasmEngine;
+  label_board(input: string, config: string): string;
+  spin_model_json(): string;
 };
 
 const scope = globalThis as unknown as {
@@ -31,6 +33,11 @@ let detailedCurrentKey = '';
 let modulePromise: Promise<WasmModule> | undefined;
 let bestSpinsByBag = Array<number>(101).fill(0);
 let bagRecordVersions = new Map<string, string>();
+let loadedModule: WasmModule | null = null;
+let fixedLabelConfig = '';
+let learningEnabled = false;
+let pendingObservation: { id: string; input: FocusedInput } | null = null;
+let waitingObservationDecision = false;
 
 function send(message: EngineEvent) { scope.postMessage(message); }
 
@@ -169,6 +176,23 @@ tasks.port1.onmessage = ({ data }: MessageEvent<number>) => {
 function tick() {
   if (!running || !engine) return;
   try {
+    if (learningEnabled && pendingObservation && loadedModule) {
+      const job = pendingObservation;
+      pendingObservation = null;
+      // The collector is unchanged. Only the supplied origin is chosen deeply;
+      // a completed bounded job yields before another one is assigned.
+      waitingObservationDecision = true;
+      try {
+        fixedLabelConfig ||= JSON.stringify(JSON.parse(loadedModule.spin_model_json()).labelConfig);
+        const label = JSON.parse(loadedModule.label_board(JSON.stringify(job.input), fixedLabelConfig)) as FocusedSpinLabel;
+        send({ type: 'observation', runId, observationId: job.id, label });
+      } catch (error) {
+        send({ type: 'observation-error', runId, observationId: job.id,
+          message: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+    if (learningEnabled && waitingObservationDecision) return;
     const started = performance.now();
     do { engine.advance(1); } while (performance.now() - started < 12);
     if (performance.now() - lastSnapshot >= 200) {
@@ -194,11 +218,15 @@ scope.onmessage = async ({ data }) => {
     detailedCurrentKey = '';
     bestSpinsByBag.fill(0);
     bagRecordVersions.clear();
+    pendingObservation = null;
+    waitingObservationDecision = false;
+    learningEnabled = data.learningEnabled === true;
     runId = data.runId;
     const requestedId = runId;
     try {
       const module = await wasm(data.assetBase, data.assetVersion);
       if (runId !== requestedId) return;
+      loadedModule = module;
       // Pause/cancel can arrive while the async module is loading.
       // Public Pages always runs the established search. A stale saved config
       // or an old caller must not re-enable learned ordering or training here.
@@ -214,6 +242,30 @@ scope.onmessage = async ({ data }) => {
     return;
   }
   if (data.runId !== runId) return;
+  if (data.type === 'learning-mode') {
+    learningEnabled = data.enabled;
+    if (!learningEnabled) { pendingObservation = null; waitingObservationDecision = false; }
+    if (running) schedule();
+    return;
+  }
+  if (data.type === 'observe') {
+    if (learningEnabled && requested !== 'cancelled') {
+      pendingObservation = { id: data.observationId, input: data.input };
+      waitingObservationDecision = false;
+      if (running) schedule();
+    }
+    return;
+  }
+  if (data.type === 'observation-idle') {
+    pendingObservation = null;
+    waitingObservationDecision = false;
+    if (running) schedule();
+    return;
+  }
+  if (data.type === 'observation-wait') {
+    if (learningEnabled) waitingObservationDecision = true;
+    return;
+  }
   if (data.type === 'benchmarks') {
     try { if (requested !== 'cancelled') observeBenchmarks(data.bestSpinsByBag); }
     catch (error) { fail(error); }
@@ -265,6 +317,8 @@ scope.onmessage = async ({ data }) => {
       requested = 'cancelled';
       running = false;
       invalidateTask();
+      pendingObservation = null;
+      waitingObservationDecision = false;
       snapshot();
       send({ type: 'status', runId, status: 'cancelled' });
     }

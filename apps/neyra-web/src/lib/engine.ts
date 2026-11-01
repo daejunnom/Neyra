@@ -1,5 +1,8 @@
-import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RetainedSearchTrace, RunStatus,
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, FocusedObservation,
+  FocusedSpinLabel, LearningFocusStatus, RetainedSearchTrace, RunStatus,
   SearchConfig, SearchRecordCounters, SearchSnapshot, TrainingContribution, TrainingField } from './types';
+import { FocusedFrontier, focusedDescendants, focusedRoot, type FocusedOrigin } from './focused-learning';
+import { MAX_PENDING_OBSERVATIONS, type ContributionState, type ObservationDelivery } from './contributions';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
 
@@ -10,6 +13,8 @@ type WorkerSlot = {
   snapshot: SearchSnapshot | null;
   incumbent: { candidate: Candidate; data: unknown } | null;
   watching: boolean;
+  focusedJob: { id: string; sequence: number; origin: FocusedOrigin } | null;
+  focusedWaiting: boolean;
 };
 type OwnedCandidate = { slot: WorkerSlot; candidate: Candidate };
 type ArchivedCandidate = OwnedCandidate & { data: unknown };
@@ -142,13 +147,62 @@ export class SearchClient {
   private bestSpinsByBag = Array<number>(101).fill(0);
   private shareSpinBenchmarks = true;
   private contributionEnabled = false;
+  private focusedFrontier = new FocusedFrontier();
+  private awaitingObservations = new Map<string, FocusedObservation>();
+  private observationSequence = 0;
+  private focusedCompleted = 0;
+  private focusedFailed = 0;
+  private deepestFocusedOrigin = 0;
+  private focusedDisplay: { id: string; origin: FocusedOrigin; observedSpins: number | null } | null = null;
+  private observationTransportPending = 0;
+  private observationTransportReady = true;
 
   constructor(private receive: (event: EngineEvent) => void,
-    private contribute: (field: TrainingContribution) => void = () => {}) {}
+    private contribute: (field: TrainingContribution) => void = () => {},
+    private contributeObservation: (observation: FocusedObservation) => boolean = () => false) {}
 
-  /** Collection starts with future record events; existing UI archives are not backfilled. */
+  /** Existing archives may seed new bounded work. Their past traces are never backfilled. */
   setContributionEnabled(enabled: boolean) {
+    if (enabled === this.contributionEnabled) return;
     this.contributionEnabled = enabled;
+    if (!enabled) {
+      this.focusedFrontier.clear(false);
+      this.awaitingObservations.clear();
+    }
+    for (const slot of this.slots) {
+      if (['failed', 'completed', 'cancelled'].includes(slot.status)) continue;
+      if (!enabled) { slot.focusedJob = null; slot.focusedWaiting = false; }
+      slot.worker.postMessage({ type: 'learning-mode', runId: this.runId, enabled } satisfies EngineCommand);
+    }
+    if (enabled && this.intent !== 'cancelled') {
+      for (const field of this.trainingFields()) {
+        const origin = focusedRoot(field);
+        if (origin) this.focusedFrontier.add(origin);
+      }
+      this.scheduleFocused();
+    }
+    this.publishProgress(true);
+  }
+
+  /** A descendant cannot be collected until its parent is safely in the relay.
+   * Failed/rejected parents retain no runnable descendants. */
+  observationDelivery(id: string, status: ObservationDelivery['status']) {
+    const observation = this.awaitingObservations.get(id);
+    if (!observation || !this.contributionEnabled) return;
+    this.awaitingObservations.delete(id);
+    if (status === 'acknowledged') {
+      for (const origin of focusedDescendants(observation)) this.focusedFrontier.add(origin);
+    } else this.focusedFailed++;
+    this.scheduleFocused();
+    this.publishProgress(true);
+  }
+
+  /** Include pending labels from an earlier run in this tab's work cap. */
+  setObservationTransport(state: ContributionState) {
+    this.observationTransportPending = state.observationQueued;
+    this.observationTransportReady = state.enabled &&
+      !['disabled', 'unavailable', 'paused'].includes(state.phase);
+    this.scheduleFocused();
   }
 
   start(config: SearchConfig) {
@@ -171,7 +225,7 @@ export class SearchClient {
         worker = new Worker(new URL('./search.worker.ts', import.meta.url), { type: 'module' });
         const id = this.slots.length;
         const slot: WorkerSlot = { id, worker, status: 'loading', snapshot: null, incumbent: null,
-          watching: this.observingCurrent && id === 0 };
+          watching: this.observingCurrent && id === 0, focusedJob: null, focusedWaiting: false };
         worker.onmessage = (event: MessageEvent<EngineEvent>) => {
           if (this.runId !== runId || event.data.runId !== runId) return;
           this.handle(slot, event.data);
@@ -193,7 +247,8 @@ export class SearchClient {
           type: 'start', runId,
           config: { ...engineConfig, cnn_evaluation: false, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
-          assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching
+          assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching,
+          learningEnabled: this.contributionEnabled
         } satisfies EngineCommand);
       } catch (error) {
         this.failed(slot, error instanceof Error ? error.message : String(error));
@@ -228,11 +283,15 @@ export class SearchClient {
     this.intent = 'running';
     this.nextFocusAt = performance.now() + 2000;
     this.broadcast('resume');
+    this.scheduleFocused();
     this.publishStatus();
   }
 
   cancel() {
     this.intent = 'cancelled';
+    this.focusedFrontier.clear(false);
+    this.awaitingObservations.clear();
+    for (const slot of this.slots) slot.focusedJob = null;
     this.broadcast('cancel');
     this.publishStatus();
   }
@@ -390,6 +449,82 @@ export class SearchClient {
     if (!trace) return;
     // Data transport is optional and must never interrupt search or alter a record.
     try { this.contribute({ ...field, trace }); } catch { /* The transport reports its own state. */ }
+    const origin = focusedRoot(field);
+    if (origin) this.focusedFrontier.add(origin);
+    this.scheduleFocused();
+  }
+
+  private focusedStatus(): LearningFocusStatus {
+    return { enabled: this.contributionEnabled,
+      active: this.slots.filter((slot) => slot.focusedJob !== null).length,
+      queued: this.focusedFrontier.length, awaitingDelivery: this.awaitingObservations.size,
+      completed: this.focusedCompleted, failed: this.focusedFailed,
+      deepestOriginBag: this.deepestFocusedOrigin,
+      activeBag: this.focusedDisplay?.origin.input.source.bagBoundary ?? null,
+      latestObservedSpins: this.focusedDisplay?.observedSpins ?? null,
+      rows: this.focusedDisplay ? [...this.focusedDisplay.origin.input.rows] : null };
+  }
+
+  private scheduleFocused() {
+    if (!this.contributionEnabled || this.intent !== 'running' || !this.runId) return;
+    let occupied = Math.max(this.awaitingObservations.size, this.observationTransportPending) +
+      this.slots.filter((slot) => slot.focusedJob !== null).length;
+    const available = this.slots.filter((slot) => slot.status === 'running');
+    for (const slot of available) {
+      if (slot.focusedJob || !this.observationTransportReady ||
+          occupied >= MAX_PENDING_OBSERVATIONS || this.observationSequence >= 1_000_000) continue;
+      const origin = this.focusedFrontier.take();
+      if (!origin) break;
+      const sequence = ++this.observationSequence;
+      const id = `${this.runId}:observation-${sequence}`;
+      slot.focusedJob = { id, sequence, origin };
+      slot.focusedWaiting = false;
+      this.focusedDisplay = { id, origin, observedSpins: null };
+      this.deepestFocusedOrigin = Math.max(this.deepestFocusedOrigin, origin.input.source.bagBoundary);
+      occupied++;
+      slot.worker.postMessage({ type: 'observe', runId: this.runId, observationId: id, input: origin.input } satisfies EngineCommand);
+    }
+    const focusing = occupied > 0 || this.focusedFrontier.length > 0;
+    for (const slot of available) {
+      if (slot.focusedJob || slot.focusedWaiting === focusing) continue;
+      slot.focusedWaiting = focusing;
+      slot.worker.postMessage({ type: focusing ? 'observation-wait' : 'observation-idle', runId: this.runId } satisfies EngineCommand);
+    }
+  }
+
+  private observed(slot: WorkerSlot, observationId: string, label: FocusedSpinLabel | null) {
+    const job = slot.focusedJob;
+    // Withdrawal invalidates the job before its synchronous collector yields.
+    // An immediate OFF→ON must not revive that old result under new consent.
+    if (!job || job.id !== observationId || !this.contributionEnabled) return;
+    slot.focusedJob = null;
+    slot.focusedWaiting = true;
+    if (!label || label.schemaVersion !== 2 || label.task !== 'naga-spin-observations-v2' ||
+        label.policy !== 'neyra-fixed-bag-continuation-v2' ||
+        label.input?.id !== job.origin.input.id ||
+        label.input.rows.length !== job.origin.input.rows.length ||
+        label.input.rows.some((row, y) => row !== job.origin.input.rows[y]) ||
+        Object.keys(label.input.source).length !== Object.keys(job.origin.input.source).length ||
+        Object.entries(job.origin.input.source).some(([key, value]) =>
+          (label.input.source as unknown as Record<string, unknown>)[key] !== value)) {
+      this.focusedFailed++;
+    } else {
+      this.focusedCompleted++;
+      if (this.focusedDisplay?.id === job.id) this.focusedDisplay.observedSpins = label.targets.observedSpins;
+      const observation: FocusedObservation = { schemaVersion: 1, kind: 'focused-spin-observation',
+        id: job.id, runId: this.runId, rootCandidateId: job.origin.rootCandidateId,
+        sequence: job.sequence, parentObservationId: job.origin.parentObservationId,
+        parentWitnessId: job.origin.parentWitnessId, label };
+      this.awaitingObservations.set(observation.id, observation);
+      let accepted = false;
+      try { accepted = this.contributeObservation(observation); } catch { /* Transport reports its own state. */ }
+      if (!accepted) {
+        this.awaitingObservations.delete(observation.id);
+        this.focusedFailed++;
+      }
+    }
+    this.scheduleFocused();
+    this.publishProgress(true);
   }
 
   dispose() {
@@ -401,6 +536,13 @@ export class SearchClient {
     this.bagRecords.clear();
     this.selectedArchive = null;
     this.bestSpinsByBag.fill(0);
+    this.focusedFrontier.clear();
+    this.awaitingObservations.clear();
+    this.observationSequence = 0;
+    this.focusedCompleted = 0;
+    this.focusedFailed = 0;
+    this.deepestFocusedOrigin = 0;
+    this.focusedDisplay = null;
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
     this.runConfig = null;
@@ -423,6 +565,13 @@ export class SearchClient {
       // A start acknowledgement can arrive after pause/cancel was requested.
       // Keep waiting for the matching control acknowledgement from every worker.
       slot.status = message.status;
+      if (message.status === 'completed' && slot.focusedJob) {
+        this.focusedFrontier.release(slot.focusedJob.origin);
+        slot.focusedJob = null;
+        slot.focusedWaiting = false;
+        slot.worker.postMessage({ type: 'observation-idle', runId: this.runId } satisfies EngineCommand);
+      }
+      this.scheduleFocused();
       this.publishStatus();
       this.publishProgress(true);
     } else if (message.type === 'incumbent') {
@@ -435,6 +584,10 @@ export class SearchClient {
     } else if (message.type === 'bag-record') {
       this.retainBagRecord(slot, message.candidate, message.data, message.counters);
       this.publishProgress();
+    } else if (message.type === 'observation') {
+      this.observed(slot, message.observationId, message.label);
+    } else if (message.type === 'observation-error') {
+      this.observed(slot, message.observationId, null);
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
     } else if (message.type === 'export' || message.type === 'export-error') {
@@ -464,6 +617,8 @@ export class SearchClient {
   private failed(slot: WorkerSlot, message: string) {
     if (slot.status === 'failed') return;
     slot.status = 'failed';
+    if (slot.focusedJob) this.focusedFailed++;
+    slot.focusedJob = null;
     slot.worker.terminate();
     for (const [requestId, request] of this.pendingExports) {
       if (request.owner === slot.id) {
@@ -480,6 +635,7 @@ export class SearchClient {
       this.publishStatus();
     }
     this.publishProgress(true);
+    this.scheduleFocused();
   }
 
   private publishStatus() {
@@ -682,6 +838,7 @@ export class SearchClient {
       finished: this.status === 'completed',
       current: owned(current), best: owned(best), bestPartial: owned(partial),
       bestByBag: this.publishedBagRecords(), selectedCandidate: owned(this.selectedArchive),
+      learningFocus: this.focusedStatus(),
       workers: this.slots.filter((slot) => !['failed', 'completed', 'cancelled'].includes(slot.status)).length
     } });
   }

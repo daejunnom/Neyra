@@ -17,17 +17,18 @@ It runs new continuation collection only when no received observations remain.
   bag depth, seeds, rules, settings and a separate retained-path trace. These
   trace scores describe the heuristic search and never become CNN targets.
 - With sharing on, selected verified boards after at least two bags seed the
-  unchanged fixed-policy collector. Each job observes two further bags under
-  its fixed work budget. Certified result boards enter a bounded global frontier
+  versioned v3 collector. Each job attempts two further bags under
+  its fixed work budget. Input-replayed result boards enter a bounded global frontier
   ordered by depth, so origins can advance beyond the initial 2-to-4 window.
   The existing selected worker pool performs this work; no extra worker pool is
   created for public collection. Workers without an assigned collection job
   continue ordinary broad search, including while parent delivery is pending.
 - At origin bags two and three, each depth admits at most two broad roots and
-  four total jobs per run, including certified descendants. These limits survive
+  four total jobs per run, including recorded descendants. These limits survive
   consent toggles. When those shallow opportunities are exhausted, ordinary
-  search advances until deeper roots appear. Depth is always supported by actual
-  certificates; the scheduler cannot guarantee a deeper field from every input.
+  search can supply more roots while replayed descendants receive priority. Depth
+  needs actual whole-bag input witnesses; finite work cannot guarantee a deeper
+  field from every input. A zero-spin endpoint remains eligible.
 - A previous retained board may start a **new** job after consent. Previous
   traces are not backfilled. Turning sharing off invalidates in-flight results,
   aborts upload and clears queued collection across open tabs. The synchronous
@@ -62,7 +63,7 @@ The studio imports full focused observations, queues them for analysis and uses
 those supplied results directly. It records CNN predictions and observed targets
 without relabeling every received board. Only an empty received queue and empty
 remote relay permit fallback collection. Fallback starts at an actual submitted
-result field or its certified descendant, uses the same fixed collector, and
+result field or its input-reachable descendant, uses the explicit v3 collector, and
 continues from its deeper result fields. No opener/bootstrap/perturbation examples
 are automatically selected. Old seeded-order artifacts remain in historical
 exports, but are not mixed into the active fixed-policy training set.
@@ -103,7 +104,7 @@ Results may commit only while their matching lease is current. Accepting receive
 evidence and its training observation is transactional; late results cannot undo
 quarantine or clear a replacement worker's lease. Occupancy deduplication returns
 the immutable stored winner while preserving distinct received evidence records.
-If parent storage succeeds but certified child storage is interrupted, a missing
+If parent storage succeeds but recorded child storage is interrupted, a missing
 completion marker schedules idempotent repair from the persisted proof. Duplicate
 receipts and bounded fallback preparation repair those exact fields; they do not
 rerun search or replace the original lineage with a later submission.
@@ -114,9 +115,12 @@ it must never be copied into public code, command arguments, files or logs.
 
 The served champion is pinned to `naga-spin-v2-f3194bf253a7`, independently of
 newer private candidates. Training and uploads never promote a model automatically.
-Private training checks a digest of the selected fixed-policy **training** records;
-unchanged training data does not trigger another fit. New test, validation or
-seeded records alone do not trigger training. A paused session stays paused.
+Legacy v2 retains its training-only data digest. V3 keys a bounded candidate
+attempt by the eligible parent identity and the selected fixed-policy train and
+validation records, so a changed validation set or quarantined parent cannot
+reuse a stale selection result. Test and seeded records do not trigger fitting.
+A v3 parent whose recorded fitting lineage is now excluded cannot seed another
+candidate; its immutable artifact remains available. A paused session stays paused.
 
 The learning worker is a build-emitted asset resolved against the live HTTPS
 origin. It must not use a server module's `file://` URL as its base. A narrowly
@@ -156,13 +160,69 @@ CUDA inference with the drain/fallback boundaries described below.
 Neither public search ordering nor its archive exports automatically invoke CNN
 evaluation. `learnedOrdering.enabled` remains false for compatibility.
 
-## Fresh observation contract
+## Next-bag v3 observation contract
+
+New observations use schema 3, task `naga-next-bag-spin-v3`, policy
+`bounded-next-bag-spin-v3`, and `config.observationVersion=3`. The target horizon
+is explicitly `targetHorizonBags=1`. `config.horizonBags` and a model's
+`horizonBags` continue to describe the **actual measured lookahead**, two or
+three bags. These fields must not be confused. The fixed public/private policy
+uses two bags, 131,072 work units, beam 48, profile 0, seed 1, node cap 96 and six
+attempts per node. The labeling-source digest identifies the new collector.
+
+One supplied nonempty field after at least two completed bags owns a job's
+entire observation budget. Generation retains actual inventories, SRS+ inputs,
+logical deletion context, Spin Singles and physical ceilings. It bypasses
+completion pace, peer/sibling futility and all-supply quiet/P7-parent gates only
+in this learning policy. Ordinary certified search retains its own gates.
+Finite beam, exact continuation deduplication, node/witness capacity and work
+budgets remain recorded censoring. Space is reserved for a parent-closed deeper
+chain before accepting many shallow siblings. Quiet endpoints remain useful.
+
+`targets` and `targetWitness` describe spins found **within the first new bag**.
+`reachableWholeBagWitnesses` retains at most 32 parent-linked, replayed inventories,
+including zero-spin results, each with all seven distinct labels, ordered
+inputs, placed cells, row deletion context and frames. Its trust is
+`input-reachable`: it proves a physical queue exists, not 5,040-supply coverage.
+The legacy certified array stays empty for this policy. `measured.lookahead`
+separately records requested/attempted/completed depth, reached locks, capacity
+and duplicate limits, and one coherent best two-bag path with first/second gains.
+Its total never becomes a one-bag training target. No result means unobserved,
+not a proof that a board is impossible or a fabricated completed second bag.
+
+After the parent receipt, its exact oriented result can seed the next job.
+Thus a bag-two root can produce a bag-four origin, then bag six, without a
+global completion candidate or all-supply certificate as the admission gate.
+The source group and exact parent evidence travel with that continuation.
+Received observations are consumed directly; only an empty received/relay queue
+permits private fallback. Legacy v2 observations remain readable and archived
+but do not enter v3 fitting. Exported training selections keep policies separate.
+
+The public champion remains the unchanged v2 checkpoint. A private v3 training
+initialization can reuse the explicitly identified convolution/hidden tensors
+and reset the two output tensors to zero. It is schema 3 and `trained=false`,
+not a relabeled v2 prediction. Only fitting actual, grouped v3 training records
+can produce a trained v3 candidate; validation selects candidates and test
+records remain untouched. Promotion is a separate decision. Rust/WASM accepts
+both honest contracts and clamps a v3 predicted count to one bag (0–6).
+
+The one-bag model is a deliberately short horizon. Actual two-bag paths preserve
+preparation that pays off later, so a low first-bag prediction must not become
+an unconditional prune. Future model-guided scheduling should first allocate a
+nonzero observation floor, reserve second-bag work for promising setup results,
+and use measured coherent gains plus a separately identified leaf prediction.
+Only measured same-policy first-bag gains are supervised truth. Do not add a
+leaf prediction to a target, count alternative paths together, or claim the
+same remaining spins repeatedly. Adaptive allocation needs its own policy and
+equal-work evaluation before public activation. See [checkpoint gates](LEARNING_CHECKPOINT.md).
+
+## Preserved v2 observation contract
 
 Schema 2 has task `naga-spin-observations-v2`. The normal policy is
 `neyra-fixed-bag-continuation-v2`; exploration uses
 `neyra-seeded-bag-continuation-v2` with an explicit seed, ordinal and
-`proposal-order-only` scope. The fixed collector and its source digest remain
-unchanged. Both accept only current occupancy and provenance
+`proposal-order-only` scope. The legacy collector and its source digest remain
+unchanged for reproducibility. These legacy policies accept current occupancy and provenance
 from boundaries of at least two completed bags. Existing board scores, Terrain
 scores, opener preferences, shape objectives and path-count targets are rejected.
 The v2 model starts from fresh weights instead of a teacher-trained v1 checkpoint.
@@ -179,12 +239,22 @@ deduplicated within its corpus, while each stored physical witness retains its o
 orientation. Checkpoint choice uses validation only; test records do not enter
 gradient updates or browser checkpoint selection.
 
-Retiring examples does not erase their historical split constraints. If a new
-run's fixed split conflicts with a known physical or reflected board in any
-retained corpus, the whole new run and its descendants are excluded from all
-three learning splits. Raw analysis evidence remains available. The actual
-`measurementGroup` is checked separately from a deduplicated board's original
-provenance. New snapshots record these exclusions explicitly.
+Retiring examples does not erase historical split constraints. A durable source
+group is admitted before choosing a new hash split. If its first board belongs
+to one unambiguous existing geometry component, the new group inherits that
+component's split. Duplicate-only runs also retain their assignment and exact
+physical source occurrence. Unconstrained components use deterministic hash
+splits. Existing assignments are never moved. A real cross-split component
+conflict still quarantines the affected group and descendants; historical
+exclusions remain. Raw analysis evidence and physical orientations stay available.
+V3 observations keep their actual `measurementGroup`, source and physical input,
+even when an older run first registered the canonical occupancy. An excluded
+first owner cannot permanently block an independent eligible observation in the
+same unambiguous split. Immutable observations are retained per measurement group;
+fitting selects the earliest eligible representative per canonical board and exact
+policy. Eligible physical source occurrences also remain available to fallback
+collection. Legacy v2 selection is unchanged. New snapshots record assignments,
+source occurrences and exclusions explicitly.
 
 The browser dataset has a bounded recent-plus-coverage sample per split, with
 explicit total and selected counts. New observations can therefore enter training
@@ -222,7 +292,7 @@ physical board matches and certified bag bridges. Client-supplied bridges retain
 client-reported trust; they do not become independently verified by import. Feedback retains witness
 references, actual spins and locks across at most six bridges. It is a censored
 lower bound on an observed path, not an optimal completion value or a replacement
-for the ancestor's original two-bag label. Recording this feedback is distinct
+for the ancestor's original versioned target. Recording this feedback is distinct
 from applying neural-network gradients; neither public heuristic scores nor
 the CNN's own predictions become target truth.
 
@@ -298,7 +368,10 @@ labels are also written separately as `fixed-labels.jsonl` and
 `exploration-labels.jsonl`; ordinary training uses only fixed labels. These derived
 files honor the snapshot's `excludedTrainingGroups`, checking measurement and
 source/run groups. Full `labels.jsonl`, raw pages and received artifacts remain
-complete. The receipt records eligible/excluded counts and derived file hashes.
+complete. V3 fixed-policy observations have their own `next-bag-fixed-labels.jsonl`
+file. It selects one eligible canonical representative per exact policy without
+discarding raw duplicate proofs; the receipt records those deduplicated counts.
+The receipt also records eligible/excluded counts and derived file hashes.
 Old snapshots without this optional exclusion list preserve their prior meaning.
 
 ### Reusing a retained checkpoint

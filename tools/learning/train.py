@@ -1,6 +1,6 @@
 """Train an occupancy-only Naga Eyes spin CNN, on CPU by default.
 
-V2 accepts fresh bounded-search observations only. Legacy board teachers, opener
+Each task accepts fresh bounded-search observations only. Legacy board teachers, opener
 priors and path-count objectives are rejected, including in source metadata.
 Optional CUDA training drains one epoch before applying a changed GPU request.
 Failed CUDA epochs restore the preceding CPU model/optimizer snapshot and retry
@@ -17,7 +17,7 @@ import time
 
 import torch
 from torch import nn
-from spin_contract import (ARCHITECTURE, MAX_FILE_BYTES, MAX_RECORD_BYTES, POLICY, TASK, WEIGHTS_HASH_ALGORITHM,
+from spin_contract import (ARCHITECTURE, MAX_FILE_BYTES, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, TASK, NEXT_BAG_TASK, WEIGHTS_HASH_ALGORITHM,
                            canonical_rows, read_jsonl, reject_constant, unique_keys,
                            validate_model, weights_hash)
 
@@ -50,10 +50,10 @@ def encode(rows):
 def read_data(path):
     records = read_jsonl(path)
     if not records:
-        raise ValueError("No freshly measured v2 labels")
-    groups, families, boards, protocols = {}, {}, set(), set()
+        raise ValueError("No freshly measured spin labels")
+    groups, families, measurement_groups, boards, protocols = {}, {}, {}, set(), set()
     for record in records:
-        if record["policy"] != POLICY:
+        if record["policy"] not in {POLICY, NEXT_BAG_POLICY}:
             raise ValueError("Exploration observations are excluded from fixed-policy fitting; measure their certified descendant boards with the fixed collector first")
         source = record["input"]["source"]
         split = source.get("split")
@@ -62,11 +62,15 @@ def read_data(path):
         group = source.get("group", source["family"])
         if groups.setdefault(group, split) != split or families.setdefault(source["family"], split) != split:
             raise ValueError("A source family/run leaks across splits")
+        measured_group = record.get("measurementGroup", group)
+        if measurement_groups.setdefault(measured_group, split) != split:
+            raise ValueError("A measurement run leaks across splits")
         board = canonical_rows(record["input"]["rows"])
         if board in boards:
             raise ValueError("Duplicate or reflected board; deduplicate before fitting")
         boards.add(board)
-        protocols.add(json.dumps(record["config"], sort_keys=True, separators=(",", ":")))
+        protocols.add(json.dumps([record["schemaVersion"], record["task"], record["policy"], record["config"]],
+                                 sort_keys=True, separators=(",", ":")))
     if len(protocols) != 1:
         raise ValueError("One model must use one fixed labeling policy")
     data = {}
@@ -88,6 +92,8 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
     if len(raw) > MAX_RECORD_BYTES:
         raise ValueError("Initial checkpoint exceeds the bounded record limit")
     checkpoint = validate_model(json.loads(raw, object_pairs_hook=unique_keys, parse_constant=reject_constant))
+    if checkpoint["schemaVersion"] != records[0]["schemaVersion"] or checkpoint["task"] != records[0]["task"]:
+        raise ValueError("Warm-start cannot reinterpret a retained checkpoint's prediction task")
     if checkpoint.get("datasetHashAlgorithm", "sha256-raw-jsonl-v1") != "sha256-raw-jsonl-v1":
         raise ValueError("Offline warm-start currently requires raw-JSONL training artifacts. Browser canonical projected-record hashes are distinct; retain the exported datasetSelection history and use the private Site to continue that candidate.")
     paths = [original_labels_path, *history_paths]
@@ -106,16 +112,17 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
     if set(provided) != set(lineage):
         raise ValueError("Provide every checkpoint trainingDatasetLineage artifact using --initial-labels and --history-labels")
     policy = records[0]["config"]
-    if checkpoint["labelConfig"] != policy or any(r["config"] != policy for r in previous):
+    if checkpoint["labelConfig"] != policy or any(r["config"] != policy or r["task"] != records[0]["task"] for r in previous):
         raise ValueError("Warm-start requires the identical fixed observation policy")
-    families, groups, boards = {}, {}, {}
+    families, groups, measurement_groups, boards = {}, {}, {}, {}
     for record in previous + records:
         source = record["input"]["source"]
         split = source["split"]
         group = source.get("group", source["family"])
         board = canonical_rows(record["input"]["rows"])
         if (families.setdefault(source["family"], split) != split
-                or groups.setdefault(group, split) != split or boards.setdefault(board, split) != split):
+                or groups.setdefault(group, split) != split or boards.setdefault(board, split) != split
+                or measurement_groups.setdefault(record.get("measurementGroup", group), split) != split):
             raise ValueError("Warm-start cannot move a historical family, group or reflected board between splits")
     state = {key: torch.tensor(checkpoint["weights"][key], dtype=torch.float32, device="cpu").reshape(value.shape)
              for key, value in model.state_dict().items()}
@@ -289,7 +296,7 @@ def main():
     p.add_argument("--gpu-control", type=Path,
                    help='Optional live JSON file, {"gpu":true|false}; read between epochs, default/malformed/missing means CPU')
     p.add_argument("--initial-model", type=Path,
-                   help="Optional compatible private v2 checkpoint; never automatically promoted")
+                   help="Optional compatible private checkpoint of the same task; never automatically promoted")
     p.add_argument("--initial-labels", type=Path,
                    help="Exact original JSONL dataset matching the initial model hash; required to audit held-out isolation")
     p.add_argument("--history-labels", type=Path, action="append", default=[],
@@ -339,7 +346,8 @@ def main():
     model.load_state_dict(best_state)
     model.eval()
     config = records[0]["config"]
-    horizon = config["horizonBags"]
+    next_bag = records[0]["schemaVersion"] == 3
+    horizon = 1 if next_bag else config["horizonBags"]
     evaluation, predictions = {}, []
     mean = train_y.mean(0)
     probability = mean[0].clamp(1e-6, 1-1e-6)
@@ -357,21 +365,23 @@ def main():
     weight_hash = weights_hash(weights)
     dataset_hash = hashlib.sha256(a.labels.read_bytes()).hexdigest()
     runtime = {
-        "schemaVersion": 2, "task": TASK,
+        "schemaVersion": 3 if next_bag else 2, "task": NEXT_BAG_TASK if next_bag else TASK,
         # A retained epoch-zero checkpoint can be evaluated against a new
         # dataset without overwriting the original immutable model artifact.
-        "modelId": "naga-spin-v2-" + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
+        "modelId": ("naga-next-bag-v3-" if next_bag else "naga-spin-v2-") + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
         # The artifact device describes portable inference, not the training host.
         "architecture": ARCHITECTURE, "trained": True, "device": "cpu",
         "datasetSha256": dataset_hash, "weightsSha256": weight_hash,
         "datasetHashAlgorithm": "sha256-raw-jsonl-v1",
         "weightsSha256Algorithm": WEIGHTS_HASH_ALGORITHM,
-        "horizonBags": horizon, "workBudget": config["workBudget"], "labelConfig": config,
+        "horizonBags": config["horizonBags"], "workBudget": config["workBudget"], "labelConfig": config,
         "weights": weights, "outputNames": ["foundSpinLogit", "observedSpinsScaled"],
         "countScale": 6, "sourceInputs": "Canonical current occupancy only; no heuristic score channels.",
         "scope": "Predictions of censored bounded-policy spin observations, not construction probability or exhaustive feasibility.",
         "searchOrderingEnabled": False,
     }
+    if next_bag:
+        runtime["targetHorizonBags"] = 1
     if initial:
         runtime["trainingDatasetLineage"] = sorted(set(initial["trainingDatasetLineage"]) | {dataset_hash})
     validate_model(runtime)
@@ -385,7 +395,7 @@ def main():
         "cudaBuild": torch.version.cuda, "cudaAvailable": compute.cuda_available,
         "finalEvaluationDevice": "cpu", "portableArtifactDevice": "cpu",
         "torch": torch.__version__, "seed": a.seed, "threads": a.threads,
-        "initialization": "Compatible v2 checkpoint; policy and historical splits audited" if initial else "Fresh random weights; no v1 checkpoint or score supervision",
+        "initialization": "Compatible same-task checkpoint; policy and historical splits audited" if initial else "Fresh random weights; no legacy checkpoint or score supervision",
         "initialCheckpoint": initial,
         "epochsRun": len(history), "selectedEpoch": best_epoch,
         "selection": "Validation loss only; held-out test evaluated once after fitting.",
@@ -396,7 +406,7 @@ def main():
         "history": history,
     }
     report = {
-        "schemaVersion": 2, "task": TASK, "modelId": runtime["modelId"],
+        "schemaVersion": runtime["schemaVersion"], "task": runtime["task"], "modelId": runtime["modelId"],
         "datasetSha256": dataset_hash, "weightsSha256": weight_hash,
         "datasetHashAlgorithm": runtime["datasetHashAlgorithm"],
         "weightsSha256Algorithm": WEIGHTS_HASH_ALGORITHM, "architecture": ARCHITECTURE,
@@ -404,10 +414,12 @@ def main():
         "limitations": [
             "Small grouped pilot, not proof of stronger search or general calibration.",
             "A missing spin under limited search is censored absence, not impossibility.",
-            "No legacy Terrain values, published-opener priors or path-count targets are mixed into v2.",
+            "No legacy Terrain values, published-opener priors, path-count targets or mixed prediction horizons are used.",
             "Public completion search does not use this model for ordering.",
         ],
     }
+    if next_bag:
+        report["targetHorizonBags"] = 1
     (a.output / "training-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     (a.output / "predictions.json").write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n")
     (a.output / "model-card.json").write_text(json.dumps({

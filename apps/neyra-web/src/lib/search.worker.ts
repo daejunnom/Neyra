@@ -1,10 +1,14 @@
 import type { Candidate, EngineCommand, EngineEvent, FocusedInput, FocusedSpinLabel, SearchSnapshot } from './types';
+import { NEXT_BAG_LABEL_CONFIG } from './learning-policy';
+import { QUIET_TT_BATCH_ENTRIES, quietTranspositionBatch } from './transpositions';
 
 type WasmEngine = {
   advance(work: number): void;
   snapshot(): string;
   snapshot_compact(): string;
   observe_benchmarks(values: string): void;
+  drain_transpositions(limit: number): string;
+  observe_transpositions(batch: string): void;
   export_selected_json(selection: string): string;
   free(): void;
 };
@@ -38,8 +42,24 @@ let fixedLabelConfig = '';
 let learningEnabled = false;
 let pendingObservation: { id: string; input: FocusedInput } | null = null;
 let waitingObservationDecision = false;
+let transpositionSharing = false;
 
 function send(message: EngineEvent) { scope.postMessage(message); }
+
+function stopTranspositionSharing() {
+  if (!transpositionSharing) return;
+  transpositionSharing = false;
+  send({ type: 'warning', runId, message: '중복 검증 공유를 사용할 수 없어 각 탐색기의 자체 검증으로 계속합니다.' });
+}
+
+function shareTranspositions() {
+  if (!engine || !transpositionSharing) return;
+  try {
+    const batch = quietTranspositionBatch(JSON.parse(engine.drain_transpositions(QUIET_TT_BATCH_ENTRIES)));
+    if (!batch) { stopTranspositionSharing(); return; }
+    if (batch.entries.length) send({ type: 'transpositions', runId, batch });
+  } catch { stopTranspositionSharing(); }
+}
 
 function observeBenchmarks(incoming: number[]) {
   if (!Array.isArray(incoming)) return;
@@ -142,6 +162,7 @@ function snapshot(full = false): SearchSnapshot | null {
   const value = readSnapshot(full);
   if (!value || !engine) return null;
   lastSnapshot = performance.now();
+  shareTranspositions();
   send({ type: 'progress', runId, snapshot: value });
   retainIncumbent(value);
   return value;
@@ -179,11 +200,11 @@ function tick() {
     if (learningEnabled && pendingObservation && loadedModule) {
       const job = pendingObservation;
       pendingObservation = null;
-      // The collector is unchanged. Only the supplied origin is chosen deeply;
-      // a completed bounded job yields before another one is assigned.
+      // One selected field owns a bounded deep observation. The new one-bag
+      // target is separate from measured two-bag continuation evidence.
       waitingObservationDecision = true;
       try {
-        fixedLabelConfig ||= JSON.stringify(JSON.parse(loadedModule.spin_model_json()).labelConfig);
+        fixedLabelConfig ||= JSON.stringify(NEXT_BAG_LABEL_CONFIG);
         const label = JSON.parse(loadedModule.label_board(JSON.stringify(job.input), fixedLabelConfig)) as FocusedSpinLabel;
         send({ type: 'observation', runId, observationId: job.id, label });
       } catch (error) {
@@ -221,6 +242,7 @@ scope.onmessage = async ({ data }) => {
     pendingObservation = null;
     waitingObservationDecision = false;
     learningEnabled = data.learningEnabled === true;
+    transpositionSharing = data.transpositionSharing === true;
     runId = data.runId;
     const requestedId = runId;
     const mayInitialize = () => runId === requestedId && requested !== 'cancelled';
@@ -272,6 +294,14 @@ scope.onmessage = async ({ data }) => {
   if (data.type === 'benchmarks') {
     try { if (requested !== 'cancelled') observeBenchmarks(data.bestSpinsByBag); }
     catch (error) { fail(error); }
+    return;
+  }
+  if (data.type === 'transpositions') {
+    if (!engine || !transpositionSharing || requested === 'cancelled') return;
+    const batch = quietTranspositionBatch(data.batch);
+    if (!batch) return;
+    try { engine.observe_transpositions(JSON.stringify(batch)); }
+    catch { stopTranspositionSharing(); }
     return;
   }
   if (data.type === 'watch') {

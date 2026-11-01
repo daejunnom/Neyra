@@ -23,11 +23,11 @@
   deployment. Existing GitHub checks and access controls still apply.
 - Keep source research, implementation status, and measured search results
   distinct. Do not copy private reference code into this public repository.
-- Keep af8dac63a9a9155fc28e480246fd617bc855bfb1 as the fixed strongest-source
-  reference. Build candidate algorithm changes from that source and preserve
-  the current probability/transport contracts. Improvement over the shipped
-  version alone does not establish parity with this fixed reference. Compare
-  matched rules, settings and work; keep benchmark tools and results outside
+- Develop from the latest accepted best source. The user's November 2026
+  instruction retires the frozen af8 source baseline; do not restore or maintain
+  a parallel historical implementation. Accept changes against the immediately
+  preceding accepted source using matched rules, settings and work, preserving
+  probability and transport contracts. Keep benchmark tools and results outside
   the repository. Preserve existing test modules and do not commit new tests.
 - Exclude O spins in this build-search profile. Keep physical rotation data
   separate from search-state equivalence: an origin-only rotation need not
@@ -42,9 +42,12 @@
   legacy default-on settings are not consent. Learning stays off. Generate a
   fresh nonzero random seed on page entry, then honor the user's manual seed.
   Preserve physics, probability, necessary bounds and supply certificates.
-- The CPU CNN v2 learns current occupancy only and predicts bounded-search spin
+- The CPU CNN learns current occupancy only and predicts bounded-search spin
   discovery and observed spin count. Do not mix in structural teachers, Terrain
-  scores, shape preferences, opener priors, path-count targets or old checkpoints.
+  scores, shape preferences, opener priors or path-count targets. Preserve the
+  released two-bag v2 checkpoint. Explicit v3 initialization may reuse its
+  convolution/hidden features only with a reset output head and recorded source
+  provenance; it must remain marked untrained until actual v3-only fitting.
   Keep history, inventory, forecasts and opener identity out of inference inputs.
   Inspect actual accessible source before using another engine's board features;
   never infer closed-source evaluation or copy private reference implementation.
@@ -55,16 +58,22 @@
   completion searches. Keep input-reachable observations distinct from exact
   P7/quiet-safe chains. Limited search is censored: a miss is not impossibility,
   and the discovery head is not construction probability. Split whole opener
-  families and search runs; purge identical and reflected boards across splits.
+  families and search runs; isolate identical and reflected boards across splits.
+  New v3 labels predict only the first new bag, with targetHorizonBags=1, while
+  the collector still attempts at least two new inventories. Retain the actual
+  reached depth, zero-spin endpoints, physical input witnesses and censored
+  capacity/work limits. Do not apply peer score, completion pace, sibling
+  futility or all-P7-parent gates in this learning-only path. Public certified
+  search keeps those separate rules. Reserve capacity for deeper continuation.
   Commit reusable collection/training/storage tools and the selected runtime
   model, but keep datasets, new tests, one-time experiments and result reports
   outside this repository. Record dataset, labeling-source and model hashes.
 - The developer learning Site stays owner-private with sharing and learning on,
   without mode selectors. Analyze received fixed-policy observations first;
   do not rerun the collector to consume an already supplied observation. Only
-  when both the received analysis queue and relay are empty may the unchanged
-  collector continue from an actual received result board or its certified
-  descendant. Do not generate empty first-bag or bootstrap-example searches.
+  when both the received analysis queue and relay are empty may the versioned
+  collector continue from an actual received result board or a recorded
+  input-reachable descendant. Do not generate empty first-bag/bootstrap searches.
   Sites D1/R2 holds observations and model artifacts; Supabase is the bounded
   public relay. Received labels remain client-reported even after structural
   validation; independent private measurements retain their separate trust.
@@ -75,8 +84,8 @@
 - Capture public search traces only after explicit consent, using existing
   retained frames and worker totals. Do not retrospectively upload old traces.
   With consent on, use a verified boundary of at least two bags as an origin
-  for the unchanged fixed-policy collector, then prioritize deeper certified
-  result fields. An existing retained board may seed a new post-consent job.
+  for the v3 fixed-policy collector, then prioritize deeper replayed result
+  fields, including zero-spin boundaries. Existing retained boards may seed new jobs.
   Use the selected worker count, a bounded global frontier, and parent delivery
   acknowledgement before dispatching descendants. Keep queued observations
   under backpressure rather than evicting parents. With consent off, discard
@@ -102,12 +111,14 @@
   candidate training shares at most 20 attempted epochs per cycle, at most ten
   per candidate and two concurrent GPU candidates. Preserve the parent as a
   validation candidate and record actual allocation and backend metadata.
-  Load the training runtime only for training work. Interrupted certified child
+  Load the training runtime only for training work. Interrupted recorded child
   admission must be repairable from the immutable parent proof, with a bounded
   repair batch after received-work priority checks; do not rerun collection.
-- Preserve the released v2 checkpoint and fixed-policy collector. Private seeded
+- Preserve the released v2 checkpoint and legacy collector semantics. V3 uses
+  an explicitly different policy, model task and one-bag output contract; never
+  relabel a two-bag prediction or mix versions in a training dataset. Private seeded
   exploration changes proposal ordering only, within the same declared budget;
-  store its seed, ordinal and distinct policy. Its certified child boards may
+  store its seed, ordinal and distinct policy. Its replayed child boards may
   enter fixed-policy collection, but stochastic labels must not silently mix
   with the fixed-policy training set. Pin the served champion independently of
   newer private candidates; training never promotes a checkpoint automatically.
@@ -117,9 +128,18 @@
   enter the new public-results training set. Preserve all physical witness
   orientations and per-link trust when attaching ancestor feedback.
   Keep historical geometry/run split constraints even after corpus retirement.
-  Exclude a conflicting whole run and its descendants from all learning splits;
-  check actual measurementGroup as well as canonical provenance. Full exports
-  retain evidence; derived offline training files honor manifest exclusions.
+  Assign a durable source group before admitting its first board. A new group
+  first inherits an unambiguous existing geometry component's split; hash a new
+  component only when no prior constraint exists. Record duplicate-only source
+  occurrences and exact orientations independently of canonical training rows.
+  Never move historical groups/geometry between splits or clear old exclusions.
+  Quarantine a genuine cross-split component conflict and its descendants.
+  V3 proofs keep their actual measurement group, physical orientation and source;
+  an excluded first canonical owner must not poison a later independent group
+  that inherits one unambiguous historical split. Keep immutable proofs per
+  measurement group and select one earliest eligible representative per canonical
+  board and policy for fitting. Legacy v2 eligibility remains unchanged. Full
+  exports retain evidence; derived training files honor manifest exclusions.
 - CPU remains the default. Optional private GPU learning must finish an active
   unit before switching off and retry failed GPU work from retained CPU weights
   and optimizer state. Native training uses epoch boundaries; ORT inference
@@ -130,9 +150,10 @@
   JSON checkpoint. Rust placement search remains CPU; do not label it GPU search.
 - Limit private CNN decision capture to the supplied board and one selected
   successor. Keep predicted values, allocated work, consumed work and measured
-  outcomes distinct. Ancestor feedback needs an exact physical certified bridge
+  outcomes distinct. Ancestor feedback needs an exact physical recorded bridge
   and witness references; it is a censored path lower bound, not a replacement
-  for the original two-bag label. Do not fabricate remaining-to-40 or completion
+  for the original versioned label. One-bag targets and coherent measured
+  two-bag path totals remain separate. Do not fabricate remaining-to-40/completion
   cost labels from unfinished searches. Adaptive budgets and new cost heads need
   separate policy evidence before activation. Keep the current mino controls.
 - Export complete immutable private snapshots separately from bounded training
@@ -246,7 +267,7 @@
   may skip its other canonical query; skipped raw entries remain unknown.
   Distinguish effective model coverage from actual canonical query counts.
   Keep supply reflection separate from optional root geometry reduction.
-  The adopted af8-based generator partitions first-placement proposals among
+  The accepted generator partitions first-placement proposals among
   workers without the later chronological reflected-prefix cut. Preserve
   piece-to-target assignment, deletion history and execution context; board
   occupancy alone must not merge distinct fixed tilings.
@@ -463,6 +484,14 @@
 - Worker lanes partition first-placement proposals, not every complete build.
   Preserve independent P7 certificates, compact progress, correct replay
   ownership, manual worker preferences and all-worker pause/cancel semantics.
+  A bounded exact TT may reuse proven quiet-policy rejection only after complete
+  relevant execution proof. Compare full oriented context bytes, typed logical
+  target assignments, goal and symmetry context. Never cache heuristic misses,
+  interrupted work or probability cutoffs as failures. Shared immutable batches
+  must not block workers, echo imports, cross run generations or merge success
+  sets. Mirror deduplication is for display/training identity only; actual physics
+  and certificates keep their original orientation. Retain two distinct final
+  field identities per bag before truncation, plus the explicitly pinned route.
 - Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
@@ -475,7 +504,8 @@
   bags outranks nine in five, while both depths remain separately inspectable.
   Keep playback on the retained best route; the current-search tab shows only
   its final board and has no autoplay or replay controls. A focused-learning
-  view shows its real origin board and relative two-bag observations, never
+  view shows its real origin board and next-bag target separately from deeper
+  observed continuations, never
   inventing cumulative progress toward 40 clears from that isolated board.
   The compact best-route field evaluation displays that route's final raw
   fieldQuality, not normalized rankingScore or the currently replayed frame.

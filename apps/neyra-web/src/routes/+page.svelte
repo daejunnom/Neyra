@@ -433,7 +433,7 @@
         <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={focusedBoard ? '후속 스핀을 관측하는 출발 필드' : view === 'best' ? selectedRoute ? '선택한 경로 필드' : '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate && !focusedBoard} /></div>
         <div class="field-summary">
           {#if focusedBoard}
-          <div class="field-stat primary"><span>관측한 후속 스핀</span><strong>{learningFocus?.latestObservedSpins ?? '…'}<small>/ 2가방</small></strong></div>
+          <div class="field-stat primary"><span>다음 가방에서 찾은 스핀</span><strong>{learningFocus?.latestObservedSpins ?? '…'}<small>/ 1가방</small></strong></div>
           <div class="field-stat"><span>관측 완료</span><strong>{learningFocus?.completed ?? 0}<small>필드</small></strong></div>
           <div class="field-stat"><span>출발 가방</span><strong>{learningFocus?.activeBag ?? '—'}</strong></div>
           <div class="candidate-label">{learningFocus?.active ? '후속 스핀 확인 중' : '관측 필드'}</div>
@@ -511,7 +511,7 @@
         <p class="verified-progress">검증 통과 최대 {snapshot?.qualifiedSpins ?? 0}스핀<span>{snapshot?.workers ?? 0}개 동시 탐색</span></p>
         <section class="contribution-status" aria-label="CNN 학습 자료 제공">
           <div><label><input type="checkbox" checked={contributionState.enabled} onchange={(event) => setDataSharing(event.currentTarget.checked)} />학습 자료 제공</label><span>학습 OFF</span></div>
-          <p>켜면 선택한 필드에서 후속 스핀을 깊게 탐색해 결과를 전송합니다.</p>
+          <p>켜면 선택한 필드에서 두 가방 이상의 후속 경로를 탐색해 결과를 전송합니다.</p>
           <div class="contribution-progress" role="status"><span>{contributionLabel}{#if contributionState.queued > 0} · 대기 {contributionState.queued}개{/if}</span>{#if contributionState.phase === 'paused'}<button class="text-button" onclick={() => contributions.retry()}>다시 전송</button>{/if}</div>
           {#if learningFocus?.enabled}<div class="learning-focus" role="status"><span>관측 {learningFocus.completed}개 · 가장 깊은 출발 {learningFocus.deepestOriginBag || '—'}가방</span><span>{learningFocus.active ? `${learningFocus.active}개 진행` : learningFocus.awaitingDelivery ? '전송 대기' : '출발 필드 대기'}</span></div>{/if}
           {#if contributionState.dropped > 0}<small>전송하지 못한 필드 {contributionState.dropped}개 · 보관된 경로는 아래에서 파일로 저장할 수 있어요.</small>{/if}
@@ -592,7 +592,7 @@
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
-  <p>이 화면은 기존 알고리즘으로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 검증된 2가방 이후 필드를 시작점으로 제한된 후속 탐색을 수행하고, 실제 관측한 스핀과 결과 필드·시드·설정을 개발자 전용 CNN 학습 화면에 보냅니다. 이어서 결과 필드를 새 시작점으로 사용하므로 더 깊은 가방에서도 자료를 모읍니다. 학습 자료를 만들 때에도 기존 탐색 알고리즘과 선택한 동시 탐색 수를 사용합니다. 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
+  <p>이 화면은 기존 평가기로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 검증된 2가방 이후 필드를 시작점으로 두 가방 이상의 후속 경로를 제한된 예산 안에서 확인하고, 실제 관측한 스핀과 결과 필드·시드·설정을 개발자 전용 CNN 학습 화면에 보냅니다. 다음 한 가방의 스핀 수가 새 모델의 학습 대상이며, 그 이후 경로는 별도 관측 자료로 남깁니다. 스핀이 없는 결과도 실제 입력으로 도달했다면 다음 시작점으로 이어갑니다. 이 도달 기록이 모든 공급 순서에서의 구축 성공을 뜻하지는 않습니다. 선택한 동시 탐색 수를 사용하며, 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

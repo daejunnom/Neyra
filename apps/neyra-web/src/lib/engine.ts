@@ -1,8 +1,10 @@
 import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, FocusedObservation,
   FocusedSpinLabel, LearningFocusStatus, RetainedSearchTrace, RunStatus,
   SearchConfig, SearchRecordCounters, SearchSnapshot, TrainingContribution, TrainingField } from './types';
-import { FocusedFrontier, focusedDescendants, focusedRoot, type FocusedOrigin } from './focused-learning';
+import { FocusedFrontier, focusedBoardKey, focusedDescendants, focusedRoot, validNextBagLabel, type FocusedOrigin } from './focused-learning';
+import { NEXT_BAG_LABEL_CONFIG } from './learning-policy';
 import { MAX_PENDING_OBSERVATIONS, type ContributionState, type ObservationDelivery } from './contributions';
+import { QuietTranspositionBroker } from './transpositions';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
 
@@ -146,6 +148,7 @@ export class SearchClient {
   private bagRecords = new Map<number, ArchivedCandidate[]>();
   private selectedArchive: ArchivedCandidate | null = null;
   private bestSpinsByBag = Array<number>(101).fill(0);
+  private transpositions = new QuietTranspositionBroker();
   private shareSpinBenchmarks = true;
   private contributionEnabled = false;
   private focusedFrontier = new FocusedFrontier();
@@ -252,7 +255,7 @@ export class SearchClient {
           config: { ...engineConfig, cnn_evaluation: false, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
           assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching,
-          learningEnabled: this.contributionEnabled
+          learningEnabled: this.contributionEnabled, transpositionSharing: this.slots.length > 1
         } satisfies EngineCommand);
       } catch (error) {
         this.failed(slot, error instanceof Error ? error.message : String(error));
@@ -507,8 +510,10 @@ export class SearchClient {
     if (!job || job.id !== observationId || !this.contributionEnabled) return;
     slot.focusedJob = null;
     slot.focusedWaiting = true;
-    if (!label || label.schemaVersion !== 2 || label.task !== 'naga-spin-observations-v2' ||
-        label.policy !== 'neyra-fixed-bag-continuation-v2' ||
+    if (!label || !validNextBagLabel(label) ||
+        Object.keys(label.config).length !== Object.keys(NEXT_BAG_LABEL_CONFIG).length ||
+        Object.entries(NEXT_BAG_LABEL_CONFIG).some(([key, value]) =>
+          (label.config as unknown as Record<string, unknown>)[key] !== value) ||
         label.input?.id !== job.origin.input.id ||
         label.input.rows.length !== job.origin.input.rows.length ||
         label.input.rows.some((row, y) => row !== job.origin.input.rows[y]) ||
@@ -548,6 +553,7 @@ export class SearchClient {
     this.bagRecords.clear();
     this.selectedArchive = null;
     this.bestSpinsByBag.fill(0);
+    this.transpositions.clear();
     this.focusedFrontier.clear();
     this.awaitingObservations.clear();
     this.observationSequence = 0;
@@ -572,6 +578,7 @@ export class SearchClient {
   private handle(slot: WorkerSlot, message: EngineEvent) {
     if (message.type === 'progress') {
       this.updateSnapshot(slot, message.snapshot);
+      this.deliverTranspositions(slot);
       this.publishProgress();
     } else if (message.type === 'status') {
       // A start acknowledgement can arrive after pause/cancel was requested.
@@ -596,12 +603,16 @@ export class SearchClient {
     } else if (message.type === 'bag-record') {
       this.retainBagRecord(slot, message.candidate, message.data, message.counters);
       this.publishProgress();
+    } else if (message.type === 'transpositions') {
+      if (this.intent !== 'cancelled') this.transpositions.accept(slot.id, message.batch);
     } else if (message.type === 'observation') {
       this.observed(slot, message.observationId, message.label);
     } else if (message.type === 'observation-error') {
       this.observed(slot, message.observationId, null);
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
+    } else if (message.type === 'warning') {
+      this.receive(message);
     } else if (message.type === 'export' || message.type === 'export-error') {
       const request = this.pendingExports.get(message.requestId);
       if (!request || request.owner !== slot.id) return;
@@ -624,6 +635,17 @@ export class SearchClient {
         this.receive({ type: 'export', runId: this.runId, requestId: message.requestId, data: message.data });
       }
     }
+  }
+
+  private deliverTranspositions(slot: WorkerSlot) {
+    if (this.intent === 'cancelled' || ['failed', 'completed', 'cancelled'].includes(slot.status)) return;
+    const batch = this.transpositions.take(slot.id);
+    if (!batch) return;
+    // An unavailable peer may simply recompute these exact checks. Cache
+    // delivery is optional and must not turn a valid search into an error.
+    try {
+      slot.worker.postMessage({ type: 'transpositions', runId: this.runId, batch } satisfies EngineCommand);
+    } catch { /* A lost batch is a cache miss, never a verification result. */ }
   }
 
   private failed(slot: WorkerSlot, message: string) {
@@ -761,10 +783,20 @@ export class SearchClient {
     records.push(record);
     records.sort((a, b) => betterPartial(a.candidate, b.candidate) ? -1 :
       betterPartial(b.candidate, a.candidate) ? 1 : 0);
-    // Full certificate ownership remains separate even when two workers find
-    // similar boards. Keep just the two displayed records, plus one user pin.
-    this.bagRecords.set(candidate.bagCount, records.slice(0, 2));
-    if (records.slice(0, 2).includes(record)) this.contributeRecord(record, counters);
+    // Display distinct fields at this depth. Reflection is an identity for
+    // presentation only: keep the winning record's original orientation,
+    // owner, probability and complete certificate; never merge their proofs.
+    // An explicitly selected route remains pinned even if its representative
+    // is displaced by another worker's stronger route to the same field.
+    const seenFields = new Set<string>();
+    const distinct = records.filter((item) => {
+      const key = focusedBoardKey(item.candidate.rows);
+      if (seenFields.has(key)) return false;
+      seenFields.add(key);
+      return true;
+    }).slice(0, 2);
+    this.bagRecords.set(candidate.bagCount, distinct);
+    if (distinct.includes(record)) this.contributeRecord(record, counters);
   }
 
   private publishedBagRecords(): BagCandidates[] {
@@ -876,6 +908,9 @@ export class SearchClient {
       pruned: sum((value) => value.pruned ?? 0),
       selectivePruned: sum((value) => value.selectivePruned ?? 0),
       duplicates: sum((value) => value.duplicates ?? 0),
+      transpositionHits: sum((value) => value.transpositionHits ?? 0),
+      transpositionStores: sum((value) => value.transpositionStores ?? 0),
+      transpositionImports: sum((value) => value.transpositionImports ?? 0),
       bags: selected?.bags ?? 0,
       checked: selected?.checked ?? 0,
       success: selected?.success ?? 0,

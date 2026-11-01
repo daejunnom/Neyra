@@ -131,6 +131,14 @@ impl NeyraEngine {
         Ok(())
     }
 
+    pub fn drain_transpositions(&mut self, limit: u32) -> String {
+        self.session.drain_transpositions(limit as usize)
+    }
+
+    pub fn observe_transpositions(&mut self, batch_json: &str) -> Result<(), JsValue> {
+        self.session.observe_transpositions(batch_json).map_err(|e| JsValue::from_str(&e))
+    }
+
     pub fn snapshot(&self) -> Result<String, JsValue> {
         serde_json::to_string(&self.session.snapshot())
             .map_err(|e| JsValue::from_str(&e.to_string()))

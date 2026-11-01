@@ -15,8 +15,8 @@ import sys
 
 import numpy as np
 import onnxruntime as ort
-from spin_contract import (ARCHITECTURE, HASH, MAX_RECORD_BYTES, TASK,
-                           canonical_rows, integer, reject_constant, unique_keys)
+from spin_contract import (ARCHITECTURE, HASH, MAX_RECORD_BYTES, TASK, NEXT_BAG_TASK,
+                           canonical_rows, integer, reject_constant, unique_keys, validate_config)
 
 CPU = "CPUExecutionProvider"
 CUDA = "CUDAExecutionProvider"
@@ -58,7 +58,7 @@ class SpinInference:
         self.model_path = Path(model_path)
         self.manifest = read_json(manifest_path or self.model_path.with_suffix(".manifest.json"))
         m = self.manifest
-        if (m.get("format") != FORMAT or m.get("task") != TASK or m.get("architecture") != ARCHITECTURE
+        if (m.get("format") != FORMAT or m.get("task") not in {TASK, NEXT_BAG_TASK} or m.get("architecture") != ARCHITECTURE
                 or m.get("input") != {"name": "occupancy", "shape": ["batch", 1, 24, 10], "encoding": "canonical-reflection-bottom-up-f32"}
                 or m.get("output") != {"name": "raw_scores", "shape": ["batch", 2], "countScale": 6}):
             raise ValueError("Unexpected ONNX model contract")
@@ -66,6 +66,13 @@ class SpinInference:
             if not isinstance(m.get(key), str) or not HASH.fullmatch(m[key]):
                 raise ValueError("Missing ONNX model provenance")
         integer(m.get("horizonBags"), "horizonBags", 2, 3)
+        next_bag = m["task"] == NEXT_BAG_TASK
+        config = validate_config(m.get("labelConfig"), 3 if next_bag else 2)
+        self.target_horizon = 1 if next_bag else m["horizonBags"]
+        if (m["horizonBags"] != config["horizonBags"]
+                or next_bag and m.get("targetHorizonBags") != 1
+                or not next_bag and m.get("targetHorizonBags", m["horizonBags"]) != m["horizonBags"]):
+            raise ValueError("ONNX prediction horizon disagrees with its measurement policy")
         if not isinstance(m.get("modelId"), str) or not m["modelId"]:
             raise ValueError("Missing source model identity")
         with self.model_path.open("rb") as source:
@@ -100,6 +107,9 @@ class SpinInference:
                 or metadata.get("neyra.weightsSha256") != self.manifest["weightsSha256"]
                 or metadata.get("neyra.format") != FORMAT):
             raise ValueError("ONNX session disagrees with its checkpoint manifest")
+        if (metadata.get("neyra.task", TASK) != self.manifest["task"]
+                or metadata.get("neyra.targetHorizonBags", str(self.manifest["horizonBags"])) != str(self.target_horizon)):
+            raise ValueError("ONNX task metadata cannot reinterpret retained output heads")
         return session
 
     def set_gpu_enabled(self, enabled):
@@ -188,7 +198,7 @@ class SpinInference:
                 raw = run_checked(self._cpu)
             scores = raw.astype(np.float64)
             found = 1 / (1 + np.exp(-np.clip(scores[:, 0], -80, 80)))
-            counts = np.clip(scores[:, 1] * 6, 0, self.manifest["horizonBags"] * 6)
+            counts = np.clip(scores[:, 1] * 6, 0, self.target_horizon * 6)
             return {"modelId": self.manifest["modelId"], "weightsSha256": self.manifest["weightsSha256"],
                     "configuredProviderForRun": provider, "status": self.status(),
                     "predictions": [{"foundSpinLikelihood": float(p), "observedSpins": float(n),

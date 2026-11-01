@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub const MODEL_TASK: &str = "naga-spin-observations-v2";
+pub const NEXT_BAG_TASK: &str = "naga-next-bag-spin-v3";
 pub const MODEL_PARAMETERS: usize = 33_442;
 const MODEL_JSON: &str = include_str!("../models/naga-spin-cnn-v2.json");
 const MODEL_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -26,6 +27,25 @@ struct Architecture {
     parameters: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Initialization {
+    kind: String,
+    source_model_id: String,
+    source_weights_sha256: String,
+    reused: Vec<String>,
+    reset: Vec<String>,
+    target_horizon_bags: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservationContract {
+    observation_version: Option<u8>,
+    horizon_bags: u8,
+    work_budget: u32,
+}
+
 /// Validated owner-produced weights. No search ranking or heuristic score is used.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +57,10 @@ pub struct SpinModel {
     device: String,
     architecture: Architecture,
     horizon_bags: u8,
+    target_horizon_bags: Option<u8>,
     work_budget: u32,
+    label_config: Option<ObservationContract>,
+    initialization: Option<Initialization>,
     weights: HashMap<String, Vec<f32>>,
 }
 
@@ -52,6 +75,12 @@ pub struct BoardEvaluation {
     pub found_spin_likelihood: f64,
     pub observed_spins: f64,
     pub horizon_bags: u8,
+    /// V3 predicts one inventory while actual follow-up measurement spans two
+    /// or three. Absent on the unchanged historical v2 output contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_horizon_bags: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trained: Option<bool>,
     pub work_budget: u32,
     pub experimental: bool,
     pub scope: &'static str,
@@ -63,7 +92,28 @@ impl SpinModel {
         let model: Self = serde_json::from_str(json)
             .map_err(|e| format!("Invalid spin model JSON: {e}"))?;
         let a = &model.architecture;
-        if model.schema_version != 2 || model.task != MODEL_TASK || !model.trained
+        let next_bag = model.schema_version == 3 && model.task == NEXT_BAG_TASK
+            && model.target_horizon_bags == Some(1)
+            && model.label_config.as_ref().is_some_and(|config| {
+                config.observation_version == Some(3) && config.horizon_bags == model.horizon_bags
+                    && config.work_budget == model.work_budget
+            });
+        let legacy = model.schema_version == 2 && model.task == MODEL_TASK
+            && model.target_horizon_bags.is_none() && model.trained
+            && model.label_config.as_ref().is_none_or(|config| {
+                config.observation_version.is_none_or(|version| version == 2)
+                    && config.horizon_bags == model.horizon_bags
+                    && config.work_budget == model.work_budget
+            });
+        let honest_initialization = next_bag && model.initialization.as_ref().is_some_and(|init| {
+            init.kind == "v2-feature-transfer-v3-head-reset"
+                && !init.source_model_id.is_empty() && init.source_model_id.len() <= 128
+                && init.source_weights_sha256.len() == 64
+                && init.source_weights_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && init.reused == ["conv1", "conv2", "conv3", "hidden"]
+                && init.reset == ["output"] && init.target_horizon_bags == 1
+        });
+        if !(legacy || next_bag) || (!model.trained && !honest_initialization)
             || model.device != "cpu" || model.model_id.is_empty() || model.model_id.len() > 128
             || !(2..=3).contains(&model.horizon_bags)
             || !(1..=4_194_304).contains(&model.work_budget)
@@ -87,6 +137,10 @@ impl SpinModel {
             if values.len() != size || values.iter().any(|x| !x.is_finite() || x.abs() > 1000.0) {
                 return Err(format!("Invalid tensor {name}"));
             }
+        }
+        if !model.trained && ["output.weight", "output.bias"].iter()
+            .any(|name| model.weights[*name].iter().any(|value| *value != 0.0)) {
+            return Err("Untrained next-bag initialization must have a reset output head".into());
         }
         Ok(model)
     }
@@ -143,11 +197,16 @@ impl SpinModel {
     pub fn evaluate_with_raw(&self, board: &Board) -> Option<([f32; 2], BoardEvaluation)> {
         let raw = self.raw_prediction(board)?;
         let logit = f64::from(raw[0]).clamp(-80.0, 80.0);
+        let next_bag = self.schema_version == 3;
         Some((raw, BoardEvaluation {
-            schema_version: 2, task: MODEL_TASK, model_id: self.model_id.clone(),
+            schema_version: self.schema_version,
+            task: if next_bag { NEXT_BAG_TASK } else { MODEL_TASK }, model_id: self.model_id.clone(),
             found_spin_likelihood: 1.0 / (1.0 + (-logit).exp()),
-            observed_spins: (f64::from(raw[1]) * 6.0).clamp(0.0, f64::from(self.horizon_bags) * 6.0),
+            observed_spins: (f64::from(raw[1]) * 6.0).clamp(0.0,
+                f64::from(self.target_horizon_bags.unwrap_or(self.horizon_bags)) * 6.0),
             horizon_bags: self.horizon_bags, work_budget: self.work_budget,
+            target_horizon_bags: self.target_horizon_bags,
+            trained: next_bag.then_some(self.trained),
             experimental: true,
             scope: "Current occupancy only. Predictions of censored follow-up spin observations; not construction probability, exhaustive feasibility, or a heuristic-score blend.",
         }))

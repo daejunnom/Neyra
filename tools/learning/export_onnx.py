@@ -13,14 +13,14 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import torch
-from spin_contract import ARCHITECTURE, MAX_RECORD_BYTES, TASK, read_jsonl, validate_model
+from spin_contract import ARCHITECTURE, MAX_RECORD_BYTES, prediction_horizon, read_jsonl, validate_model
 from train import BoardCNN
 from ort_inference import FORMAT, CPU, SpinInference, encode_boards, read_json
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True, help="Retained spin-v2 JSON checkpoint")
+    parser.add_argument("--model", type=Path, required=True, help="Retained versioned spin JSON checkpoint")
     parser.add_argument("--boards", type=Path, required=True, help="Actual deep-board input JSONL used only for export parity")
     parser.add_argument("--output", type=Path, required=True, help="New .onnx artifact outside the source repository")
     parser.add_argument("--threads", type=int, default=2)
@@ -55,12 +55,14 @@ def main():
         graph = onnx.load(staged, load_external_data=False)
         onnx.helper.set_model_props(graph, {"neyra.format": FORMAT, "neyra.modelId": checkpoint["modelId"],
                                            "neyra.weightsSha256": checkpoint["weightsSha256"],
+                                           "neyra.task": checkpoint["task"],
+                                           "neyra.targetHorizonBags": str(prediction_horizon(checkpoint)),
                                            "neyra.inputEncoding": "canonical-reflection-bottom-up-f32"})
         onnx.checker.check_model(graph, full_check=True)
         onnx.save(graph, staged)
         if staged.stat().st_size > MAX_RECORD_BYTES:
             raise ValueError("Export exceeded the bounded ONNX artifact limit")
-        manifest = {"format": FORMAT, "task": TASK, "architecture": ARCHITECTURE,
+        manifest = {"format": FORMAT, "task": checkpoint["task"], "architecture": ARCHITECTURE,
                     "modelId": checkpoint["modelId"], "weightsSha256": checkpoint["weightsSha256"],
                     "sourceModelSha256": hashlib.sha256(args.model.read_bytes()).hexdigest(),
                     "onnxSha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
@@ -70,6 +72,8 @@ def main():
                     "runtime": {"torch": torch.__version__, "onnx": onnx.__version__, "onnxruntime": ort.__version__,
                                 "opset": 18, "exporter": "torch.onnx dynamo", "cpuThreads": args.threads},
                     "scope": "Optional fixed-model inference. Rust search and training are unchanged; no public promotion."}
+        if checkpoint["schemaVersion"] == 3:
+            manifest["targetHorizonBags"] = 1
         staged_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
         runtime = SpinInference(staged, threads=args.threads)
         errors = []

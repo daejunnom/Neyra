@@ -127,6 +127,7 @@ export interface FocusedInput {
 }
 
 export interface FocusedLabelConfig {
+  observationVersion?: 2 | 3;
   horizonBags: number;
   workBudget: number;
   beamWidth: number;
@@ -154,16 +155,38 @@ export interface FocusedWitness {
 }
 
 export interface FocusedSpinLabel {
-  schemaVersion: 2;
-  task: 'naga-spin-observations-v2';
-  policy: 'neyra-fixed-bag-continuation-v2';
+  schemaVersion: 2 | 3;
+  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3';
+  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3';
+  /** Prediction horizon. Actual follow-up measurement still spans >=2 bags. */
+  targetHorizonBags?: 1;
   input: FocusedInput;
   config: FocusedLabelConfig;
   targets: { foundSpin: boolean; observedSpins: number };
   measured: { workUsed: number; censored: boolean; [key: string]: unknown };
   certifiedWitnesses: FocusedWitness[];
+  reachableWholeBagWitnesses?: FocusedReachableWitness[];
+  targetWitness?: unknown;
   reachableWitness: unknown;
   [key: string]: unknown;
+}
+
+/** One exact input-replayed inventory, with no all-supply success claim. */
+export interface FocusedReachableWitness {
+  id: number;
+  parentId: number | null;
+  bags: number;
+  startRows: number[];
+  endRows: number[];
+  startSpins: number;
+  endSpins: number;
+  deletedRows: number;
+  targets: { piece: string; cells: [number, number][] }[];
+  representativeQueue: number[];
+  representativeInputs: string[][];
+  frames: BoardFrame[];
+  trust: 'input-reachable';
+  wholeBag: true;
 }
 
 export interface FocusedObservation {
@@ -245,6 +268,10 @@ export interface SearchSnapshot {
   /** Selective productivity/terrain cuts, separate from proven bounds. */
   selectivePruned?: number;
   duplicates?: number;
+  /** Exact oriented quiet-policy rejection cache; never selective pruning. */
+  transpositionHits?: number;
+  transpositionStores?: number;
+  transpositionImports?: number;
   bags: number;
   checked: number;
   success: number;
@@ -254,7 +281,7 @@ export interface SearchSnapshot {
   current: Candidate | null;
   best: Candidate | null;
   bestPartial: Candidate | null;
-  /** Two independent certified whole-bag routes at each reached depth. */
+  /** Two distinct fields per depth (reflection-aware display only), each with its own certified route. */
   bestByBag?: BagCandidates[];
   /** Explicit browser selection, pinned while later records improve. */
   selectedCandidate?: Candidate | null;
@@ -266,6 +293,13 @@ export interface SearchSnapshot {
 
 export type RunStatus = 'idle' | 'loading' | 'running' | 'paused' | 'cancelled' | 'completed' | 'failed';
 
+export interface QuietTranspositionBatch {
+  schemaVersion: 1;
+  policy: 'neyra-exact-quiet-tt-v1';
+  /** Full serialized verification contexts, with no mirror canonicalization. */
+  entries: string[];
+}
+
 export type EngineEvent =
   | { type: 'ready'; runId?: string }
   | { type: 'progress'; runId: string; snapshot: SearchSnapshot }
@@ -274,6 +308,7 @@ export type EngineEvent =
   | { type: 'warning'; runId: string; message: string }
   | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
   | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
+  | { type: 'transpositions'; runId: string; batch: QuietTranspositionBatch }
   | { type: 'observation'; runId: string; observationId: string; label: FocusedSpinLabel }
   | { type: 'observation-error'; runId: string; observationId: string; message: string }
   | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
@@ -281,13 +316,14 @@ export type EngineEvent =
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean; transpositionSharing?: boolean }
   | { type: 'learning-mode'; runId: string; enabled: boolean }
   | { type: 'observe'; runId: string; observationId: string; input: FocusedInput }
   | { type: 'observation-idle'; runId: string }
   | { type: 'observation-wait'; runId: string }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
   | { type: 'benchmarks'; runId: string; bestSpinsByBag: number[] }
+  | { type: 'transpositions'; runId: string; batch: QuietTranspositionBatch }
   | { type: 'watch'; runId: string; enabled: boolean }
   | { type: 'detail'; runId: string; requestId: string }
   | { type: 'export'; runId: string; requestId: string; view: CandidateView };

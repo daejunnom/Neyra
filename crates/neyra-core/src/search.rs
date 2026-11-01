@@ -5,6 +5,7 @@
 //! retained here, with a 24-row SonicDropOnly physics backend.
 
 pub mod labels;
+mod transpositions;
 
 use crate::physics::{Board, Input, Piece, Placement, Pose, HEIGHT};
 use crate::structure::{
@@ -281,6 +282,10 @@ pub struct ProgressSnapshot {
     /// Always compact; fetch one record's frames with candidate:<id> export.
     pub best_by_bag: Vec<BagCandidatesSnapshot>,
     pub duplicates: u64,
+    /// Exact quiet-policy computations reused, never heuristic or mirror cuts.
+    pub transposition_hits: u64,
+    pub transposition_stores: u64,
+    pub transposition_imports: u64,
     /// Selective productivity/terrain cuts, never exact P7 failures.
     pub selective_pruned: u64,
     /// Verified same-depth maxima; peers may share these scheduling hints only.
@@ -1985,6 +1990,10 @@ struct GenerationJob {
     mino_bound_pruned: u64,
     mino_selective_pruned: u64,
     mino_capacity_pruned: u64,
+    /// Observation-only generation has no completion or supply objective.
+    /// Its bounded beam remains selective, but cross-field futility and quiet
+    /// supply policy must not erase a real, input-reachable continuation.
+    learning_only: bool,
 }
 
 struct PrincipalMove {
@@ -2150,7 +2159,15 @@ impl GenerationJob {
             mino_bound_pruned: 0,
             mino_selective_pruned: 0,
             mino_capacity_pruned: 0,
+            learning_only: false,
         }
+    }
+
+    fn for_learning(mut self) -> Self {
+        self.learning_only = true;
+        self.minimum_success = 0;
+        self.first_bag_symmetry = false;
+        self
     }
 
     fn set_prune_budget(&mut self, goal: u8, budget: u16) {
@@ -2176,7 +2193,7 @@ impl GenerationJob {
         let state = &self.frontier[self.state_index];
         // The parent is unchanged while its remaining piece labels are visited.
         // Every child still checks current bounds before entering a frontier.
-        let cut = if self.piece_index == 0 {
+        let cut = if !self.learning_only && self.piece_index == 0 {
             mino_cut(&state.board, state.used, state.spins, bounds)
         } else { None };
         if cut.is_some() {
@@ -2276,7 +2293,9 @@ impl GenerationJob {
             let Some(target) = normalize_target(placement.pose, state.deleted) else {
                 continue;
             };
-            let first_mask = if can_be_first(&self.start, &target) {
+            let first_mask = if self.learning_only {
+                ALL_PIECES
+            } else if can_be_first(&self.start, &target) {
                 state.first_mask
             } else {
                 state.first_mask & !piece.bit()
@@ -2291,7 +2310,7 @@ impl GenerationJob {
             let first_upper = if self.first_bag_symmetry {
                 first_upper.saturating_mul(2).min(P7_COUNT as u16)
             } else { first_upper };
-            if first_upper < self.minimum_success
+            if !self.learning_only && first_upper < self.minimum_success
             {
                 self.pruned += 1;
                 continue;
@@ -2304,7 +2323,7 @@ impl GenerationJob {
             // A round reserved for quiet setup can never repair a missing
             // first choice with a later clear. Unknown targets remain allowed.
             // Mixed prefixes may change a target's clear role, so are exempt.
-            if !complete && (self.setup || (used == ALL_PIECES && spins == self.start_spins))
+            if !self.learning_only && !complete && (self.setup || (used == ALL_PIECES && spins == self.start_spins))
                 && !quiet_first_covered(first_mask & self.start_spawn, self.first_bag_symmetry)
             {
                 self.pruned += 1;
@@ -2313,12 +2332,14 @@ impl GenerationJob {
             }
             let potential = bag_potential(&result.board, used);
             let optimistic_spins = spins.saturating_add(potential.0);
-            if let Some(cut) = mino_cut_with_potential(spins, potential, bounds) {
+            if let Some(cut) = (!self.learning_only)
+                .then(|| mino_cut_with_potential(spins, potential, bounds)).flatten()
+            {
                 if cut == MinoCut::Cost { self.mino_bound_pruned += 1; self.pruned += 1; }
                 else { self.mino_selective_pruned += 1; self.selective_pruned += 1; }
                 continue;
             }
-            if !complete && used == ALL_PIECES {
+            if !self.learning_only && !complete && used == ALL_PIECES {
                 let quiet = guaranteed_quiet_targets(
                     &self.start, state.targets.iter().chain(std::iter::once(&target)), deleted,
                 );
@@ -2336,11 +2357,11 @@ impl GenerationJob {
             let (bucket, limit) = if used == ALL_PIECES {
                 (&self.complete, 12)
             } else { (&self.next_by_inventory[used as usize], per_inventory) };
-            if !complete && self.start_pieces != 0 && below_bucket_window(bucket, limit, spins) {
+            if !self.learning_only && !complete && self.start_pieces != 0 && below_bucket_window(bucket, limit, spins) {
                 self.mino_capacity_pruned += 1;
                 continue;
             }
-            if used == ALL_PIECES && !complete {
+            if !self.learning_only && used == ALL_PIECES && !complete {
                 let targets: [TargetOperation; 7] = std::array::from_fn(|index| {
                     state.targets.get(index).unwrap_or(&target).clone()
                 });
@@ -2428,7 +2449,8 @@ impl GenerationJob {
             };
             let (selective, capacity) = insert_sibling_draft(
                 &mut siblings, draft, goal,
-                if used == ALL_PIECES { 12 } else { per_inventory }, self.start_pieces != 0,
+                if used == ALL_PIECES { 12 } else { per_inventory },
+                !self.learning_only && self.start_pieces != 0,
             );
             self.mino_selective_pruned += selective;
             self.selective_pruned += selective;
@@ -3132,6 +3154,7 @@ pub struct SearchSession {
     generation_rounds: u64,
     active_budget: u16,
     physics_cache: PhysicsCache,
+    quiet_table: transpositions::QuietTable,
     focus: Option<usize>,
     pruned: u64,
     qualified_bags: u16,
@@ -3223,6 +3246,7 @@ impl SearchSession {
             generation_rounds: 0,
             active_budget,
             physics_cache: PhysicsCache::default(),
+            quiet_table: transpositions::QuietTable::default(),
             focus: Some(0),
             pruned: 0,
             qualified_bags: 0,
@@ -3283,6 +3307,7 @@ impl SearchSession {
                     // This fixed tiling violates the mandatory no-hold quiet
                     // placement policy, independently of the chance threshold.
                     self.quiet_policy_rejected += 1;
+                    self.quiet_table.reject(transpositions::key(&job.plan, self.goal));
                     self.pruned += 1;
                     self.backpropagate(job.parent, 0.0);
                 } else if job.checked == P7_COUNT {
@@ -3469,10 +3494,26 @@ impl SearchSession {
             self.forget_plan(parent, &plan);
             return;
         }
-        self.verification = Some(VerificationJob::new(parent, plan));
         self.dispatches += 1;
         self.last_checked = 0;
         self.last_success = 0;
+        if self.quiet_table.contains(&transpositions::key(&plan, self.goal)) {
+            self.quiet_policy_rejected += 1;
+            self.pruned += 1;
+            self.backpropagate(parent, 0.0);
+            return;
+        }
+        self.verification = Some(VerificationJob::new(parent, plan));
+    }
+
+    /// Internal, same-build worker exchange. Imported keys are never reflected,
+    /// persisted as certificates, echoed, or interpreted as supply probability.
+    pub fn observe_transpositions(&mut self, batch: &str) -> Result<(), String> {
+        self.quiet_table.observe(batch)
+    }
+
+    pub fn drain_transpositions(&mut self, limit: usize) -> String {
+        self.quiet_table.drain(limit)
     }
 
     fn cost_cap(&self) -> u16 {
@@ -4432,7 +4473,11 @@ impl SearchSession {
         let depth = usize::from(summary.bag_count);
         best_by_bag.resize_with(best_by_bag.len().max(depth + 1), Vec::new);
         let records = &mut best_by_bag[depth];
-        if let Some(index) = records.iter().position(|prior| prior.summary.id == summary.id) {
+        let reflected = summary.rows.map(|row| row.reverse_bits() >> 6);
+        if let Some(index) = records.iter().position(|prior| {
+            prior.summary.id == summary.id || prior.summary.rows == summary.rows
+                || prior.summary.rows == reflected
+        }) {
             if better_partial(&records[index].summary, summary) { return; }
             records[index] = candidate.clone();
         } else if records.len() < 2 {
@@ -4502,6 +4547,9 @@ impl SearchSession {
                 })
             }).collect(),
             duplicates: self.duplicates,
+            transposition_hits: self.quiet_table.hits,
+            transposition_stores: self.quiet_table.stores,
+            transposition_imports: self.quiet_table.imports,
             selective_pruned: self.selective_pruned,
             best_spins_by_bag: self.best_spins_by_bag.clone(),
         }

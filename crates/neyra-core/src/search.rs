@@ -4,6 +4,8 @@
 //! Clearra's separation of logical-row operation language and supply language is
 //! retained here, with a 24-row SonicDropOnly physics backend.
 
+pub mod labels;
+
 use crate::physics::{Board, Input, Piece, Placement, Pose, HEIGHT};
 use crate::structure::{
     map_after_clear, mask_count, placement_bias, remaining_cells, single_goals_for, single_targets,
@@ -69,6 +71,9 @@ pub struct SearchConfig {
     pub search_lane: u16,
     #[serde(alias = "searchLanes")]
     pub search_lanes: u16,
+    /// CPU model preference at certified boundaries, never a supply/spin proof.
+    #[serde(alias = "cnnEvaluation")]
+    pub cnn_evaluation: bool,
 }
 
 impl Default for SearchConfig {
@@ -87,6 +92,7 @@ impl Default for SearchConfig {
             search_profile: 0,
             search_lane: 0,
             search_lanes: 1,
+            cnn_evaluation: false,
         }
     }
 }
@@ -4169,7 +4175,10 @@ impl SearchSession {
         // Reuse this boundary's immutable geometry facts locally. No shared
         // cache or certificate policy is introduced by the reuse.
         let facts = BoardFacts::new(&job.plan.expected);
-        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future);
+        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future)
+            + if self.config.cnn_evaluation && !job.plan.terminal {
+                crate::evaluator::boundary_adjustment(&job.plan.expected)
+            } else { 0.0 };
         let obstruction = job.plan.future.obstructed_mass
             .map_or(facts.obstructed_mass, |after| facts.obstructed_mass.min(after));
         let certificate = Rc::new(BagCertificate {
@@ -4604,6 +4613,10 @@ impl SearchSession {
             "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
+            "boardEvaluation": archive.and_then(|a| crate::evaluator::evaluate(&Board { rows: a.summary.rows })),
+            "learnedOrdering": { "enabled": self.config.cnn_evaluation,
+                "scope": "CertifiedNonterminalBoundaryOnly;BeforeSpinRank;NoInputOrProbabilityEffect",
+                "maxAbsoluteAdjustment": 12.0 },
             "candidate": archive.map(|a| a.for_snapshot(true)), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",

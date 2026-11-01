@@ -12,6 +12,8 @@ export interface SearchConfig {
   budget_start: number;
   seed: number;
   beam_width: number;
+  /** Experimental CPU board model; disabled until its search value is validated. */
+  cnn_evaluation: boolean;
   /** Browser scheduling only; zero uses all reported logical processors. */
   worker_count: number;
 }
@@ -32,6 +34,44 @@ export interface BoardFrame {
   spin: boolean;
   /** Actual pre-clear physical cells; absent only in older saved records. */
   placedCells?: [number, number][];
+}
+
+/** Current-board predictions under a fixed continuation budget, never certificates. */
+export interface BoardEvaluation {
+  modelId: string;
+  shapePreference: number;
+  observedSpins: number;
+  observedChoices: number;
+  horizonBags: 2 | 3;
+  workBudget: number;
+  adjustment: number;
+  experimental: true;
+  scope: string;
+}
+
+/** Actual certified boundary input for the offline label collector. No labels are invented here. */
+export interface TrainingField {
+  schemaVersion: 1;
+  id: string;
+  rows: number[];
+  source: {
+    kind: 'search';
+    family: string;
+    reference: string;
+    runId: string;
+    candidateId: string;
+    bagBoundary: number;
+    probability: number;
+    firstBagProbability: number | null;
+    ignoreFirstBagProbability: boolean;
+    verified: true;
+    qualified: true;
+    seed: number;
+    runSeed: number;
+    modelMode: 'heuristic' | 'cnn-experimental';
+    modelId?: string;
+    buildVersion: string;
+  };
 }
 
 export interface Candidate {
@@ -60,12 +100,14 @@ export interface Candidate {
   frames: BoardFrame[];
   frameCount: number;
   rankingScore: number;
-  /** Raw forecast/terrain quality before the bounded actual-spin ranking. */
+  /** Raw forecast/terrain quality plus optional CNN preference, before actual-spin ranking. */
   fieldQuality: number;
   /** One coherent geometric continuation; never added to actual progress. */
   forecastSpins?: number;
   forecastSpinsByBag?: number[];
   forecastPlacements?: number;
+  /** Optional CPU estimate for these exact rows; independent of actual spins and probability. */
+  boardEvaluation?: BoardEvaluation;
 }
 
 export interface BagCandidates {
@@ -138,5 +180,6 @@ export const defaultConfig: SearchConfig = {
   budget_start: 0,
   seed: 1,
   beam_width: 64,
+  cnn_evaluation: false,
   worker_count: 0
 };

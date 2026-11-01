@@ -46,6 +46,16 @@ const WORKSPACE_SHAPE_LEVELS: usize = 5;
 const STRAIGHT_WORKSPACE_WINDOW_COST: f64 = 3.0;
 const STRAIGHT_WORKSPACE_LIMIT: f64 = 8.0;
 
+/// Current occupancy height only: preserve the ordinary low-field cost and
+/// add modest pressure near this engine's 24-row ceiling. The upper bands
+/// follow the shape of published board evaluators; these are Neyra's own
+/// coefficients, not copied upstream weights or a top-out proof.
+pub(crate) fn static_headroom_cost(height: u8) -> f64 {
+    (height as f64).powi(2) * 0.06
+        + (height.saturating_sub(16) as f64).powi(2) * 0.10
+        + (height.saturating_sub(20) as f64).powi(2) * 0.35
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StraightWorkspace {
     columns: u16,
@@ -1000,7 +1010,7 @@ impl BoardFacts {
             + self.sealed_components as f64
             + self.charged_cover_depth as f64 * 0.25
             + self.charged_buried_splits as f64 * 2.0
-            + (self.height as f64).powi(2) * 0.06
+            + static_headroom_cost(self.height)
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
             + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35

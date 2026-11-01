@@ -9,7 +9,7 @@ const bindgenVersion = execFileSync('wasm-bindgen', ['--version'], { encoding: '
 if (bindgenVersion !== 'wasm-bindgen 0.2.104') {
   throw new Error('Expected wasm-bindgen 0.2.104; install the version matching Cargo.lock.');
 }
-execFileSync('cargo', ['build', '--release', '--locked', '--target', 'wasm32-unknown-unknown', '-p', 'neyra-core'], {
+execFileSync('cargo', ['build', '--lib', '--release', '--locked', '--target', 'wasm32-unknown-unknown', '-p', 'neyra-core'], {
   cwd: root, stdio: 'inherit'
 });
 mkdirSync(out, { recursive: true });

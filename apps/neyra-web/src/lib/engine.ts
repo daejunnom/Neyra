@@ -1,4 +1,4 @@
-import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus, SearchConfig, SearchSnapshot } from './types';
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus, SearchConfig, SearchSnapshot, TrainingField } from './types';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
 
@@ -120,6 +120,7 @@ function complete(candidate: Candidate | null | undefined): candidate is Candida
 export class SearchClient {
   private slots: WorkerSlot[] = [];
   private runId = '';
+  private runConfig: SearchConfig | null = null;
   private intent: 'running' | 'paused' | 'cancelled' = 'cancelled';
   private status: RunStatus = 'idle';
   private currentOwner: number | null = null;
@@ -138,6 +139,7 @@ export class SearchClient {
   start(config: SearchConfig) {
     this.dispose();
     this.runId = crypto.randomUUID();
+    this.runConfig = { ...config };
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
@@ -266,6 +268,46 @@ export class SearchClient {
     }
   }
 
+  /** Export the retained certified boundaries, including a selection displaced
+   * by later records. A run is one training family to keep its related boards
+   * together when splitting training and validation data. */
+  trainingFields(): TrainingField[] {
+    if (!this.runConfig || !this.runId) return [];
+    const config = this.runConfig;
+    const records: OwnedCandidate[] = [...this.bagRecords.values()].flat();
+    if (this.selectedArchive) records.push(this.selectedArchive);
+    for (const slot of this.slots) {
+      if (slot.incumbent) records.push({ slot, candidate: slot.incumbent.candidate });
+    }
+    const seen = new Set<string>();
+    const fields: TrainingField[] = [];
+    for (const record of records) {
+      const candidate = record.candidate;
+      const id = this.ownedId(record);
+      // The label collector accepts actual post-clear, nonempty 24-row boards.
+      // A completed route can end inside a bag, so it needs this boundary check too.
+      if (seen.has(id) || !candidate.verified || !candidate.qualified ||
+          !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 ||
+          candidate.placed !== candidate.bagCount * 7 ||
+          candidate.frames.length !== candidate.frameCount || candidate.rows.length !== 24 ||
+          !candidate.rows.some((row) => row !== 0) ||
+          !candidate.rows.every((row) => Number.isInteger(row) && row >= 0 && row < 1023)) continue;
+      seen.add(id);
+      fields.push({ schemaVersion: 1, id: `${this.runId}:${id}`, rows: [...candidate.rows], source: {
+        kind: 'search', family: `search:${this.runId}`,
+        reference: `neyra:run:${this.runId}/candidate:${id}`,
+        runId: this.runId, candidateId: id, bagBoundary: candidate.bagCount,
+        probability: candidate.probability, firstBagProbability: candidate.firstBagProbability ?? null,
+        ignoreFirstBagProbability: config.ignore_first_bag_probability, verified: true, qualified: true,
+        seed: workerSeed(config.seed, record.slot.id), runSeed: config.seed,
+        modelMode: config.cnn_evaluation ? 'cnn-experimental' : 'heuristic',
+        ...(candidate.boardEvaluation ? { modelId: candidate.boardEvaluation.modelId } : {}),
+        buildVersion: version
+      } });
+    }
+    return fields.sort((a, b) => a.source.bagBoundary - b.source.bagBoundary || a.id.localeCompare(b.id));
+  }
+
   dispose() {
     clearTimeout(this.progressTimer);
     this.progressTimer = undefined;
@@ -277,6 +319,7 @@ export class SearchClient {
     this.bestSpinsByBag.fill(0);
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
+    this.runConfig = null;
     this.intent = 'cancelled';
   }
 
@@ -446,10 +489,15 @@ export class SearchClient {
 
   private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
     const merge = (next: Candidate | null, previous: Candidate | null | undefined, exactRecord = false) => {
+      const sameRows = !!next && !!previous && next.rows.length === previous.rows.length &&
+        next.rows.every((row, y) => row === previous.rows[y]);
+      if (next && !next.boardEvaluation && sameRows && previous?.boardEvaluation) {
+        next = { ...next, boardEvaluation: previous.boardEvaluation };
+      }
       if (next && next.frames.length === 0 && next.frameCount > 0 && previous?.id === next.id &&
           (!exactRecord || samePartialRecord(next, previous)) &&
           previous.verified === next.verified && previous.placed === next.placed && previous.spins === next.spins &&
-          previous.rows.length === next.rows.length && previous.rows.every((row, y) => row === next.rows[y]) &&
+          sameRows &&
           previous.frames.length === next.frameCount) return { ...next, frames: previous.frames };
       return next;
     };

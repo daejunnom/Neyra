@@ -36,8 +36,30 @@
   or benchmark result reports. Keep these outside the repository. Evaluate
   additional computation sharing with matched-work ABBA measurements before
   adopting it; worker-local caches do not imply a global shared search DAG.
-- Use explicit static board features and structural obligations for evaluation.
-  Do not introduce NNUE, training data dependencies, or learned evaluation.
+- Keep explicit static board features and structural obligations as the current
+  teacher and fallback. The user has authorized a small CPU CNN pilot. Train it
+  only on current-board occupancy/covered-air inputs; keep action rewards,
+  history, inventory, forecasts and opener identity out of inference inputs.
+  Inspect actual accessible source before using another engine's board features;
+  never infer closed-source evaluation or copy private reference implementation.
+  The portable Rust/WASM CNN uses no GPU connection or runtime ML dependency.
+  Learned ordering is an explicit experimental option, disabled by default until
+  independent search evidence supports promotion. Apply its bounded preference
+  once at certified nonterminal boundaries before ordinary rank normalization;
+  do not alter spins, physics, probability, necessary bounds or supply certificates.
+- Learning observations begin at nonempty completed bag boundaries and use two
+  or three new inventories with a fixed declared work/node/attempt budget.
+  Keep input-reachable observations distinct from exact P7/quiet-safe chains.
+  Count distinct productive fixed-plan chains, not input sequences or zero-spin
+  filling alternatives. Limited search is censored; an unobserved certificate
+  maximum stays unknown. Published opener quality is a separate weak prior,
+  never a fabricated spin/probability target. Split whole opener families and
+  search runs/seeds; purge identical and reflected boards across splits.
+  Commit reusable collection/training/storage tools and the selected runtime
+  model, but keep datasets, new tests, one-time experiments and result reports
+  outside this repository. Record dataset, labeling-source and model hashes.
+  Private remote tables require scoped access; never put privileged keys in the
+  browser or permit anonymous training-data writes.
 - The overall construction-success threshold defaults to 100%; preserve
   explicit saved user settings. The independent per-bag floor defaults to 100%
   and applies from bag two; the first-bag floor is separate, as below.

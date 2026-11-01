@@ -1,4 +1,5 @@
 pub mod physics;
+pub mod evaluator;
 pub mod search;
 mod srs_plus;
 mod structure;
@@ -6,6 +7,18 @@ pub mod supply;
 
 use search::{SearchConfig, SearchSession};
 use wasm_bindgen::prelude::*;
+
+/// Evaluate a current post-clear board without starting or advancing search.
+#[wasm_bindgen]
+pub fn evaluate_board(rows_json: &str) -> Result<String, JsValue> {
+    let rows: [u16; physics::HEIGHT] = serde_json::from_str(rows_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid board: {e}")))?;
+    if rows.iter().any(|&row| row > physics::FULL_ROW) {
+        return Err(JsValue::from_str("Board cells exceed ten columns"));
+    }
+    serde_json::to_string(&evaluator::evaluate(&physics::Board { rows }))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
 
 #[wasm_bindgen]
 pub struct NeyraEngine {

@@ -50,6 +50,9 @@
   const evaluationNumber = new Intl.NumberFormat('ko-KR', {
     minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'exceptZero'
   });
+  const predictionNumber = new Intl.NumberFormat('ko-KR', {
+    minimumFractionDigits: 1, maximumFractionDigits: 1
+  });
   const piecePlayback = createPiecePlayback();
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
@@ -246,6 +249,7 @@
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
     if (!Number.isSafeInteger(value.seed) || value.seed < 1 || value.seed > 4294967295) return '시드는 1–4,294,967,295 사이의 정수로 입력해 주세요.';
     if (![16, 32, 64, 128].includes(value.beam_width)) return '탐색 폭 설정을 다시 선택해 주세요.';
+    if (typeof value.cnn_evaluation !== 'boolean') return 'CNN 평가 설정을 다시 선택해 주세요.';
     if (!Number.isInteger(value.worker_count) || value.worker_count < 0 || value.worker_count > MAX_WORKERS) return `동시 탐색 수는 자동(0) 또는 1–${MAX_WORKERS} 사이의 정수로 입력해 주세요.`;
     return '';
   }
@@ -286,6 +290,21 @@
     anchor.href = url; anchor.download = document.filename; anchor.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     savedMessage = '문서를 저장했어요.';
+  }
+  function exportTrainingFields() {
+    const fields = client?.trainingFields() ?? [];
+    if (fields.length === 0) {
+      savedMessage = '검증을 마친 가방 경계 필드가 생기면 저장할 수 있어요.';
+      return;
+    }
+    const text = fields.map((field) => JSON.stringify(field)).join('\n') + '\n';
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/x-ndjson' }));
+    const anchor = window.document.createElement('a');
+    anchor.href = url;
+    anchor.download = `neyra-training-fields-${fields[0].source.runId}.jsonl`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    savedMessage = `학습 입력 필드 ${fields.length}개를 저장했어요. 후속 탐색 표지는 수집기로 계산할 수 있습니다.`;
   }
   async function exportResult(action: 'download' | 'copy') {
     if (!client || !candidate || exportBusy) return;
@@ -471,6 +490,13 @@
               <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
             {/if}
           </button>
+          {#if displayedConfig.cnn_evaluation && bestRoute.boardEvaluation}
+            <div class="cnn-estimate" data-candidate-id={bestRoute.id} aria-label="최선 경로 최종 필드의 실험 CNN 예측">
+              <span>소형 CNN · 실험</span>
+              <p>후속 {bestRoute.boardEvaluation.horizonBags}가방 예측: <b>{predictionNumber.format(bestRoute.boardEvaluation.observedSpins)}스핀 · {predictionNumber.format(bestRoute.boardEvaluation.observedChoices)}경로</b></p>
+              <small>이 경로의 최종 필드를 제한 예산으로 추정한 값이에요. 실제 스핀 기록과 성공률은 별도로 확인합니다.</small>
+            </div>
+          {/if}
           {#if bagProbabilities.length > 0}
             <section class="bag-chances" aria-label={selectedRoute ? '선택한 경로의 가방별 구축률' : '최선 경로의 가방별 구축률'}>
               <h4>가방별 구축률</h4>
@@ -520,6 +546,7 @@
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
         {/if}
         <p class="verification-note">{verificationLabel(candidate)}</p>
+        <div class="learning-export"><button class="text-button" disabled={bagCandidates.length === 0 && !bestRoute?.verified} onclick={exportTrainingFields} title="보관된 가방별 후보와 선택한 경로의 검증된 경계 필드를 JSONL로 저장합니다."><Icon name="download" size={12} />학습 필드 저장</button></div>
         <span class="save-status" role="status">{savedMessage}</span>
       </section>
     </aside>
@@ -537,6 +564,7 @@
       <label class="full-row"><span>확률 완화 최소 스핀 <small>개/가방</small></span><input type="number" min="0" max="6" step="1" required bind:value={draft.risk_min_spins_per_bag} /><small>2가방부터 이 수 미만이면 100%를 요구해요. 0은 스핀 수 제한 없음입니다.</small></label>
       <label><span>미노 제한 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>탐색 상한 안의 더 긴 결과도 보관해요.</small></label>
       <label><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
+      <label class="full-row checkbox-setting"><span><input type="checkbox" bind:checked={draft.cnn_evaluation} aria-describedby="cnn-evaluation-note" />소형 CNN 평가 (실험)</span><small id="cnn-evaluation-note">현재 필드의 후속 가능성을 예측해 탐색 평가에 작게 반영해요. CPU에서 실행하며 기본은 꺼짐입니다.</small></label>
     </div>
     <details class="advanced-options"><summary>추가 설정 <span>첫 가방 · 동시 탐색 · 범위</span></summary><div class="settings-grid">
       <label class="full-row checkbox-setting" title="첫 가방은 별도 최소값으로 확인하고, 전체 성공률은 2가방부터 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">전체 성공률은 2가방부터 계산해요.</small></label>
@@ -561,6 +589,7 @@
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
+  <p><strong>소형 CNN 평가</strong>는 현재 필드만 보고 제한된 후속 2–3가방 탐색에서 찾을 스핀과 경로 수를 예측하는 실험 기능입니다. 예측에 사용한 가방 수를 결과에 함께 표시하며, 실제 스핀·구축 확률 검증은 기존 탐색기가 담당합니다. <strong>학습 필드 저장</strong>은 검증된 가방 경계의 실제 필드를 저장하며, 후속 탐색 결과는 별도 수집기로 계산할 수 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

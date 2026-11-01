@@ -98,10 +98,12 @@ D = R_connected
   + 2 H_f + 0.5 U_f
   + 0.5 닫힌셀수 + 닫힌성분수
   + 0.25 C_f + 2 B_f
-  + 0.06 h² + 0.04 n
+  + H(h) + 0.04 n
   + 3 max(A−A_w,0) + 0.35 max(M−M_w,0)
   + 낮은좁은틈비용 + 직선공동비용
 ```
+
+최고 높이 비용은 `H(h)=0.06h²+0.10max(h−16,0)²+0.35max(h−20,0)²`다. 16행까지는 이전 값과 같고, 18/20/22/24행에서는 이전 높이 비용에 각각 0.4/1.6/5/12점이 추가된다. [Cold Clear의 정적 높이 특징](https://github.com/MinusKelvin/cold-clear/blob/279edd7c3177ff8077f6a930193397814b281f27/bot/src/evaluation/standard.rs)과 [Fusion의 순수 보드 형상 평가](https://github.com/MosaicTETR/fusion/blob/1eb879f34a77b868ef3ef0025714e0094bf06eca/src/eval.rs)에서 상단으로 갈수록 비용을 강화하는 원리만 참고했다. 16·20행 기준과 계수는 24행 필드를 위한 Neyra의 정책값이다. 현재 점유 높이만 사용하며 다음 미노, 직전 배치, 공격량, 가상 줄 삭제는 사용하지 않는다. 지붕의 양의 점수는 독립적으로 남고, 이 비용으로 입력 실패나 top-out을 확정하지 않는다.
 
 즉시 witness가 없으면 `A_w=M_w=0`이다. 공동 밖의 기본 `2 H_f`는 이 버전에서 유지된다. `terrain_score_witnessed`라고 해서 모든 구멍·덮개 비용을 지우는 것은 아니다.
 

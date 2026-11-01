@@ -43,7 +43,8 @@ function mass(rows: number[]): number {
   return rows.reduce((total, row) => { while (row) { total++; row &= row - 1; } return total; }, 0);
 }
 function equalRows(a: number[], b: number[]): boolean { return a.every((row, i) => row === b[i]); }
-function cleanTrace(value: unknown, endRows: number[], bagDepth: number, probability: number) {
+function cleanTrace(value: unknown, endRows: number[], bagDepth: number, probability: number,
+  modelMode: 'heuristic' | 'cnn', modelId?: string, weightsSha256?: string) {
   const t = object(value);
   onlyKeys(t, ['schemaVersion', 'kind', 'prefixOmittedBags', 'start', 'steps', 'evaluation', 'search', 'outcome']);
   if (t.schemaVersion !== 1 || t.kind !== 'retained-path') throw new Rejection(400, 'Invalid trace version');
@@ -70,9 +71,12 @@ function cleanTrace(value: unknown, endRows: number[], bagDepth: number, probabi
   if (o.spins !== previous.spins || o.placed !== previous.placed || o.bagCount !== bagDepth ||
       o.countedProbability !== probability) throw new Rejection(400, 'Trace outcome mismatch');
   const e = object(t.evaluation);
-  onlyKeys(e, ['kind', 'rawQuality', 'rankingScore', 'forecastSpins', 'forecastSpinsByBag', 'forecastPlacements']);
-  if (e.kind !== 'heuristic' || !Array.isArray(e.forecastSpinsByBag) || e.forecastSpinsByBag.length > 2) throw new Rejection(400, 'Invalid trace evaluator');
-  const evaluation = {kind: 'heuristic', rawQuality: nullableNumber(e.rawQuality, -1e12, 1e12),
+  onlyKeys(e, ['kind', 'rawQuality', 'rankingScore', 'forecastSpins', 'forecastSpinsByBag', 'forecastPlacements', 'modelId', 'weightsSha256']);
+  if (e.kind !== modelMode || !Array.isArray(e.forecastSpinsByBag) || e.forecastSpinsByBag.length > 2 ||
+    (modelMode === 'cnn' ? e.modelId !== modelId || e.weightsSha256 !== weightsSha256
+      : e.modelId !== undefined || e.weightsSha256 !== undefined)) throw new Rejection(400, 'Invalid trace evaluator');
+  const evaluation = {kind: modelMode, ...(modelMode === 'cnn' ? {modelId, weightsSha256} : {}),
+    rawQuality: nullableNumber(e.rawQuality, -1e12, 1e12),
     rankingScore: nullableNumber(e.rankingScore, -1e12, 1e12), forecastSpins: nullableNumber(e.forecastSpins, 0, 12, true),
     forecastSpinsByBag: e.forecastSpinsByBag.map(v => number(v, 0, 6, true)),
     forecastPlacements: nullableNumber(e.forecastPlacements, 0, 14, true)};
@@ -104,11 +108,18 @@ function cleanInput(value: unknown) {
   const source = object(field.source);
   onlyKeys(source, ['kind', 'family', 'reference', 'runId', 'candidateId', 'bagBoundary', 'probability',
     'firstBagProbability', 'ignoreFirstBagProbability', 'verified', 'qualified', 'seed', 'runSeed',
-    'modelMode', 'buildVersion', 'rules', 'searchConfig']);
+    'modelMode', 'evaluatorModelId', 'evaluatorWeightsSha256', 'buildVersion', 'rules', 'searchConfig']);
   const runId = text(source.runId, 80);
   if (!/^[a-zA-Z0-9-]{16,80}$/.test(runId) || source.family !== `search:${runId}` ||
-      source.kind !== 'search' || source.modelMode !== 'heuristic' || source.rules !== RULES ||
+      source.kind !== 'search' || !['heuristic', 'cnn'].includes(String(source.modelMode)) || source.rules !== RULES ||
       source.verified !== true || source.qualified !== true) throw new Rejection(400, 'Invalid search provenance');
+  const modelMode = source.modelMode as 'heuristic' | 'cnn';
+  const modelId = modelMode === 'cnn' ? text(source.evaluatorModelId, 200) : undefined;
+  const weightsSha256 = modelMode === 'cnn' ? text(source.evaluatorWeightsSha256, 64) : undefined;
+  if (modelMode === 'cnn' ? !/^[0-9a-f]{64}$/.test(weightsSha256!) || number(source.bagBoundary, 1, 128, true) < 2
+    : source.evaluatorModelId !== undefined || source.evaluatorWeightsSha256 !== undefined) {
+    throw new Rejection(400, 'Invalid evaluator provenance');
+  }
   const candidateId = text(source.candidateId, 100);
   if (!/^w\d+:plan-\d+$/.test(candidateId) || field.id !== `${runId}:${candidateId}` ||
       source.reference !== `neyra:run:${runId}/candidate:${candidateId}`) throw new Rejection(400, 'Invalid record identity');
@@ -123,7 +134,8 @@ function cleanInput(value: unknown) {
     firstBagProbability: source.firstBagProbability === null ? null : number(source.firstBagProbability, 0, 1),
     ignoreFirstBagProbability: bool(source.ignoreFirstBagProbability), verified: true, qualified: true,
     seed: number(source.seed, 0, 0xffffffff, true), runSeed: number(source.runSeed, 0, 0xffffffff, true),
-    modelMode: 'heuristic', buildVersion: text(source.buildVersion, 96), rules: RULES,
+    modelMode, ...(modelMode === 'cnn' ? {evaluatorModelId: modelId, evaluatorWeightsSha256: weightsSha256} : {}),
+    buildVersion: text(source.buildVersion, 96), rules: RULES,
     trust: 'unverified-contribution',
     searchConfig: {
       minSuccessPercent: number(c.minSuccessPercent, 0, 100),
@@ -133,7 +145,8 @@ function cleanInput(value: unknown) {
       pieceGoal: number(c.pieceGoal, 1, 1000, true), maxPieces: number(c.maxPieces, 1, 700, true),
       beamWidth: number(c.beamWidth, 16, 128, true)
     }
-  }, trace: cleanTrace(field.trace, rows, number(source.bagBoundary, 1, 100, true), number(source.probability, 0, 1))};
+  }, trace: cleanTrace(field.trace, rows, number(source.bagBoundary, 1, 100, true), number(source.probability, 0, 1),
+    modelMode, modelId, weightsSha256)};
   if (new TextEncoder().encode(JSON.stringify(result)).length > 6144 ||
       new TextEncoder().encode(storageJson(result)).length > 8192) throw new Rejection(413, 'Contribution exceeds storage limit');
   return result;
@@ -141,6 +154,12 @@ function cleanInput(value: unknown) {
 async function digest(value: string): Promise<string> {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))),
     byte => byte.toString(16).padStart(2, '0')).join('');
+}
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') return `{${Object.keys(value).sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalJson((value as ObjectValue)[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
 }
 async function readBody(request: Request): Promise<ObjectValue> {
   const declared = Number(request.headers.get('content-length'));
@@ -179,6 +198,12 @@ async function rest(path: string, init: RequestInit = {}): Promise<Response> {
     const error = await response.json().catch(() => ({}));
     if (error.message === 'contribution limit' || error.message === 'contribution queue full') {
       throw new Rejection(429, 'Contribution capacity reached');
+    }
+    if (error.message === 'observation identity conflict' || error.message === 'unknown observation receipt') {
+      throw new Rejection(409, error.message);
+    }
+    if (['invalid observation', 'invalid batch', 'invalid run', 'invalid observation receipt'].includes(error.message)) {
+      throw new Rejection(400, 'Invalid contribution record');
     }
     throw new Rejection(503, 'Storage unavailable');
   }
@@ -227,7 +252,9 @@ Deno.serve(async (request: Request) => {
           return `and(board_key.eq.${key},bag_depth.eq.${depth})`; });
         const response = await rest(`neyra_contribution_queue?or=(${receipts.join(',')})&acknowledged_at=is.null`,
           {method: 'PATCH', headers: {'Prefer': 'return=representation'}, body: JSON.stringify({acknowledged_at: new Date().toISOString()})});
-        return respond({acknowledged: (await response.json()).length});
+        // A repeat ACK is successful even when the original PATCH response was
+        // lost. Exact depth predicates cannot retire a newer queued revision.
+        return respond({acknowledged: (await response.json()).length, acknowledgedIds: ids});
       }
       if (body.action === 'stats') {
         const [response, observations] = await Promise.all([
@@ -240,15 +267,30 @@ Deno.serve(async (request: Request) => {
       if (body.action === 'pull-observations') {
         const limit = number(body.limit ?? 1, 1, 4, true);
         const records = await (await rest(`neyra_observation_queue?select=queue_key,observation&order=created_at.asc,sequence.asc,queue_key.asc&limit=${limit}`)).json();
-        return respond({observations: records.map((row: {queue_key: string; observation: unknown}) =>
-          ({queueId: row.queue_key, observation: row.observation}))});
+        return respond({observations: await Promise.all(records.map(async (row: {queue_key: string; observation: unknown}) =>
+          ({queueId: row.queue_key, observation: row.observation,
+            payloadSha256: await digest(canonicalJson(row.observation))})))});
       }
       if (body.action === 'ack-observations') {
         if (!Array.isArray(body.ids) || !body.ids.length || body.ids.length > 32 ||
           body.ids.some(id => typeof id !== 'string' || !/^[0-9a-f]{64}$/.test(id))) throw new Rejection(400, 'Invalid observation acknowledgement');
-        const response = await rest(`neyra_observation_queue?queue_key=in.(${[...new Set(body.ids)].join(',')})`,
-          {method: 'DELETE', headers: {'Prefer': 'return=representation'}});
-        return respond({acknowledged: (await response.json()).length});
+        const ids = [...new Set(body.ids as string[])];
+        const filter = `queue_key=in.(${ids.join(',')})`;
+        const [queued, recorded] = await Promise.all([
+          rest(`neyra_observation_queue?${filter}&select=queue_key,observation`).then(r => r.json()),
+          rest(`neyra_observation_receipts?${filter}&select=queue_key,payload_sha256`).then(r => r.json())
+        ]);
+        const hashes = new Map<string, string>(recorded.map((row: {queue_key: string; payload_sha256: string}) =>
+          [row.queue_key, row.payload_sha256]));
+        // Legacy queued observations acquire the same immutable receipt as new
+        // admissions. Raw data is only removed in the receipt transaction.
+        for (const row of queued) hashes.set(row.queue_key, await digest(canonicalJson(row.observation)));
+        if (ids.some(id => !hashes.has(id))) throw new Rejection(409, 'Unknown observation receipt');
+        const response = await rest('rpc/neyra_ack_observations', {method: 'POST', body: JSON.stringify({
+          p_receipts: ids.map(queue_key => ({queue_key, payload_sha256: hashes.get(queue_key)}))
+        })});
+        const result = await response.json();
+        return respond({...result, receipts: ids.map(queueId => ({queueId, state: 'imported'}))});
       }
       throw new Rejection(400, 'Unknown consumer action');
     }
@@ -260,10 +302,14 @@ Deno.serve(async (request: Request) => {
       onlyKeys(body, ['schemaVersion', 'consent', 'observations']);
       if (!Array.isArray(body.observations) || body.observations.length !== 1) throw new Rejection(400, 'One focused observation is required');
       const observation = cleanObservation(body.observations[0]);
-      const response = await rest('rpc/neyra_admit_observation', {method: 'POST', body: JSON.stringify({
-        p_key: await digest(observation.id), p_observation: observation
+      const queueId = await digest(observation.id);
+      const payloadSha256 = await digest(canonicalJson(observation));
+      const response = await rest('rpc/neyra_admit_observation_v2', {method: 'POST', body: JSON.stringify({
+        p_key: queueId, p_observation: observation, p_payload_sha256: payloadSha256
       })});
-      return respond(await response.json());
+      const result = await response.json();
+      return respond({...result, receipt: {kind: 'focused-observation', id: observation.id,
+        queueId, payloadSha256, state: result.state}});
     }
     onlyKeys(body, ['schemaVersion', 'consent', 'fields']);
     if (body.schemaVersion !== 3 || !Array.isArray(body.fields) || !body.fields.length || body.fields.length > 8) {
@@ -277,7 +323,8 @@ Deno.serve(async (request: Request) => {
     }));
     if (new TextEncoder().encode(storageJson(records)).length > MAX_TRACE_BODY) throw new Rejection(413, 'Batch exceeds storage limit');
     const response = await rest('rpc/neyra_admit_contributions', {method: 'POST', body: JSON.stringify({p_records: records})});
-    return respond(await response.json());
+    return respond({...await response.json(), receipts: records.map(record =>
+      ({id: record.input.id, bagBoundary: record.bag_depth}))});
   } catch (error) {
     const rejected = error instanceof Rejection || error instanceof ObservationError;
     return respond({error: rejected ? error.message : 'Service temporarily unavailable'}, rejected ? error.status : 503);

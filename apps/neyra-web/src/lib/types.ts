@@ -12,8 +12,9 @@ export interface SearchConfig {
   budget_start: number;
   seed: number;
   beam_width: number;
-  /** Compatibility field. Public search always forces the existing evaluator. */
+  /** Legacy compatibility only; use the explicit board evaluator selection. */
   cnn_evaluation: boolean;
+  board_evaluator: 'heuristic' | 'cnn-v5';
   /** Browser scheduling only; zero uses all reported logical processors. */
   worker_count: number;
 }
@@ -56,7 +57,9 @@ export interface TrainingField {
     qualified: true;
     seed: number;
     runSeed: number;
-    modelMode: 'heuristic';
+    modelMode: 'heuristic' | 'cnn';
+    evaluatorModelId?: string;
+    evaluatorWeightsSha256?: string;
     buildVersion: string;
     rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
     searchConfig: {
@@ -87,7 +90,9 @@ export interface RetainedSearchTrace {
   start: { rows: number[]; spins: number; placed: number };
   steps: Pick<BoardFrame, 'piece' | 'rows' | 'spins' | 'placed' | 'lines' | 'spin'>[];
   evaluation: {
-    kind: 'heuristic';
+    kind: 'heuristic' | 'cnn';
+    modelId?: string;
+    weightsSha256?: string;
     rawQuality: number | null;
     rankingScore: number | null;
     forecastSpins: number | null;
@@ -269,6 +274,8 @@ export interface BagCandidates {
 }
 
 export interface SearchSnapshot {
+  evaluator?: { requested: string; active: 'heuristic' | 'cnn-v5'; modelId: string | null; weightsSha256: string | null;
+    fallbackReason: string | null; scope: string; learningComplete: boolean };
   phase: string;
   expanded: number;
   candidates: number;
@@ -330,7 +337,7 @@ export type EngineEvent =
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean; transpositionSharing?: boolean }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; modelJson?: string; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean; transpositionSharing?: boolean }
   | { type: 'learning-mode'; runId: string; enabled: boolean }
   | { type: 'observe'; runId: string; observationId: string; input: FocusedInput }
   | { type: 'observation-idle'; runId: string }
@@ -354,5 +361,6 @@ export const defaultConfig: SearchConfig = {
   seed: 1,
   beam_width: 64,
   cnn_evaluation: false,
+  board_evaluator: 'heuristic',
   worker_count: 0
 };

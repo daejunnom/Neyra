@@ -1,4 +1,5 @@
 import type { FocusedInput, FocusedObservation, FocusedReachableWitness, FocusedSpinLabel, FocusedWitness, TrainingField } from './types';
+import { learningHistory } from './learning-history';
 
 export type FocusedOrigin = {
   input: FocusedInput;
@@ -84,7 +85,7 @@ export function focusedRoot(field: TrainingField): FocusedOrigin | null {
     rules: source.rules, trust: 'client-reported'
   } }, rootCandidateId: source.candidateId, parentObservationId: null, parentWitnessId: null, gain: 0,
   ...(Number.isFinite(field.trace?.evaluation.rawQuality) ?
-    { evaluation: { kind: 'heuristic' as const, score: field.trace!.evaluation.rawQuality! } } : {}) };
+    { evaluation: { kind: field.trace!.evaluation.kind, score: field.trace!.evaluation.rawQuality! } } : {}) };
 }
 
 /** Read exact native evidence before using a result field as another origin. */
@@ -544,7 +545,7 @@ export class FocusedFrontier {
   get length() { return this.pending.length; }
 
   add(origin: FocusedOrigin) {
-    if (this.seen.size >= 4096 || !rows(origin.input.rows)) return;
+    if (this.seen.size >= 4096 || !rows(origin.input.rows) || learningHistory.has(origin.input.rows)) return;
     const key = focusedBoardKey(origin.input.rows);
     if (this.seen.has(key)) return;
     const previous = this.pendingByKey.get(key);
@@ -564,6 +565,12 @@ export class FocusedFrontier {
   }
 
   take() {
+    learningHistory.refresh();
+    this.pending = this.pending.filter(origin => {
+      if (!learningHistory.has(origin.input.rows)) return true;
+      this.pendingByKey.delete(focusedBoardKey(origin.input.rows));
+      return false;
+    });
     if (!this.pending.length) return null;
     const pool = this.pending;
     // Scores from different evaluators have different units. Select a homogeneous

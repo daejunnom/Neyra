@@ -217,11 +217,11 @@ export class SearchClient {
   setObservationTransport(state: ContributionState) {
     this.observationTransportPending = state.observationQueued;
     this.observationTransportReady = state.enabled &&
-      !['disabled', 'unavailable', 'paused'].includes(state.phase);
+      !['disabled', 'unavailable', 'recovering', 'paused'].includes(state.phase);
     this.scheduleFocused();
   }
 
-  start(config: SearchConfig) {
+  start(config: SearchConfig, modelJson?: string) {
     this.dispose();
     this.runId = crypto.randomUUID();
     this.runConfig = { ...config, cnn_evaluation: false };
@@ -262,6 +262,7 @@ export class SearchClient {
       try {
         slot.worker.postMessage({
           type: 'start', runId,
+          modelJson: config.board_evaluator === 'cnn-v5' ? modelJson : undefined,
           config: { ...engineConfig, cnn_evaluation: false, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
           assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching,
@@ -404,7 +405,10 @@ export class SearchClient {
       probability: candidate.probability, firstBagProbability: candidate.firstBagProbability ?? null,
       ignoreFirstBagProbability: config.ignore_first_bag_probability, verified: true, qualified: true,
       seed: workerSeed(config.seed, record.slot.id), runSeed: config.seed,
-      modelMode: 'heuristic', buildVersion: version,
+      modelMode: candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? 'cnn' : 'heuristic',
+      ...(candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? {
+        evaluatorModelId: record.slot.snapshot.evaluator.modelId ?? undefined,
+        evaluatorWeightsSha256: record.slot.snapshot.evaluator.weightsSha256 ?? undefined } : {}), buildVersion: version,
       rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1',
       searchConfig: {
         minSuccessPercent: config.min_success_percent,
@@ -450,7 +454,10 @@ export class SearchClient {
     const count = (value: number | undefined) => integer(value, Number.MAX_SAFE_INTEGER) ? value : null;
     const forecastByBag = candidate.forecastSpinsByBag ?? [];
     return { schemaVersion: 1, kind: 'retained-path', prefixOmittedBags: offset / 7, start, steps,
-      evaluation: { kind: 'heuristic', rawQuality: finite(candidate.fieldQuality), rankingScore: finite(candidate.rankingScore),
+      evaluation: { kind: candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? 'cnn' : 'heuristic',
+        ...(candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? {
+          modelId: record.slot.snapshot.evaluator.modelId ?? undefined, weightsSha256: record.slot.snapshot.evaluator.weightsSha256 ?? undefined } : {}),
+        rawQuality: finite(candidate.fieldQuality), rankingScore: finite(candidate.rankingScore),
         forecastSpins: integer(candidate.forecastSpins, 6) ? candidate.forecastSpins : null,
         forecastSpinsByBag: forecastByBag.length <= 2 && forecastByBag.every((value) => integer(value, 6)) ? [...forecastByBag] : [],
         forecastPlacements: integer(candidate.forecastPlacements, 14) ? candidate.forecastPlacements : null },
@@ -906,6 +913,7 @@ export class SearchClient {
     const selected = current?.slot.snapshot;
     const owned = (item: OwnedCandidate | null) => item ? { ...item.candidate, id: this.ownedId(item) } : null;
     this.receive({ type: 'progress', runId: this.runId, snapshot: {
+      evaluator: selected?.evaluator ?? values[0]?.evaluator,
       phase: selected?.phase ?? 'searching',
       expanded: sum((value) => value.expanded),
       candidates: sum((value) => value.candidates),

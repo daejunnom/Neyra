@@ -3,6 +3,7 @@
 
 use crate::physics::{Board, HEIGHT, WIDTH};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -13,6 +14,37 @@ pub const PRECISION_BAG_TASK: &str = "naga-next-bag-spin-v5";
 pub const MODEL_PARAMETERS: usize = 33_442;
 const MODEL_JSON: &str = include_str!("../models/naga-spin-cnn-v2.json");
 const MODEL_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const WEIGHTS_HASH_ALGORITHM: &str = "sha256-f32le-neyraspin-v2";
+pub(crate) const WEIGHT_LAYOUT: [(&str, usize); 10] = [
+    ("conv1.weight", 216), ("conv1.bias", 24),
+    ("conv2.weight", 6912), ("conv2.bias", 32),
+    ("conv3.weight", 13824), ("conv3.bias", 48),
+    ("hidden.weight", 12288), ("hidden.bias", 32),
+    ("output.weight", 64), ("output.bias", 2),
+];
+
+pub(crate) fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub(crate) fn validate_weights(
+    weights: &HashMap<String, Vec<f32>>, layout: &[(&str, usize)], expected_hash: &str,
+) -> Result<(), String> {
+    if weights.len() != layout.len() || !valid_digest(expected_hash) {
+        return Err("Unexpected model tensors or invalid weights digest".into());
+    }
+    let mut digest = Sha256::new();
+    for &(name, size) in layout {
+        let values = weights.get(name).ok_or_else(|| format!("Missing tensor {name}"))?;
+        if values.len() != size || values.iter().any(|x| !x.is_finite() || x.abs() > 1000.0) {
+            return Err(format!("Invalid tensor {name}"));
+        }
+        for value in values { digest.update(value.to_le_bytes()); }
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected_hash { return Err("Model weights hash mismatch".into()); }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +117,14 @@ pub struct SpinModel {
     initialization: Option<Initialization>,
     target_derivation: Option<TargetDerivation>,
     training_objective: Option<TrainingObjective>,
+    weights_sha256: String,
+    weights_sha256_algorithm: String,
+    output_names: Vec<String>,
+    count_scale: u8,
+    dataset_sha256: Option<String>,
+    dataset_hash_algorithm: Option<String>,
+    training_dataset_lineage: Option<Vec<String>>,
+    search_ordering_enabled: bool,
     weights: HashMap<String, Vec<f32>>,
 }
 
@@ -177,20 +217,22 @@ impl SpinModel {
         {
             return Err("Unsupported spin-only CPU model contract".into());
         }
-        let layout = [
-            ("conv1.weight", 216), ("conv1.bias", 24),
-            ("conv2.weight", 6912), ("conv2.bias", 32),
-            ("conv3.weight", 13824), ("conv3.bias", 48),
-            ("hidden.weight", 12288), ("hidden.bias", 32),
-            ("output.weight", 64), ("output.bias", 2),
-        ];
-        if model.weights.len() != layout.len() { return Err("Unexpected model tensors".into()); }
-        for (name, size) in layout {
-            let values = model.weights.get(name).ok_or_else(|| format!("Missing tensor {name}"))?;
-            if values.len() != size || values.iter().any(|x| !x.is_finite() || x.abs() > 1000.0) {
-                return Err(format!("Invalid tensor {name}"));
+        if model.weights_sha256_algorithm != WEIGHTS_HASH_ALGORITHM || model.search_ordering_enabled
+            || !matches!(model.dataset_hash_algorithm.as_deref().unwrap_or("sha256-raw-jsonl-v1"),
+                "sha256-raw-jsonl-v1" | "sha256-neyra-canonical-projected-records-v1" | "sha256-neyra-refined-records-v1")
+            || model.output_names != ["foundSpinLogit", "observedSpinsScaled"] || model.count_scale != 6
+            || model.trained && !model.dataset_sha256.as_deref().is_some_and(valid_digest) {
+            return Err("Invalid spin model output or provenance contract".into());
+        }
+        if let Some(lineage) = &model.training_dataset_lineage {
+            let unique: std::collections::HashSet<_> = lineage.iter().collect();
+            if lineage.is_empty() || lineage.len() > 256 || unique.len() != lineage.len()
+                || lineage.iter().any(|hash| !valid_digest(hash))
+                || !model.dataset_sha256.as_ref().is_some_and(|hash| lineage.contains(hash)) {
+                return Err("Invalid spin model training lineage".into());
             }
         }
+        validate_weights(&model.weights, &WEIGHT_LAYOUT, &model.weights_sha256)?;
         if !model.trained && ["output.weight", "output.bias"].iter()
             .any(|name| model.weights[*name].iter().any(|value| *value != 0.0)) {
             return Err("Untrained next-bag initialization must have a reset output head".into());
@@ -199,25 +241,8 @@ impl SpinModel {
     }
 
     pub fn raw_prediction(&self, board: &Board) -> Option<[f32; 2]> {
-        if board.rows.iter().all(|&r| r == 0) || board.rows.iter().any(|&r| r >= 1023) { return None; }
         let w = &self.weights;
-        let first = convolution(&encode(board), 1, 24, &w["conv1.weight"], &w["conv1.bias"]);
-        let second = convolution(&first, 24, 32, &w["conv2.weight"], &w["conv2.bias"]);
-        let third = convolution(&second, 32, 48, &w["conv3.weight"], &w["conv3.bias"]);
-        let mut pooled = [0.0; 384];
-        for channel in 0..48 {
-            for py in 0..4 {
-                for px in 0..2 {
-                    let mut sum = 0.0;
-                    for y in py * 6..(py + 1) * 6 {
-                        for x in px * 5..(px + 1) * 5 {
-                            sum += third[channel * HEIGHT * WIDTH + y * WIDTH + x];
-                        }
-                    }
-                    pooled[channel * 8 + py * 2 + px] = sum / 30.0;
-                }
-            }
-        }
+        let pooled = occupancy_features(board, w)?;
         let mut hidden = [0.0; 32];
         let hidden_bias = &w["hidden.bias"];
         let hidden_weight = &w["hidden.weight"];
@@ -239,6 +264,21 @@ impl SpinModel {
             *value = sum;
         }
         output.iter().all(|x| x.is_finite()).then_some(output)
+    }
+
+    pub fn model_id(&self) -> &str { &self.model_id }
+    pub fn weights_sha256(&self) -> &str { &self.weights_sha256 }
+
+    /// Experimental explicit use only. This does not assert learning completion,
+    /// current private-corpus eligibility or better search; the owner pins a model.
+    pub fn search_eligible(&self) -> bool {
+        self.schema_version == 5 && self.trained && self.target_horizon_bags == Some(1)
+    }
+
+    pub fn boundary_quality(&self, board: &Board) -> Option<f64> {
+        if !self.search_eligible() { return None; }
+        let prediction = self.evaluate(board)?;
+        Some(120.0 * (prediction.observed_spins + 0.05 * prediction.found_spin_likelihood))
     }
 
     pub fn evaluate(&self, board: &Board) -> Option<BoardEvaluation> {
@@ -264,6 +304,30 @@ impl SpinModel {
             scope: "Current occupancy only. Predictions of censored follow-up spin observations; not construction probability, exhaustive feasibility, or a heuristic-score blend.",
         }))
     }
+}
+
+/// Shared occupancy encoder. The completion model adds progress only after this
+/// tensor, preserving the first model's occupancy-only contract.
+pub(crate) fn occupancy_features(board: &Board, w: &HashMap<String, Vec<f32>>) -> Option<[f32; 384]> {
+    if board.rows.iter().all(|&r| r == 0) || board.rows.iter().any(|&r| r >= 1023) { return None; }
+    let first = convolution(&encode(board), 1, 24, &w["conv1.weight"], &w["conv1.bias"]);
+    let second = convolution(&first, 24, 32, &w["conv2.weight"], &w["conv2.bias"]);
+    let third = convolution(&second, 32, 48, &w["conv3.weight"], &w["conv3.bias"]);
+    let mut pooled = [0.0; 384];
+    for channel in 0..48 {
+        for py in 0..4 {
+            for px in 0..2 {
+                let mut sum = 0.0;
+                for y in py * 6..(py + 1) * 6 {
+                    for x in px * 5..(px + 1) * 5 {
+                        sum += third[channel * HEIGHT * WIDTH + y * WIDTH + x];
+                    }
+                }
+                pooled[channel * 8 + py * 2 + px] = sum / 30.0;
+            }
+        }
+    }
+    pooled.iter().all(|value| value.is_finite()).then_some(pooled)
 }
 
 fn model() -> Option<&'static SpinModel> {

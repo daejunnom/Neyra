@@ -1,6 +1,9 @@
 import type { FocusedObservation, TrainingContribution } from './types';
+import { ObservationOutbox } from './contribution-outbox';
+import { learningHistory } from './learning-history';
+import { NEXT_BAG_LABEL_CONFIG } from './learning-policy';
 
-export type ContributionPhase = 'ready' | 'sending' | 'retrying' | 'paused' | 'disabled' | 'unavailable';
+export type ContributionPhase = 'ready' | 'recovering' | 'sending' | 'retrying' | 'paused' | 'disabled' | 'unavailable';
 export interface ContributionState {
   enabled: boolean;
   phase: ContributionPhase;
@@ -8,9 +11,10 @@ export interface ContributionState {
   observationQueued: number;
   acknowledged: number;
   dropped: number;
+  issue?: 'authorization' | 'capacity' | 'network' | 'receipt' | 'rejected';
 }
 
-type Pending = { serialized: string; bytes: number; bagBoundary: number; key: string; order: number };
+type Pending = { id: string; serialized: string; bytes: number; bagBoundary: number; key: string; order: number };
 type PendingObservation = { id: string; body: string; key: string };
 export type ObservationDelivery = { id: string; status: 'acknowledged' | 'rejected' };
 type Batch = { entries: Pending[]; observation?: PendingObservation; body: string };
@@ -39,7 +43,7 @@ const MAX_SEEN = 4096;
 // Observations never evict another observation: descendants need its receipt.
 export const MAX_PENDING_OBSERVATIONS = 8;
 const MAX_OBSERVATION_BYTES = 512 * 1024;
-const MAX_ATTEMPTS = 6;
+const MAX_FAST_ATTEMPTS = 6;
 const FLUSH_DELAY = 3000;
 const encoder = new TextEncoder();
 const envelopePrefix = (schemaVersion: number, key: string) =>
@@ -49,6 +53,19 @@ const TRACE_PREFIX = envelopePrefix(3, 'fields');
 const OBSERVATION_PREFIX = envelopePrefix(4, 'observations');
 const ENVELOPE_SUFFIX = ']}';
 const TRACE_ENVELOPE_BYTES = encoder.encode(TRACE_PREFIX + ENVELOPE_SUFFIX).byteLength;
+
+/** Receipt hash contract: recursively sort object keys, retain array order,
+ * then SHA-256 the UTF-8 JSON. Both endpoints hash the validated observation. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') return `{${Object.keys(value).sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+async function sha256(value: string): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)))]
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
 
 /** This guard catches accidental privileged-key configuration. The server is
  * still responsible for verifying the JWT, payload and storage permissions. */
@@ -73,15 +90,21 @@ export class ContributionClient {
   private enabled = false;
   private disposed = false;
   private generation = 0;
+  private consentConfigured = false;
+  private restoring = false;
   private inFlight: AbortController | null = null;
   private inFlightKeys = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private phase: ContributionPhase = 'ready';
+  private issue: ContributionState['issue'];
+  private isolatedTraceKeys = new Set<string>();
   private readonly configured: boolean;
+  private readonly outbox: ObservationOutbox;
 
   constructor(private config: PublicIngestion, private receive: (state: ContributionState) => void,
     private delivered: (delivery: ObservationDelivery) => void = () => {}) {
     this.configured = publicIngestion(config);
+    this.outbox = new ObservationOutbox(config.url);
     this.publish();
   }
 
@@ -89,11 +112,12 @@ export class ContributionClient {
     return { enabled: this.enabled,
       phase: !this.enabled ? 'disabled' : !this.configured ? 'unavailable' : this.phase,
       queued: this.queue.length + this.observations.length, observationQueued: this.observations.length,
-      acknowledged: this.acknowledged, dropped: this.dropped };
+      acknowledged: this.acknowledged, dropped: this.dropped, issue: this.issue };
   }
 
   setEnabled(enabled: boolean) {
-    if (this.disposed || enabled === this.enabled) return;
+    if (this.disposed || (enabled === this.enabled && this.consentConfigured)) return;
+    this.consentConfigured = true;
     this.enabled = enabled;
     if (!enabled) {
       this.generation++;
@@ -104,9 +128,41 @@ export class ContributionClient {
       for (const entry of this.observations) this.seen.delete(entry.key);
       this.queue = [];
       this.observations = [];
+      this.isolatedTraceKeys.clear();
       this.attempts = 0;
       this.phase = 'ready';
-    } else this.schedule();
+      this.issue = undefined;
+      this.restoring = false;
+      void this.outbox.clear();
+    } else void this.restore();
+    this.publish();
+  }
+
+  private async restore() {
+    if (this.restoring || this.disposed || !this.enabled) return;
+    const generation = this.generation;
+    this.restoring = true;
+    this.phase = 'recovering';
+    this.publish();
+    const pending = await this.outbox.read();
+    if (this.disposed || !this.enabled || generation !== this.generation) return;
+    for (const entry of pending) {
+      if (this.observations.length >= MAX_PENDING_OBSERVATIONS) break;
+      try {
+        const envelope = JSON.parse(entry.body), observation = envelope.observations?.[0];
+        if (envelope.schemaVersion !== 4 || !hasContributionConsent(JSON.stringify(envelope.consent)) ||
+            envelope.observations.length !== 1 || observation?.id !== entry.id ||
+            entry.key !== `observation:${entry.id}` || !/^[0-9a-f-]{36}:observation-[1-9]\d{0,6}$/.test(entry.id) ||
+            encoder.encode(JSON.stringify(observation)).byteLength > MAX_OBSERVATION_BYTES) throw new Error('Invalid outbox');
+        if (!this.observations.some(item => item.id === entry.id)) {
+          this.observations.push(entry);
+          this.seen.set(entry.key, true);
+        }
+      } catch { void this.outbox.remove(entry.id); this.dropped++; }
+    }
+    this.restoring = false;
+    this.phase = 'ready';
+    this.schedule(0);
     this.publish();
   }
 
@@ -125,7 +181,7 @@ export class ContributionClient {
     }
     // The immutable wire representation owns the queued snapshot. Avoid a
     // second full object graph and repeat serialization on every HTTP retry.
-    const entry = { serialized, bytes, bagBoundary: field.source.bagBoundary, key, order: this.order++ };
+    const entry = { id: field.id, serialized, bytes, bagBoundary: field.source.bagBoundary, key, order: this.order++ };
     this.seen.set(key, true);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
     this.queue.push(entry);
@@ -133,6 +189,7 @@ export class ContributionClient {
     if (this.queue.length > MAX_QUEUE) {
       const index = this.queue.findLastIndex((item) => !this.inFlightKeys.has(item.key));
       const [evicted] = this.queue.splice(index, 1);
+      this.isolatedTraceKeys.delete(evicted.key);
       this.dropped++;
       // Keep the seen marker: a repeated shallow record must not refill the queue.
       if (evicted === entry) { this.publish(); return; }
@@ -154,7 +211,9 @@ export class ContributionClient {
       this.publish();
       return false;
     }
-    this.observations.push({ id: observation.id, body: OBSERVATION_PREFIX + serialized + ENVELOPE_SUFFIX, key });
+    const entry = { id: observation.id, body: OBSERVATION_PREFIX + serialized + ENVELOPE_SUFFIX, key };
+    this.observations.push(entry);
+    void this.outbox.put(entry);
     this.seen.set(key, true);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
     this.schedule(0);
@@ -164,9 +223,10 @@ export class ContributionClient {
 
   /** A deliberate retry or an online transition gives a stopped batch a new bounded lease. */
   retry() {
-    if (this.disposed || !this.enabled || !this.configured || this.inFlight) return;
+    if (this.disposed || !this.enabled || !this.configured || this.inFlight || this.restoring) return;
     this.attempts = 0;
     this.phase = 'ready';
+    this.issue = undefined;
     this.schedule(0);
     this.publish();
   }
@@ -179,6 +239,7 @@ export class ContributionClient {
     this.inFlight?.abort();
     this.queue = [];
     this.observations = [];
+    this.isolatedTraceKeys.clear();
     this.seen.clear();
   }
 
@@ -186,7 +247,7 @@ export class ContributionClient {
 
   private schedule(delay = FLUSH_DELAY) {
     if (this.disposed || !this.enabled || !this.configured || (!this.queue.length && !this.observations.length) ||
-        this.inFlight || this.phase === 'paused') return;
+        this.inFlight || this.restoring || this.phase === 'paused') return;
     if (this.timer) {
       // New observations can overtake a trace batching delay, but never an
       // automatic failure backoff or the server's Retry-After interval.
@@ -203,7 +264,8 @@ export class ContributionClient {
     if (observation) return { entries: [], observation, body: observation.body };
     const entries: Pending[] = [];
     let bytes = TRACE_ENVELOPE_BYTES;
-    for (const entry of this.queue.slice(0, MAX_BATCH)) {
+    const isolated = this.queue.find(entry => this.isolatedTraceKeys.has(entry.key));
+    for (const entry of isolated ? [isolated] : this.queue.slice(0, MAX_BATCH)) {
       const nextBytes = bytes + entry.bytes + (entries.length ? 1 : 0);
       if (nextBytes > MAX_BODY_BYTES) break;
       entries.push(entry);
@@ -215,19 +277,27 @@ export class ContributionClient {
   private remove(entries: Pending[]) {
     const removed = new Set(entries.map((entry) => entry.key));
     this.queue = this.queue.filter((entry) => !removed.has(entry.key));
+    for (const key of removed) this.isolatedTraceKeys.delete(key);
   }
 
   private settle(batch: Batch, status: ObservationDelivery['status']) {
     if (batch.observation) {
       const entry = batch.observation;
       this.observations = this.observations.filter((pending) => pending.key !== entry.key);
+      void this.outbox.remove(entry.id);
+      if (status === 'acknowledged') {
+        const label = JSON.parse(entry.body).observations[0].label as FocusedObservation['label'];
+        if (label.schemaVersion === 5 && canonicalJson(label.config) === canonicalJson(NEXT_BAG_LABEL_CONFIG)) {
+          learningHistory.acknowledge(label.input.rows);
+        }
+      }
       // Delivery callbacks cannot turn a successful HTTP receipt into a retry.
       try { this.delivered({ id: entry.id, status }); } catch { /* Consumer is optional. */ }
     } else this.remove(batch.entries);
   }
 
   private async flush() {
-    if (this.disposed || !this.enabled || !this.configured || this.inFlight ||
+    if (this.disposed || !this.enabled || !this.configured || this.inFlight || this.restoring ||
         (!this.queue.length && !this.observations.length)) return;
     const batch = this.batch();
     const { entries, observation, body } = batch;
@@ -248,6 +318,9 @@ export class ContributionClient {
     const timeout = setTimeout(() => controller.abort(), 15000);
     let retryDelay: number | null = null;
     try {
+      const expectedHash = observation ? await sha256(canonicalJson(JSON.parse(body).observations[0])) : null;
+      const expectedQueueId = observation ? await sha256(observation.id) : null;
+      if (this.disposed || !this.enabled || generation !== this.generation) return;
       const response = await fetch(this.config.url, {
         method: 'POST', credentials: 'omit', referrerPolicy: 'no-referrer',
         headers: { 'Content-Type': 'application/json', apikey: this.config.anonKey,
@@ -257,44 +330,72 @@ export class ContributionClient {
       if (this.disposed || !this.enabled || generation !== this.generation) return;
       if (!response.ok) {
         // Invalid records cannot become valid by retrying unchanged bytes.
-        if ([400, 413, 422].includes(response.status)) {
+        if ([400, 409, 413, 415, 422].includes(response.status)) {
+          if (!observation && entries.length > 1) {
+            // Isolate a bad record instead of discarding its valid neighbours.
+            for (const entry of entries) this.isolatedTraceKeys.add(entry.key);
+            this.attempts = 0;
+            this.phase = 'ready';
+            return;
+          }
           this.settle(batch, 'rejected');
           this.dropped += count;
+          this.issue = 'rejected';
           this.attempts = 0;
           this.phase = 'ready';
           return;
         }
         if ([401, 403, 404].includes(response.status)) {
           this.phase = 'paused';
+          this.issue = 'authorization';
           return;
         }
         const retryAfter = Number(response.headers.get('Retry-After'));
         if (response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0) {
-          retryDelay = Math.min(60000, Math.max(1000, retryAfter * 1000));
+          retryDelay = Math.min(300000, Math.max(1000, retryAfter * 1000));
         }
+        this.issue = response.status === 429 ? 'capacity' : 'network';
         throw new Error('Contribution request was not acknowledged');
       }
-      const result = await response.json() as { accepted?: number; duplicates?: number };
+      const result = await response.json() as { accepted?: number; duplicates?: number;
+        receipt?: { kind: string; id: string; queueId: string; payloadSha256: string; state: string };
+        receipts?: { id: string; bagBoundary: number }[] };
       if (this.disposed || !this.enabled || generation !== this.generation) return;
       if (!Number.isInteger(result.accepted) || !Number.isInteger(result.duplicates) ||
           result.accepted! < 0 || result.duplicates! < 0 || result.accepted! + result.duplicates! !== count) {
         throw new Error('Contribution acknowledgement does not match the batch');
       }
+      const receiptMatches = observation ? result.receipt?.kind === 'focused-observation' &&
+        result.receipt.id === observation.id && result.receipt.queueId === expectedQueueId &&
+        result.receipt.payloadSha256 === expectedHash && ['queued', 'imported'].includes(result.receipt.state)
+        : Array.isArray(result.receipts) && result.receipts.length === entries.length &&
+          result.receipts.every((receipt, index) => receipt.id === entries[index].id &&
+            receipt.bagBoundary === entries[index].bagBoundary);
+      if (!receiptMatches) {
+        this.issue = 'receipt';
+        throw new Error('Contribution receipt identity does not match');
+      }
       this.settle(batch, 'acknowledged');
       this.acknowledged += count;
       this.attempts = 0;
       this.phase = 'ready';
+      this.issue = undefined;
     } catch {
       if (this.disposed || !this.enabled || generation !== this.generation) return;
       this.attempts++;
-      this.phase = this.attempts >= MAX_ATTEMPTS ? 'paused' : 'retrying';
-      retryDelay ??= Math.min(60000, 2000 * 2 ** (this.attempts - 1));
+      this.phase = 'retrying';
+      this.issue ??= 'network';
+      // A temporary outage must not permanently stop collection. After the
+      // short recovery window, probe slowly while preserving the exact bytes.
+      retryDelay ??= this.attempts >= MAX_FAST_ATTEMPTS ? 300000 :
+        Math.min(60000, 2000 * 2 ** (this.attempts - 1));
     } finally {
       clearTimeout(timeout);
       this.inFlight = null;
       this.inFlightKeys.clear();
       if (!this.disposed) {
-        this.schedule(retryDelay ?? (this.observations.length ? 0 : FLUSH_DELAY));
+        if (this.enabled && !this.observations.length && observation && this.phase === 'ready') void this.restore();
+        else this.schedule(retryDelay ?? (this.observations.length ? 0 : FLUSH_DELAY));
         this.publish();
       }
     }

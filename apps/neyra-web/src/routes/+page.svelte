@@ -22,6 +22,8 @@
   let settings: HTMLDialogElement;
   let about: HTMLDialogElement;
   let settingsError = '';
+  let evaluatorModelJson: string | undefined;
+  let evaluatorModelName = '';
   let elapsedMs = 0;
   let previousTick = 0;
   let view: 'current' | 'best' = 'best';
@@ -36,9 +38,11 @@
   let contributionState: ContributionState = { enabled: false, phase: 'disabled', queued: 0, observationQueued: 0, acknowledged: 0, dropped: 0 };
   $: contributionLabel = !contributionState.enabled ? '자료 제공 꺼짐' :
     contributionState.phase === 'unavailable' ? '자료 전송 연결을 확인하고 있어요.' :
+    contributionState.phase === 'recovering' ? '보관된 전송 대기 자료를 불러오고 있어요.' :
     contributionState.phase === 'sending' ? '탐색 자료 전송 중' :
-    contributionState.phase === 'retrying' ? '연결을 기다린 뒤 다시 전송해요.' :
-    contributionState.phase === 'paused' ? '전송을 기다리고 있어요. 다시 시도할 수 있습니다.' :
+    contributionState.phase === 'retrying' ? (contributionState.issue === 'capacity' ? '수신 대기가 줄어들면 자동으로 다시 전송해요.' :
+      contributionState.issue === 'receipt' ? '수신 확인을 다시 요청하고 있어요. 자료는 보관 중입니다.' : '연결이 회복되면 보관된 자료를 자동으로 다시 전송해요.') :
+    contributionState.phase === 'paused' ? '전송 권한 또는 연결 주소를 확인해야 해요. 자료는 보관 중입니다.' :
     contributionState.acknowledged ? `${number.format(contributionState.acknowledged)}개 전송 완료` : '확정된 가방 필드부터 전송해요.';
 
   type ExportFormat = 'ctk3' | 'fumen';
@@ -163,7 +167,7 @@
       const stored = localStorage.getItem('neyra-config-v1');
       if (stored) {
         const values = JSON.parse(stored);
-        const merged = { ...defaultConfig, ...values, seed: entrySeed, cnn_evaluation: false };
+        const merged = { ...defaultConfig, ...values, seed: entrySeed, cnn_evaluation: false, board_evaluator: 'heuristic' as const };
         // The old cumulative floor already implied this floor for every later
         // bag. Preserve that acceptance range when migrating saved settings.
         if (values && !Object.prototype.hasOwnProperty.call(values, 'bag_min_success_percent') &&
@@ -228,7 +232,7 @@
     runConfig = { ...config, cnn_evaluation: false };
     previousTick = performance.now();
     client.observeCurrent(false);
-    client.start(runConfig);
+    client.start(runConfig, evaluatorModelJson);
   }
   function pause() { client.pause(); }
   function resume() {
@@ -269,10 +273,25 @@
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
     if (!Number.isSafeInteger(value.seed) || value.seed < 1 || value.seed > 4294967295) return '시드는 1–4,294,967,295 사이의 정수로 입력해 주세요.';
     if (![16, 32, 64, 128].includes(value.beam_width)) return '탐색 폭 설정을 다시 선택해 주세요.';
+    if (!['heuristic', 'cnn-v5'].includes(value.board_evaluator)) return '보드 평가기를 다시 선택해 주세요.';
     if (!Number.isInteger(value.worker_count) || value.worker_count < 0 || value.worker_count > MAX_WORKERS) return `동시 탐색 수는 자동(0) 또는 1–${MAX_WORKERS} 사이의 정수로 입력해 주세요.`;
     return '';
   }
   function openSettings() { draft = { ...config }; settingsError = ''; settings.showModal(); }
+  async function selectEvaluatorModel(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0]; if (!file) return;
+    try {
+      if (file.size > 3000000) throw new Error('모델 파일은 3MB 이하의 JSON이어야 합니다.');
+      const encoded = await file.text(), model = JSON.parse(encoded);
+      if (model?.schemaVersion !== 5 || model.trained !== true || typeof model.modelId !== 'string'
+        || !/^[a-f0-9]{64}$/.test(model.weightsSha256 || '') || model.targetHorizonBags !== 1) {
+        throw new Error('실제로 학습한 v5 한 가방 CNN 파일을 선택해 주세요. 초기화 모델은 사용할 수 없습니다.');
+      }
+      evaluatorModelJson = encoded; evaluatorModelName = model.modelId;
+      draft.board_evaluator = 'cnn-v5'; settingsError = '';
+    } catch (error) { settingsError = error instanceof Error ? error.message : '모델 파일을 읽지 못했습니다.'; input.value = ''; }
+  }
   function saveSettings(event: SubmitEvent) {
     event.preventDefault();
     settingsError = validateConfig(draft);
@@ -507,6 +526,7 @@
         </div>
         {#if error}<div class="error-message" role="alert">{error}</div>{/if}
         {#if notice}<p class="session-notice" role="status">{notice}</p>{/if}
+        {#if snapshot?.evaluator}<p class="session-notice" aria-label="실제 보드 평가기">{snapshot.evaluator.active === 'cnn-v5' ? `1차 CNN · ${snapshot.evaluator.modelId} · 2가방 이후 완성 필드 평가` : '기존 보드 평가기 사용 중'}</p>{/if}
       </section>
 
       <section class="progress-section" aria-label="작업 진척도">
@@ -520,8 +540,8 @@
         <p class="verified-progress">검증 통과 최대 {snapshot?.qualifiedSpins ?? 0}스핀<span>{snapshot?.workers ?? 0}개 동시 탐색</span></p>
         <section class="contribution-status" aria-label="CNN 학습 자료 제공">
           <div><label><input type="checkbox" checked={contributionState.enabled} onchange={(event) => setDataSharing(event.currentTarget.checked)} />학습 자료 제공</label><span>학습 OFF</span></div>
-          <p>켜면 선택한 필드에서 두 가방 이상의 후속 경로를 탐색해 결과를 전송합니다.</p>
-          <div class="contribution-progress" role="status"><span>{contributionLabel}{#if contributionState.queued > 0} · 대기 {contributionState.queued}개{/if}</span>{#if contributionState.phase === 'paused'}<button class="text-button" onclick={() => contributions.retry()}>다시 전송</button>{/if}</div>
+          <p>켜면 선택한 필드의 다음 한 가방을 정밀 관측해 결과를 전송합니다.</p>
+          <div class="contribution-progress" role="status"><span>{contributionLabel}{#if contributionState.queued > 0} · 대기 {contributionState.queued}개{/if}</span>{#if contributionState.phase === 'paused' || contributionState.phase === 'retrying'}<button class="text-button" onclick={() => contributions.retry()}>다시 전송</button>{/if}</div>
           {#if learningFocus?.enabled}<div class="learning-focus" role="status"><span>관측 {learningFocus.completed}개 · 가장 깊은 출발 {learningFocus.deepestOriginBag || '—'}가방</span><span>{learningFocus.active ? `${learningFocus.active}개 진행` : learningFocus.awaitingDelivery ? '전송 대기' : '출발 필드 대기'}</span></div>{/if}
           {#if contributionState.dropped > 0}<small>전송하지 못한 필드 {contributionState.dropped}개 · 보관된 경로는 아래에서 파일로 저장할 수 있어요.</small>{/if}
         </section>
@@ -584,6 +604,8 @@
       <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
       <label><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
+      <label class="full-row"><span>보드 평가기</span><select bind:value={draft.board_evaluator}><option value="heuristic">기존 보드 평가기</option><option value="cnn-v5">1차 CNN · 학습 모델 직접 선택</option></select><small>2가방 이후 완성 필드의 순서를 평가합니다. 모델이 유효하지 않으면 기존 평가기를 사용해요.</small></label>
+      {#if draft.board_evaluator === 'cnn-v5'}<label class="full-row"><span>학습한 v5 모델</span><input type="file" accept=".json,application/json" onchange={selectEvaluatorModel} /><small>{evaluatorModelName || '학습실에서 받은 후보 JSON을 선택하세요.'} · 파일은 이 탭에서만 사용합니다.</small></label>{/if}
       <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div><small>접속할 때마다 무작위로 정해져요. 같은 탐색을 다시 실행하려면 직접 입력하세요.</small></label>
     </div></details>
     {#if active || status === 'paused'}<p class="settings-note">변경한 설정은 다음 탐색부터 적용됩니다.</p>{/if}
@@ -601,7 +623,7 @@
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
-  <p>이 화면은 기존 평가기로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 검증된 2가방 이후 필드를 시작점으로 두 가방 이상의 후속 경로를 제한된 예산 안에서 확인하고, 실제 관측한 스핀과 결과 필드·시드·설정을 개발자 전용 CNN 학습 화면에 보냅니다. 다음 한 가방의 스핀 수가 새 모델의 학습 대상이며, 그 이후 경로는 별도 관측 자료로 남깁니다. 스핀이 없는 결과도 실제 입력으로 도달했다면 다음 시작점으로 이어갑니다. 이 도달 기록이 모든 공급 순서에서의 구축 성공을 뜻하지는 않습니다. 선택한 동시 탐색 수를 사용하며, 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
+  <p>기본은 기존 보드 평가기입니다. 추가 설정에서 직접 선택한 학습 CNN으로 2가방 이후 완성 필드를 평가할 수 있으며, 이 화면에서는 CNN을 학습하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 켜면 검증된 2가방 이후 필드에서 다음 한 가방을 정밀 관측하고 실제 스핀·결과 필드·시드·설정을 비공개 학습실에 보냅니다. 0스핀 결과도 입력으로 도달했다면 다음 관측의 시작점으로 이어집니다. 도달 기록은 모든 공급 순서의 성공을 뜻하지 않습니다. 동의를 끄면 새 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 실제 가방 경계를 파일로 받을 수 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

@@ -36,9 +36,20 @@
   or benchmark result reports. Keep these outside the repository. Evaluate
   additional computation sharing with matched-work ABBA measurements before
   adopting it; worker-local caches do not imply a global shared search DAG.
-- Public Pages always uses the existing structural search evaluator. Accept the
-  old cnn_evaluation setting for compatibility but ignore it in ranking. Public
-  learning-data sharing defaults off and requires explicit versioned consent;
+- Public Pages defaults to the existing structural search evaluator. Accept the
+  old cnn_evaluation setting for compatibility but ignore it in ranking. Only an
+  explicit board_evaluator=cnn-v5 selection with an attached, validated trained
+  v5 checkpoint enables experimental CNN evaluation of completed boundaries
+  from bag two. Keep first-bag foundations and unfinished prefixes structural;
+  replace that boundary quality with 120*(observedSpins+0.05*foundSpinLikelihood),
+  without blending structural scores. Missing, untrained or invalid artifacts
+  fall back before search starts. Verify the actual float32 weight digest,
+  one-bag task/policy, architecture and recorded dataset lineage. Record the
+  active evaluator, model ID/hash and any fallback reason in snapshots/exports
+  and preserve actual evaluator provenance in contributions. Activation does
+  not establish learning completion or generalization. Never automatically
+  fetch/promote a private candidate or pass it into the fixed-policy collector.
+  Public learning-data sharing defaults off and requires explicit versioned consent;
   legacy default-on settings are not consent. Learning stays off. Generate a
   fresh nonzero random seed on page entry, then honor the user's manual seed.
   Preserve physics, probability, necessary bounds and supply certificates.
@@ -145,6 +156,16 @@
   Unassigned public workers continue broad search during focused collection
   and acknowledgement backpressure. Immutable wire payloads may be shared,
   but consent generations and parent acknowledgements must remain independent.
+  Persist consented pending observations in the browser outbox when storage is
+  available, recover the exact payload on reconnect/reload, and erase pending
+  payloads on consent withdrawal. An HTTP success alone is not delivery: check
+  observation ID, queue ID, payload digest and receipt state; trace receipts
+  must match each identity and depth. The 4,096-entry completed-work ledger is
+  qualified by exact physical rows and full collector policy, and accepts only
+  acknowledged work. It is bounded history, not permanent global deduplication.
+  Retain service-only relay content receipts after raw import so an identical
+  retry neither recreates work nor consumes quota again; reject identity reuse
+  with different content. Acknowledgement and raw removal must be transactional.
 - Private parallel claims are atomic and lease-qualified. Received acceptance
   and its label insertion must commit together; late work cannot bypass
   quarantine or release another worker's lease. Reuse exact validated model
@@ -156,6 +177,10 @@
   Load the training runtime only for training work. Interrupted recorded child
   admission must be repairable from the immutable parent proof, with a bounded
   repair batch after received-work priority checks; do not rerun collection.
+  Renew only matching live leases, keep claim/commit retries idempotent and stop
+  work when ownership is lost. Temporary connection failures reconnect without
+  charging a collector failure or overriding manual pause. Recover committed
+  results by exact request/lease identity instead of fitting or collecting again.
 - Preserve the released v2 checkpoint and legacy collector semantics. V3 uses
   an explicitly different policy, model task and one-bag output contract; never
   relabel a two-bag prediction or mix versions in a training dataset. Private seeded
@@ -175,12 +200,30 @@
   Private training uses bounded random replay, not a full-dataset fit for each
   arrival: at most 16 fresh and 48 eligible historical train rows, plus a stable
   validation roster of at most 64. Test rows never enter fitting or selection.
+  Drain fresh winners in arrival order; a row cursor is not evidence of use.
+  Only exact selected IDs in a successfully completed/unchanged attempt consume
+  freshness. Historical replay is intentional reuse. Failed attempts keep their
+  sample, with cooldown and at most two retries for the same parent/eligibility;
+  exhausted failures wait for different fresh work and do not count as fitting.
   Record the exact selected IDs/order and distinguish random database selection
   from the recorded training shuffle seed. Atomically prepare and complete each
   attempt, rechecking parent lineage, exclusions and eligibility at both ends.
   Removing a bad row from today's batch does not remove its influence from a
   trained parent: invalidate that lineage and use an eligible ancestor or an
   honestly untrained initializer. Preserve immutable historical memberships.
+- Keep trained, learning complete and deployment ready distinct. The versioned
+  neyra-next-bag-readiness-v1 policy requires eligible canonical board counts
+  2,048/256/256 and source-group counts 32/8/8 in train/validation/test, plus
+  2,048 unique train boards in the selected checkpoint's successful fitting
+  ancestry. Unchanged/failed attempts cannot manufacture fitted coverage.
+  Follow docs/LEARNING_CHECKPOINT.md and the Site's learning-readiness.ts for
+  frozen audit coverage, multi-spin strata, MAE/Brier/calibration and CPU parity
+  gates. These are engineering acceptance floors, not a sufficient-sample
+  theorem. Reserve final test groups once for a frozen candidate; never use
+  them for fitting or epoch selection. Source exclusions invalidate the audit.
+  Learning completion does not authorize model promotion: deploymentReady stays
+  false until separately recorded matched-rule/search-work quality and CPU-cost
+  evidence has an acceptance contract. Do not invent that missing comparison.
 - Verify workers in the agent's internal environment. Prefer the supported
   private Sites service-access path and managed internal preview; never weaken
   owner privacy for testing. Use the user's Chrome only as a limited fallback
@@ -241,8 +284,15 @@
   and witness references; it is a censored path lower bound, not a replacement
   for the original versioned label. One-bag targets and coherent measured
   two-bag path totals remain separate. Do not fabricate remaining-to-40/completion
-  cost labels from unfinished searches. Adaptive budgets and new cost heads need
-  separate policy evidence before activation. Keep the current mino controls.
+  cost labels from unfinished searches. The separate naga-completion-cost-v1
+  model, proof verifier, CPU trainer and Rust/WASM inference are implemented in
+  docs/COMPLETION_CNN.md's contract. Reuse trained v5 features only with exact
+  parent lineage; explicitly condition on remaining spins and the fixed rules.
+  Its target is best observed representative completed-path lock cost, not a
+  globally optimal or all-supplies bound. Unfinished proofs cannot supply exact
+  targets. No trained stage-two artifact is bundled or activated automatically.
+  Adaptive budgets and cost-head adoption still need separate policy evidence.
+  Keep the current mino controls.
 - Export complete immutable private snapshots separately from bounded training
   samples, with cursor/count/hash checks and atomic local latest-pointer updates.
   Preserve earlier snapshots. Fine-tuning requires the retained parent model and
@@ -521,7 +571,9 @@
   paid initially charged cells p and terrain change dT, use
   A1=-10*q+6*p+0.25*dT, forecastLine=60*g1+18*g2+A1, and select lines with
   g1+0.3*g2+0.45*A1/(120+abs(A1)). Add the best readiness and independence
-  evidence once. Boundary quality is 2*terrain+forecast-12*unpaidHistory.
+  evidence once. In structural mode, boundary quality is
+  2*terrain+forecast-12*unpaidHistory; the explicit cnn-v5 boundary replacement
+  above has its own score units.
   Keep this direct raw composition; do not reintroduce 120*totalForecast or
   an additional 48-point saturation that suppresses all secondary differences.
   Never assume an unprobed prefix already has forecast spins. Extra work needs

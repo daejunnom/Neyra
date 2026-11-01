@@ -7,6 +7,7 @@
 pub mod labels;
 mod transpositions;
 
+use crate::evaluator::SpinModel;
 use crate::physics::{Board, Input, Piece, Placement, Pose, HEIGHT};
 use crate::structure::{
     map_after_clear, mask_count, placement_bias, remaining_cells, single_goals_for, single_targets,
@@ -72,10 +73,13 @@ pub struct SearchConfig {
     pub search_lane: u16,
     #[serde(alias = "searchLanes")]
     pub search_lanes: u16,
-    /// Legacy setting accepted for saved-config compatibility. Search ignores it;
-    /// spin-only CNN evaluation belongs to the separate learning workflow.
+    /// Legacy setting accepted for saved-config compatibility. This flag stays
+    /// inert; only board_evaluator plus an explicitly supplied model can opt in.
     #[serde(alias = "cnnEvaluation")]
     pub cnn_evaluation: bool,
+    /// New explicit selection; old cnn_evaluation preferences never activate it.
+    #[serde(alias = "boardEvaluator")]
+    pub board_evaluator: String,
 }
 
 impl Default for SearchConfig {
@@ -95,12 +99,16 @@ impl Default for SearchConfig {
             search_lane: 0,
             search_lanes: 1,
             cnn_evaluation: false,
+            board_evaluator: "heuristic".into(),
         }
     }
 }
 
 impl SearchConfig {
     fn validate(&self) -> Result<(), String> {
+        if !matches!(self.board_evaluator.as_str(), "heuristic" | "cnn-v5") {
+            return Err("Unknown board evaluator".into());
+        }
         if !self.min_success_percent.is_finite()
             || self.min_success_percent <= 0.0
             || self.min_success_percent > 100.0
@@ -258,9 +266,24 @@ pub struct BagCandidatesSnapshot {
     pub runner_up: Option<CandidateSnapshot>,
 }
 
+/// Session-scoped selection: never installs a model while a run is active.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluatorStatus {
+    pub enabled: bool,
+    pub requested: String,
+    pub active: &'static str,
+    pub model_id: Option<String>,
+    pub weights_sha256: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub scope: &'static str,
+    pub learning_complete: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressSnapshot {
+    pub evaluator: EvaluatorStatus,
     pub phase: String,
     pub expanded: u64,
     pub candidates: u64,
@@ -1907,6 +1930,7 @@ impl ContinuationProbe {
 }
 
 struct RefinementJob {
+    evaluator: Option<Rc<SpinModel>>,
     first_bag: bool,
     spin_priority: bool,
     pending: Vec<SeedState>,
@@ -1917,9 +1941,10 @@ struct RefinementJob {
 }
 
 impl RefinementJob {
-    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool, spin_priority: bool) -> Self {
+    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool, spin_priority: bool, evaluator: Option<Rc<SpinModel>>) -> Self {
         pending.reverse();
         Self {
+            evaluator,
             first_bag,
             spin_priority,
             pending,
@@ -1935,7 +1960,10 @@ impl RefinementJob {
             probe.step(cache);
             if probe.finished() {
                 seed.future = probe.best;
-                seed.quality = boundary_quality(&seed.board, &seed.debt, &seed.future);
+                seed.quality = self.evaluator.as_ref().map_or_else(
+                    || boundary_quality(&seed.board, &seed.debt, &seed.future),
+                    |model| model.boundary_quality(&seed.board).unwrap_or(0.0),
+                );
                 let rank = if self.spin_priority { candidate_priority_rank } else { candidate_rank };
                 seed.score = rank(seed.spins, seed.quality, self.first_bag, seed.spins >= goal);
                 insert_seed(&mut self.complete, seed, 8);
@@ -1964,6 +1992,7 @@ impl RefinementJob {
 }
 
 struct GenerationJob {
+    evaluator: Option<Rc<SpinModel>>,
     parent: usize,
     start: Board,
     start_spins: u8,
@@ -2140,6 +2169,7 @@ impl GenerationJob {
         let depth = seed.targets.len() as u8;
         let terminal = seed.spins >= goal;
         Self {
+            evaluator: None,
             parent,
             start: node.board,
             start_spins: node.spins,
@@ -2567,6 +2597,7 @@ impl GenerationJob {
                     self.continuation_minimum_success,
                     self.start_pieces == 0,
                     self.spin_priority,
+                    self.evaluator.clone(),
                 ));
                 false
             }
@@ -3166,6 +3197,8 @@ fn productive_rounds(
 }
 
 pub struct SearchSession {
+    evaluator: Option<Rc<SpinModel>>,
+    evaluator_status: EvaluatorStatus,
     config: SearchConfig,
     goal: u8,
     rng: Random,
@@ -3258,6 +3291,14 @@ impl SearchSession {
         }
         .min(config.max_pieces);
         Ok(Self {
+            evaluator: None,
+            evaluator_status: EvaluatorStatus {
+                enabled: false, requested: config.board_evaluator.clone(), active: "heuristic",
+                model_id: None, weights_sha256: None,
+                fallback_reason: (config.board_evaluator == "cnn-v5").then(|| "model-not-supplied".into()),
+                scope: "Structural evaluator; exact physics and supply certificates are independent",
+                learning_complete: false,
+            },
             config,
             goal: TARGET_SPINS,
             rng: Random(seed),
@@ -3307,6 +3348,27 @@ impl SearchSession {
             last_pace_probe_dispatch: 0,
             exploration_phase: 0,
         })
+    }
+
+    /// Explicit owner-selected experimental model. Invalid/untrained files fall
+    /// back before any search work, so a run never mixes boundary score units.
+    pub fn with_model(config: SearchConfig, model_json: &str) -> Result<Self, String> {
+        let mut session = Self::new(config)?;
+        if session.config.board_evaluator != "cnn-v5" { return Ok(session); }
+        match SpinModel::from_json(model_json) {
+            Ok(model) if model.search_eligible() => {
+                session.evaluator_status = EvaluatorStatus {
+                    enabled: true, requested: "cnn-v5".into(), active: "cnn-v5",
+                    model_id: Some(model.model_id().into()), weights_sha256: Some(model.weights_sha256().into()),
+                    fallback_reason: None, learning_complete: false,
+                    scope: "Experimental occupancy-only v5 quality at completed boundaries from bag two; foundation and unfinished prefixes remain structural; empty boundary is neutral; not completion readiness or supply probability",
+                };
+                session.evaluator = Some(Rc::new(model));
+            }
+            Ok(_) => session.evaluator_status.fallback_reason = Some("trained-v5-model-required".into()),
+            Err(_) => session.evaluator_status.fallback_reason = Some("model-contract-or-hash-invalid".into()),
+        }
+        Ok(session)
     }
 
     /// One unit either expands a geometric piece choice, one execution node,
@@ -3906,6 +3968,7 @@ impl SearchSession {
             self.config.search_lane,
             self.config.search_lanes,
         ).prioritize_spins();
+        if self.tree[parent].pieces >= 7 { generation.evaluator = self.evaluator.clone(); }
         generation.best_bag_spins =
             self.selective_spin_reference((self.tree[parent].pieces as usize / 7) + 1);
         generation.bag_alpha = if parent != 0 && self.config.min_success_percent == 100.0 {
@@ -4253,7 +4316,12 @@ impl SearchSession {
         // Reuse this boundary's immutable geometry facts locally. No shared
         // cache or certificate policy is introduced by the reuse.
         let facts = BoardFacts::new(&job.plan.expected);
-        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future);
+        let quality = if parent.pieces >= 7 {
+            self.evaluator.as_ref().map_or_else(
+                || boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future),
+                |model| model.boundary_quality(&job.plan.expected).unwrap_or(0.0),
+            )
+        } else { boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future) };
         let obstruction = job.plan.future.obstructed_mass
             .map_or(facts.obstructed_mass, |after| facts.obstructed_mass.min(after));
         let certificate = Rc::new(BagCertificate {
@@ -4538,6 +4606,7 @@ impl SearchSession {
 
     fn snapshot_with_frames(&self, include_frames: bool) -> ProgressSnapshot {
         ProgressSnapshot {
+            evaluator: self.evaluator_status.clone(),
             phase: if self.finished {
                 "stopped"
             } else if self.verification.is_some() {
@@ -4648,7 +4717,8 @@ impl SearchSession {
         });
         // Keep each export metadata object below the macro recursion limit.
         let ordering_metadata = serde_json::json!({
-                "sourceBaseline": "af8dac63a9a9155fc28e480246fd617bc855bfb1",
+                "sourceBaseline": "99e1e091ee8cd358cd7d46a9fae3d18b34d52770",
+                "baselineMeaning": "Immediately preceding accepted source; no parallel historical engine.",
                 "continuationBags": CONTINUATION_BAGS,
                 "continuationSpinTarget": CONTINUATION_SPINS,
                 "continuationAlternatives": CONTINUATION_ALTERNATIVES,
@@ -4688,16 +4758,17 @@ impl SearchSession {
             "cavityPreparation": "OneGoalFreeStepPerSegment;ActualZeroLinePlacement;NoExtraInventory",
             "deepExploration": "OneOfFourExplorationPhases;EligibleCertifiedDepthAtLeastTwoBags"
         });
-        selective_search["fieldModel"] = serde_json::json!(
+        selective_search["fieldModel"] = serde_json::json!(if self.evaluator.is_some() {
+            "OccupancyOnlyV5;CompletedBoundariesFromBagTwo;FoundationsAndUnfinishedPrefixesStructural"
+        } else {
             "ConnectedCavityResidual;ImmediateWitness;WitnessedOutwardBanks;StrongPreparedAndGoalRelativeRoof;SymmetricGoalWorkspace;StrongCurledWorkspaceRoof;StraightWorkspaceWindowCost;AllAdjacentHeightDependence;SuspendedRoofStepRelief;LowOneCellNotch;OneMinoRoofOrLevelRepair"
-        );
+        });
         serde_json::json!({
             "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
-            "learnedOrdering": { "enabled": false,
-                "scope": "Disabled;SpinOnlyModelIsIndependentOfSearch",
-                "maxAbsoluteAdjustment": 0.0 },
+            "learnedOrdering": self.evaluator_status,
+            "learnedBoundaryFormula": "120*(predictedOneBagSpins+0.05*foundSpinLikelihood);noHeuristicBlend;fromBagTwo",
             "candidate": archive.map(|a| a.for_snapshot(true)), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",

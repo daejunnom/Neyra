@@ -14,7 +14,7 @@ type WasmEngine = {
 };
 type WasmModule = {
   default(options: { module_or_path: string }): Promise<unknown>;
-  NeyraEngine: new (config: string) => WasmEngine;
+  NeyraEngine: { new (config: string): WasmEngine; with_model(config: string, model: string): WasmEngine };
   label_board(input: string, config: string): string;
   spin_model_json(): string;
 };
@@ -255,7 +255,12 @@ scope.onmessage = async ({ data }) => {
       // Pause/cancel can arrive while the async module is loading.
       // Public Pages always runs the established search. A stale saved config
       // or an old caller must not re-enable learned ordering or training here.
-      engine = new module.NeyraEngine(JSON.stringify({ ...data.config, cnn_evaluation: false }));
+      const configJson = JSON.stringify({ ...data.config, cnn_evaluation: false });
+      engine = data.config.board_evaluator === 'cnn-v5' && typeof data.modelJson === 'string'
+        ? module.NeyraEngine.with_model(configJson, data.modelJson) : new module.NeyraEngine(configJson);
+      const evaluator = (JSON.parse(engine.snapshot_compact()) as SearchSnapshot).evaluator;
+      if (evaluator?.fallbackReason) send({ type: 'warning', runId,
+        message: '선택한 CNN의 학습·형식·해시를 확인하지 못해 이번 실행은 기존 보드 평가기로 진행합니다.' });
       if (bestSpinsByBag.some((spins) => spins > 0)) {
         engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
       }

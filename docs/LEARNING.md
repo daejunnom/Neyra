@@ -1,9 +1,11 @@
 # Naga Eyes spin evaluator and observation analysis
 
-Neyra separates public search from private CNN learning. Public GitHub Pages uses
-the existing structural search evaluator. The developer-only learning Site uses
-received bounded continuation observations to train an occupancy-only CNN.
-It runs new continuation collection only when no received observations remain.
+Neyra separates public search from private CNN learning. Public GitHub Pages
+defaults to the existing structural search evaluator and permits an explicit
+experimental first-stage v5 checkpoint for completed-boundary evaluation.
+The developer-only learning Site uses received bounded continuation observations
+to train an occupancy-only CNN. It runs new continuation collection only when
+no received observations remain.
 
 ## Public search
 
@@ -11,11 +13,15 @@ It runs new continuation collection only when no received observations remain.
   entered seed then remains reproducible for the run; saved seeds are not restored.
 - Learning-data transmission defaults **off**, including when an old default-on
   preference is present. Only the current explicit, versioned consent enables
-  transmission. Public learning is **off**. Old saved `cnn_evaluation` values do
-  not enable it; a public CNN evaluator selector remains future work.
+  transmission. Public learning is **off**. Old saved `cnn_evaluation` values
+  remain inert. Experimental evaluation requires both the `cnn-v5` selector
+  and an explicitly attached, validated trained v5 model; it does not start
+  browser training or automatically promote a private model.
 - Retained verified bag records may submit current rows, run/candidate identity,
   bag depth, seeds, rules, settings and a separate retained-path trace. These
-  trace scores describe the heuristic search and never become CNN targets.
+  trace scores describe the actual active evaluator and never become CNN targets.
+  CNN-evaluated boundaries retain the exact model ID and weight digest; a
+  fallback or first-bag field retains its actual structural provenance.
 - With sharing on, selected verified boards after at least two bags seed the
   versioned v5 collector. Each job spends its work on one new inventory from
   one supplied board. Input-replayed result boards enter a bounded global frontier;
@@ -39,11 +45,25 @@ It runs new continuation collection only when no received observations remain.
   relay. Retries retain FIFO observations; saturation pauses allocation instead
   of dropping a parent. Each observation is at most 512 KiB, sent alone in a v4
   envelope. Existing v3 trace batches remain compatible and separately bounded.
+  The browser outbox persists consented immutable observation payloads by
+  destination and identity, when IndexedDB is available. Reconnect/reload sends
+  those same bytes; withdrawing consent clears pending payloads. Storage denial
+  leaves in-memory delivery available but does not provide reload durability.
+  Only an exact observation ID, queue ID, payload SHA-256 and accepted receipt
+  state settle an upload. Trace receipts must match every submitted identity
+  and depth. Missing or mismatched receipts retain pending work.
 - Frontier deduplication distinguishes queued proposals from dispatched jobs.
   Evicting an unstarted proposal does not mark it as explored; canonical identity
   chooses a stable queued representative without a depth preference. Successful observation uploads
   drain the FIFO immediately, while failures retain bounded retry backoff.
   Queued wire payloads are immutable serialized values with measured UTF-8 size.
+  A separate local ledger retains up to 4,096 acknowledged completed collector
+  inputs under the full fixed policy and exact physical rows. It survives
+  reloads when browser storage is available and prevents repeating retained
+  deterministic jobs. Mirrors, another policy, failed work and merely queued
+  proposals are not interchangeable proofs. Eviction or cleared browser storage
+  can make older work eligible again; this is bounded reuse, not permanent
+  global deduplication.
 - The endpoint checks exact policy, source identity, work accounting, witness
   links and physical lock/line transitions. These are structural checks, not a
   fresh SRS/P7 execution. Received evidence remains **client-reported**.
@@ -108,6 +128,12 @@ Results may commit only while their matching lease is current. Accepting receive
 evidence and its training observation is transactional; late results cannot undo
 quarantine or clear a replacement worker's lease. Occupancy deduplication returns
 the immutable stored winner while preserving distinct received evidence records.
+Claim requests retain their request tokens across retries. The browser renews
+matching live analysis, fallback and replay leases; losing ownership stops that
+work. Exact completion retries recover the committed result without creating
+another observation or training run. Temporary network/service failures enter
+a reconnect state, preserve manual pause and do not count as collector failures.
+Permanent contract failures remain distinct from temporary transport failures.
 If parent storage succeeds but recorded child storage is interrupted, a missing
 completion marker schedules idempotent repair from the persisted proof. Duplicate
 receipts and bounded fallback preparation repair those exact fields; they do not
@@ -162,7 +188,41 @@ failure retries on CPU from the retained start model. Rust placement search stay
 on CPU. Native PyTorch supports optional CUDA and ONNX Runtime supports optional
 CUDA inference with the drain/fallback boundaries described below.
 Neither public search ordering nor its archive exports automatically invoke CNN
-evaluation. `learnedOrdering.enabled` remains false for compatibility.
+evaluation. Explicit selection is described below; absent that selection,
+`learnedOrdering.enabled` is false.
+
+### Explicit first-stage board evaluator
+
+`SearchConfig.board_evaluator` defaults to `heuristic`. Selecting `cnn-v5` and
+constructing `NeyraEngine.with_model(configJson, modelJson)` pins one model to the
+run. The public file selector supplies that model explicitly. Rust checks the
+trained schema-v5 one-bag task, policy, output names/scales, architecture, tensor
+sizes, actual float32 little-endian weight SHA-256, dataset digest and recorded
+lineage contract. A missing, untrained or incompatible artifact falls back to
+the structural evaluator before search begins. The public parser validates the
+artifact; it cannot independently prove that a private source was not excluded
+after export. Select an artifact with current eligible lineage.
+
+Only completed boundaries from bag two use the replacement quality:
+
+`Q = 120 × (observedSpins + 0.05 × foundSpinLikelihood)`.
+
+That boundary quality does not blend a structural teacher score. First-bag
+foundations and unfinished prefixes retain structural ordering. An empty or
+unsupported boundary receives neutral CNN quality, rather than mixing score
+units. Other search mechanics still include existing structural ordering and
+forecasts; this is not a learned replacement for every search decision.
+Physics, actual spin totals, necessary bounds, supply proofs and probability
+admission remain authoritative. The fixed-policy learning collector never
+receives this optional search model.
+
+Snapshots expose `evaluator`, and archives expose `learnedOrdering`, with the
+requested/active evaluator, actual model ID and weight digest, scope and fallback
+reason. The reasons include `model-not-supplied`, `trained-v5-model-required` and
+`model-contract-or-hash-invalid`. These values and contribution provenance come
+from the active engine, not a requested checkbox or a bundled legacy checkpoint.
+The experimental status carries `learningComplete: false`: successful activation
+is not a claim that the private readiness or search-adoption gates have passed.
 
 ## Precise single-bag v5 observations
 
@@ -210,6 +270,73 @@ measurements compare against observed search lower bounds, not unknown true opti
 The old v2–v4 objectives retain their original meaning. Private v5 initialization
 may reuse v2 convolution/hidden features with a reset head and explicit provenance;
 it stays untrained until an eligible grouped fit beats epoch zero.
+
+## First-stage learning completion and adoption
+
+The Site's `lib/learning-readiness.ts` defines
+`neyra-next-bag-readiness-v1`. These are versioned engineering acceptance floors,
+not a claim that one fixed sample count guarantees generalization. Count eligible
+canonical inputs, excluding identical/reflected duplicates; source groups are
+a diversity check and may still be statistically related. Historical task rows
+do not fill a current-v5 requirement.
+
+| Requirement | Train | Validation | Test |
+| --- | ---: | ---: | ---: |
+| Available canonical boards | 2,048 | 256 | 256 |
+| Source groups | 32 | 8 | 8 |
+| Frozen audit sample | — | 256–512 | 256–512 |
+| Audit positives and zero-spin examples | — | At least 32 each | At least 32 each |
+| Audit examples with at least two observed spins | — | At least 32 | At least 32 |
+| Audit examples with at least three observed spins | — | At least 16 | At least 16 |
+| Largest audit source-group share | — | At most 25% | At most 25% |
+
+In addition, at least 2,048 distinct eligible canonical train boards must appear
+in successfully completed replay attempts belonging to the selected checkpoint's
+fitting ancestry. Available rows, repeated epochs, failed attempts and unchanged
+parent selections do not manufacture this fitted coverage.
+
+The owner explicitly starts a final audit after the available-data and fitting
+gates pass. The server freezes the exact checkpoint ID/hash, policy, eligibility
+revision, ordered record IDs and record hash. It selects validation and test
+records across source groups, reserves each final-test group for one frozen
+candidate, and reuses the same manifest on an interrupted audit. Test never
+enters gradients or epoch selection and cannot be repeatedly reused to select
+later candidates. A completed candidate is not audited again. Source exclusions
+invalidate its audit; a new audit needs eligible independent evidence. Later
+arrivals do not rewrite what the frozen audit measured.
+
+Both validation and test must meet all coverage requirements above and all of
+these metric ceilings:
+
+| Metric | Maximum |
+| --- | ---: |
+| Observed-spin MAE | 0.50 spins |
+| Observed-spin MAE approximate 95% upper endpoint | 0.75 spins |
+| Found-spin Brier score | 0.10 |
+| Found-spin Brier approximate 95% upper endpoint | 0.15 |
+| Mean observed-spin deficit | 0.25 spins |
+| Found-spin calibration ECE, ten equal-width bins | 0.10 |
+| MAE for the exactly-two and three-or-more spin strata, when a stratum has at least 16 records | 0.75 spins |
+| Mean deficit in those multi-spin strata | 0.50 spins |
+
+The uncertainty endpoint uses the 97.5th percentile of 1,000 deterministic
+source-group cluster-bootstrap draws. It is an approximate allowance for related
+sources, not proof of independent observations. Reports also retain mean excess,
+underestimate rate and count/origin-depth strata. On the exact audited boards,
+Rust/WASM and TensorFlow.js CPU inference must agree within maximum absolute
+errors of `0.0001` for discovery likelihood and `0.001` for spin count. The server
+recomputes metrics from the submitted owner-worker predictions and stores their
+runtime and trust scope; it does not claim an independent server inference run.
+
+`trained` describes the checkpoint's fitting state. `complete` additionally
+requires the available-data gates, fitted coverage, both frozen held-out metric
+gates and portable inference parity. `deploymentReady` remains false: a separate
+matched-rule/search-work comparison must establish search quality and CPU cost,
+and no accepted comparison is supplied by this readiness version. Passing a
+learning gate does not automatically publish or promote a model. The explicit
+public v5 selector permits a provenance-checked experiment before completion;
+it does not certify completion or operational adoption. See
+[LEARNING_CHECKPOINT.md](LEARNING_CHECKPOINT.md) for the adoption checklist.
 
 ## Preserved concentrated v4 observations and shared replay
 
@@ -266,6 +393,17 @@ are never sampled. First fitting needs four train rows and one validation row;
 later fitting waits for a batch of sixteen newly eligible winners. Exact selected
 IDs and order reproduce the chosen sample. The recorded seed controls training
 shuffle, not SQLite's random selection.
+
+Fresh winners drain in arrival order. Freshness is determined by actual
+`orderedRecordIds` in successful `completed` or `unchanged` attempts, not a
+high-water arrival cursor: a large arrival burst cannot mark unsampled rows as
+used. Historical replay deliberately reuses already consumed eligible train
+records. A failed attempt retains its exact sample and retries after cooldown,
+at most twice under the same parent and eligibility revision. After those retries
+the same sample waits for a changed parent/revision, while different fresh work
+can proceed. Failure, timeout and cooldown do not consume freshness or add
+fitted coverage. A successful unchanged attempt consumes the evaluated draw,
+but does not invent additional fitting ancestry for the retained parent.
 
 Both preparation and completion recheck exclusions, split authority and parent
 lineage. New evidence does not silently overwrite previous proofs. If a trained
@@ -409,7 +547,7 @@ The browser dataset has a bounded recent-plus-coverage sample per split, with
 explicit total and selected counts. New observations can therefore enter training
 after the dataset grows beyond the per-session capacity.
 
-## Decision evidence and future search loop
+## Decision evidence and later search-control work
 
 The current intermediate model estimates **bounded short-horizon discovery**.
 The future completion-oriented loop can use the same convolutional extractor,
@@ -429,8 +567,10 @@ flowchart TD
 ```
 
 This diagram is the direction of development, not a claim that adaptive budget
-allocation or a 40L value model is already enabled. Current public search keeps
-its structural evaluator, probability admission, mino limits and existing budget.
+allocation or a completion-cost model is enabled in public search. Public search
+defaults to the structural evaluator; an explicitly attached trained v5 model
+can replace completed-boundary quality as described above. Probability
+admission, mino limits and the existing budget remain in force.
 Private labels also keep a fixed declared work budget so their targets remain
 comparable. A private job records at most two CNN evaluations: its supplied board
 and one selected successor. Predictions, allocated work, consumed work and actual
@@ -445,15 +585,28 @@ for the ancestor's original versioned target. Recording this feedback is distinc
 from applying neural-network gradients; neither public heuristic scores nor
 the CNN's own predictions become target truth.
 
-For a future 40L cost head, the remaining required clears are known progress:
+For the separate 40L cost head, the remaining required clears are known progress:
 `remaining = 40 - completed`. Occupancy alone does not determine that progress:
 two paths can reach the same board with different numbers of completed clears.
 An estimate of minos needed to finish must therefore be conditioned on the
-remaining target and the applicable rules. Training needs genuine completions
-or an explicitly censored partial-observation objective; unfinished bounded
-searches cannot supply exact completion costs. Until those contracts and
-independent comparisons exist, keep the current mino-budget controls and avoid
-adding ungrounded remaining-spin or completion-cost labels.
+remaining target and the applicable rules.
+
+The separate `naga-completion-cost-v1` architecture, complete-path verifier,
+native CPU trainer and Rust/WASM inference are implemented. Its 33,441 parameters
+reuse a selected trained-v5 occupancy extractor, append explicit remaining-spin
+context after pooling, and require the fixed rule profile. Initialization resets
+the new progress/output weights, retains exact feature-source lineage and stays
+untrained. Training uses only genuinely completed, input-replayed representative
+paths and predicts their best observed remaining lock cost. This is neither a
+global minimum nor an all-supplies certificate. Unfinished bounded searches
+cannot supply exact completion costs; a censored objective would need a separate
+contract. [COMPLETION_CNN.md](COMPLETION_CNN.md) specifies the proof format,
+initialization/training commands, source-lineage audit and inference interface.
+
+No trained second-stage checkpoint is bundled or automatically activated.
+Genuine completion data, independent validation/test and matched search
+comparisons are still adoption requirements. Keep the current mino-budget
+controls and do not derive completion labels from the first CNN's predictions.
 
 The retained v2 checkpoint can initialize a compatible private candidate without
 discarding learned convolutional features. Future heads or a Transformer require
@@ -634,7 +787,7 @@ a bounded bridge: Pages submits inputs with separately tagged untrusted traces,
 and full client-reported fixed-policy observations. The private Site pulls
 them with a separate server-only consumer secret.
 
-All queue/settings/quota tables enable RLS and deny anonymous/authenticated table
+All queue/settings/quota/receipt tables enable RLS and deny anonymous/authenticated table
 access. Only the ingress service can admit fields; only the private consumer can
 pull or acknowledge them. Quotas bound batch size, daily volume and pending rows.
 The v3 trace and v4 observation ingress require the current explicit consent envelope and reject older
@@ -647,6 +800,16 @@ explicitly excluded by the private importer. Focused observations are FIFO,
 identity-keyed and removed only after durable private import. Their independent
 quota is 64 observations per run/day, 1,024 globally/day, at most 512 queued records
 and 128 MiB of queued payload. Public table/RPC access remains denied.
+
+`neyra_observation_receipts` retains the immutable queue identity and canonical
+payload SHA-256 after raw data leaves the relay. The admission transaction first
+checks that receipt: an identical retry returns `queued` or `imported` without
+creating another job or charging the admission quota again. Reusing the same
+identity with different content is a conflict. The private acknowledgement RPC
+validates the identity/digest, marks the receipt imported and removes the raw
+queue record atomically. Repeating that acknowledgement is safe after a lost
+response. These compact receipts provide retry idempotency; they are not a
+second raw learning dataset or evidence that a label has already been fitted.
 
 The Site runtime needs `NEYRA_QUEUE_URL`, `NEYRA_QUEUE_ANON_KEY` and
 `NEYRA_QUEUE_SECRET`. The public build contains only the endpoint and public anon

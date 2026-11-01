@@ -1,5 +1,6 @@
 pub mod physics;
 pub mod evaluator;
+pub mod completion;
 pub mod exploration;
 pub mod search;
 mod srs_plus;
@@ -62,6 +63,40 @@ impl SpinEvaluator {
     }
 }
 
+/// Stage-two inference is an independent opt-in API, never a public search
+/// selection or a substitute for exact cost bounds.
+#[wasm_bindgen]
+pub struct CompletionEvaluator { model: completion::CompletionModel }
+
+#[wasm_bindgen]
+impl CompletionEvaluator {
+    #[wasm_bindgen(constructor)]
+    pub fn new(model_json: &str) -> Result<CompletionEvaluator, JsValue> {
+        Ok(Self { model: completion::CompletionModel::from_json(model_json)
+            .map_err(|e| JsValue::from_str(&e))? })
+    }
+
+    pub fn evaluate(&self, rows_json: &str, remaining_spins: f64, rules_profile: &str) -> Result<String, JsValue> {
+        let rows: [u16; physics::HEIGHT] = serde_json::from_str(rows_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid board: {e}")))?;
+        if rows.iter().any(|&row| row >= physics::FULL_ROW) { return Err(JsValue::from_str("Invalid post-clear board")); }
+        if !remaining_spins.is_finite() || remaining_spins.fract() != 0.0 || !(1.0..=40.0).contains(&remaining_spins) {
+            return Err(JsValue::from_str("remainingSpins must be an integer in 1..40"));
+        }
+        let result = self.model.evaluate(&physics::Board { rows }, remaining_spins as u8, rules_profile)
+            .map_err(|e| JsValue::from_str(&e))?;
+        serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}
+
+#[wasm_bindgen]
+pub fn completion_model_contract() -> String {
+    serde_json::json!({"schemaVersion":1, "task":completion::TASK, "rulesProfile":completion::RULE_PROFILE,
+        "observationPolicy":completion::POLICY, "architecture":completion::architecture(),
+        "state":"requires-eligible-v5-parent-and-independent-completed-paths", "searchOrderingEnabled":false,
+        "costScale":completion::COST_SCALE, "outputNames":["observedRemainingLocksScaled"]}).to_string()
+}
+
 /// CPU training clients can bootstrap from these versioned embedded weights.
 #[wasm_bindgen]
 pub fn spin_model_json() -> String { evaluator::model_json().into() }
@@ -116,6 +151,16 @@ impl NeyraEngine {
         let config: SearchConfig = serde_json::from_str(config_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid settings: {e}")))?;
         let session = SearchSession::new(config).map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { session })
+    }
+
+    /// Select a pinned v5 model explicitly for this new run. The old saved
+    /// cnn_evaluation flag remains inert; inspect snapshot.evaluator for fallback.
+    #[wasm_bindgen(js_name = with_model)]
+    pub fn with_model(config_json: &str, model_json: &str) -> Result<NeyraEngine, JsValue> {
+        let config: SearchConfig = serde_json::from_str(config_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid settings: {e}")))?;
+        let session = SearchSession::with_model(config, model_json).map_err(|e| JsValue::from_str(&e))?;
         Ok(Self { session })
     }
 

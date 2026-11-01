@@ -15,7 +15,7 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    fn plan(&self) -> Result<Plan, String> {
+    pub(super) fn plan(&self) -> Result<Plan, String> {
         if !self.start.is_valid() || self.start_spins >= TARGET_SPINS
             || self.start_pieces % 7 != 0 || self.placements.is_empty()
             || self.placements.len() > 7 {
@@ -65,6 +65,25 @@ impl Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StrictWitness {
+    pub queue: Option<[u8; 7]>,
+    pub inputs: Vec<Vec<Input>>,
+    pub frames: Vec<DisplayFrame>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrictSummary {
+    /// All bags including the first satisfy integer 5040/5040 coverage.
+    /// First-bag reflection is still the declared accepted model assumption.
+    pub qualified: bool,
+    pub budget_pieces: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_witness: Option<StrictWitness>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Proof {
     pub bag_index: u16,
     pub status: String,
@@ -100,6 +119,8 @@ pub struct Proof {
     pub representative_queue: Option<[u8; 7]>,
     pub representative_inputs: Vec<Vec<Input>>,
     pub representative_frames: Vec<DisplayFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict100: Option<StrictSummary>,
 }
 
 /// Lossless storage only. Old plain arrays remain readable, and arrays with
@@ -265,7 +286,7 @@ impl Verifier {
             .flatten();
         let (frames, inputs) = representative.map(|rank| job.graph.witness(
             job.codes[rank], job.costs[rank], job.plan.start_pieces)).unwrap_or_default();
-        Ok(Proof {
+        let mut proof = Proof {
             bag_index: job.plan.start_pieces / 7 + 1,
             status: if job.graph.overflow { "graph-capacity" } else if job.quiet_rejected {
                 "quiet-policy-rejected"
@@ -282,7 +303,10 @@ impl Verifier {
             quiet_no_hold_verified: complete && job.quiet_safe == P7_COUNT,
             first_bag_symmetry_assumed: symmetry_assumed, mirrored_inputs_verified: false,
             hold_policy: CLEAR_ONLY_HOLD_POLICY.into(),
-            probability: if complete { policy.path_probability(&counts) } else { 0.0 },
+            probability: if !complete { 0.0 } else if config.probability_frontier && job.plan.terminal {
+                budget.and_then(|n| cdf.iter().find(|point| point.pieces == n))
+                    .map_or(0.0, |point| point.probability)
+            } else { policy.path_probability(&counts) },
             first_bag_probability: if resolved || !previous_counts.is_empty() {
                 counts.first().map(|&n| f64::from(n) / P7_COUNT as f64)
             } else { None },
@@ -292,7 +316,25 @@ impl Verifier {
             order_codes: if resolved { job.codes.clone() } else { vec![] },
             representative_queue: representative.map(permutation),
             representative_inputs: inputs, representative_frames: frames,
-        })
+            strict100: None,
+        };
+        if config.probability_frontier {
+            let strict_config = SearchConfig {
+                probability_frontier: false, ignore_first_bag_probability: false,
+                min_success_percent: 100.0, bag_min_success_percent: 100.0,
+                first_bag_min_success_percent: 100.0, risk_min_spins_per_bag: 0,
+                ..config.clone()
+            };
+            let strict = self.proof(&strict_config, previous_counts)?;
+            proof.strict100 = Some(StrictSummary {
+                qualified: strict.qualified, budget_pieces: strict.budget_pieces,
+                terminal_witness: (strict.qualified && strict.terminal).then_some(StrictWitness {
+                    queue: strict.representative_queue, inputs: strict.representative_inputs,
+                    frames: strict.representative_frames,
+                }),
+            });
+        }
+        Ok(proof)
     }
 }
 

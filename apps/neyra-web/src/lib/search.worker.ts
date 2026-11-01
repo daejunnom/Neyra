@@ -13,7 +13,7 @@ type WasmEngine = {
 };
 type WasmModule = {
   default(options: { module_or_path: string }): Promise<unknown>;
-  NeyraEngine: { new (config: string): WasmEngine };
+  NeyraEngine: { new (config: string): WasmEngine; with_ga_model?(config: string, model: string): WasmEngine };
 };
 
 const scope = globalThis as unknown as {
@@ -35,6 +35,7 @@ let modulePromise: Promise<WasmModule> | undefined;
 let bestSpinsByBag = Array<number>(101).fill(0);
 let bagRecordVersions = new Map<string, string>();
 let transpositionSharing = false;
+let guideFallback: string | null = null;
 
 function send(message: EngineEvent) { scope.postMessage(message); }
 
@@ -84,6 +85,8 @@ async function wasm(assetBase: string, build: string): Promise<WasmModule> {
 function readSnapshot(full = false): SearchSnapshot | null {
   if (!engine) return null;
   const compact = JSON.parse(engine.snapshot_compact()) as SearchSnapshot;
+  if (guideFallback) compact.evaluator = { enabled: false, requested: 'ga-policy', active: 'heuristic', modelId: null, weightsSha256: null,
+    fallbackReason: guideFallback, scope: 'CPU heuristic fallback after local GA guide initialization failure', learningComplete: false };
   // Capture new certified records before advertising their IDs. A later step
   // can replace Rust's second-place archive before an on-demand request arrives.
   // Routine snapshots remain compact; the coordinator retains just two per bag.
@@ -110,6 +113,8 @@ function readSnapshot(full = false): SearchSnapshot | null {
     }
   }
   bagRecordVersions = retained;
+  // Frontier metadata remains compact. Full P7 evidence is requested only
+  // when the user selects a plan; hundreds of cost points may share one plan.
   const current = compact.current;
   const key = current ? JSON.stringify([current.id, current.verified, current.frameCount,
     current.placed, current.spins, current.rows]) : '';
@@ -210,6 +215,7 @@ scope.onmessage = async ({ data }) => {
     bestSpinsByBag.fill(0);
     bagRecordVersions.clear();
     transpositionSharing = data.transpositionSharing === true;
+    guideFallback = null;
     runId = data.runId;
     const requestedId = runId;
     const mayInitialize = () => runId === requestedId && requested !== 'cancelled';
@@ -219,10 +225,20 @@ scope.onmessage = async ({ data }) => {
       // new engine afterwards. Already initialized archives remain available.
       if (!mayInitialize()) return;
       // Pause/cancel can arrive while the async module is loading.
-      // Public Pages always runs the established search. A stale saved config
-      // or an old caller must not re-enable learned ordering or training here.
+      // The explicit local GA guide is inference only. It never re-enables
+      // retired CNN collection, training, upload or model service routes.
       const configJson = JSON.stringify({ ...data.config, cnn_evaluation: false, board_evaluator: 'heuristic' });
-      engine = new module.NeyraEngine(configJson);
+      if (data.gaModelJson) {
+        try {
+          if (new TextEncoder().encode(data.gaModelJson).byteLength > 32 * 1024 * 1024) throw new Error('로컬 GA 파일은 최대 32 MiB입니다.');
+          if (!module.NeyraEngine.with_ga_model) throw new Error('현재 엔진에는 로컬 GA 가이드 기능이 없습니다.');
+          engine = module.NeyraEngine.with_ga_model(configJson, data.gaModelJson);
+        } catch (error) {
+          guideFallback = error instanceof Error ? error.message : String(error);
+          engine = new module.NeyraEngine(configJson);
+          send({ type: 'warning', runId, message: `GA 가이드를 적용하지 못해 CPU 기본 평가기로 계속합니다: ${guideFallback}` });
+        }
+      } else engine = new module.NeyraEngine(configJson);
       if (bestSpinsByBag.some((spins) => spins > 0)) {
         engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
       }

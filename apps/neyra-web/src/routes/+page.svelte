@@ -30,6 +30,13 @@
   let notice = '';
   let availableWorkers = 1;
   let selectedDepth = 0;
+  let selectedFrontierTarget = 0;
+  let gaModelJson: string | undefined;
+  let gaModelName = '';
+  let gaModelId = '';
+  let gaGuideMessage = '';
+  let gaGuideLoading = false;
+  let gaGuideInput: HTMLInputElement;
   type ExportFormat = 'ctk3' | 'fumen';
   type BuildDocument = ReturnType<typeof encodeBuildDocument>;
   let exportFormat: ExportFormat = 'ctk3';
@@ -60,6 +67,12 @@
   $: selectedRoute = snapshot?.selectedCandidate ?? null;
   $: bestRoute = selectedRoute ?? recommendedRoute;
   $: bagCandidates = snapshot?.bestByBag ?? [];
+  $: frontierGroups = snapshot?.probabilityFrontier ?? [];
+  $: frontierTargets = [...new Set([40, ...frontierGroups.map(group => group.targetSpins)])].sort((a, b) => b - a);
+  $: displayedFrontierTarget = selectedFrontierTarget || Math.max(0, ...frontierGroups.map(group => group.targetSpins)) || 40;
+  $: frontierGroup = frontierGroups.find(group => group.targetSpins === displayedFrontierTarget && group.complete) ?? frontierGroups.find(group => group.targetSpins === displayedFrontierTarget);
+  $: frontierPoints = frontierGroup?.points ?? [];
+  $: frontierPath = frontierPoints.map((point, index) => `${index ? `H${frontierX(point.pieces)}V` : `M${frontierX(point.pieces)},`}${frontierY(point.probability)}`).join(' ');
   $: deepestCandidateBag = bagCandidates.reduce((depth, group) => Math.max(depth, group.bagCount), 0);
   $: depthLimit = Math.min(100, Math.max(Math.floor(displayedConfig.max_pieces / 7), deepestCandidateBag));
   $: depthOptions = Array.from({ length: depthLimit }, (_, index) => ({
@@ -99,6 +112,20 @@
     playing = false;
   }
 
+  function frontierSettings(value: SearchConfig): SearchConfig {
+    return { ...value, probability_frontier: true, min_success_percent: 0.01, bag_min_success_percent: 0.01,
+      risk_min_spins_per_bag: 0, first_bag_min_success_percent: 0, ignore_first_bag_probability: false, budget_start: 0 };
+  }
+  function frontierX(pieces: number) { return 42 + pieces / Math.max(1, displayedConfig.max_pieces) * 716; }
+  function frontierY(probability: number) { return 165 - probability * 145; }
+  function probabilityLabel(probability: number, exact100 = false, positiveExact = false) {
+    if (exact100) return '100%';
+    if (probability === 0 && positiveExact) return '0% 초과 · 정수 증명';
+    if (!Number.isFinite(probability) || probability < 0) return '—';
+    if (probability * 100 >= 99.9999) return '100% 미만';
+    if (probability > 0 && probability < 0.00000001) return `${(probability * 100).toExponential(2)}%`;
+    return `${(probability * 100).toLocaleString('ko-KR', { maximumFractionDigits: 6 })}%`;
+  }
   function time(ms: number) {
     const total = Math.floor(ms / 1000);
     return String(Math.floor(total / 60)).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
@@ -141,29 +168,20 @@
     const entrySeed = randomSeed();
     config = { ...defaultConfig, seed: entrySeed };
     try {
-      const stored = localStorage.getItem('neyra-config-v1');
+      const current = localStorage.getItem('neyra-config-v2-frontier');
+      const legacy = current ? null : localStorage.getItem('neyra-config-v1');
+      const stored = current ?? legacy;
       if (stored) {
         const values = JSON.parse(stored);
         if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('Invalid saved settings');
-        // Only current search preferences may cross the browser/worker boundary.
-        // Retired model selections and unknown legacy fields are discarded.
-        const preferences = Object.fromEntries(Object.keys(defaultConfig)
-          .filter(key => key !== 'seed' && Object.hasOwn(values, key)).map(key => [key, values[key]]));
-        const merged = { ...defaultConfig, ...preferences, seed: entrySeed };
-        // The old cumulative floor already implied this floor for every later
-        // bag. Preserve that acceptance range when migrating saved settings.
-        if (values && !Object.prototype.hasOwnProperty.call(values, 'bag_min_success_percent') &&
-            Number.isFinite(values.min_success_percent) && values.min_success_percent > 0 && values.min_success_percent <= 100) {
-          merged.bag_min_success_percent = values.min_success_percent;
-        }
-        // A manual count intentionally overrides the browser's processor hint.
-        // Preserve it when that hint changes, subject to the application limit.
-        if (Number.isInteger(merged.worker_count) && merged.worker_count > 0) {
-          merged.worker_count = Math.min(merged.worker_count, MAX_WORKERS);
-        }
+        const preferences = Object.fromEntries(['piece_goal', 'max_pieces', 'beam_width', 'worker_count']
+          .filter(key => Object.hasOwn(values, key)).map(key => [key, values[key]]));
+        const merged = frontierSettings({ ...defaultConfig, ...preferences, seed: entrySeed });
+        if (Number.isInteger(merged.worker_count) && merged.worker_count > 0) merged.worker_count = Math.min(merged.worker_count, MAX_WORKERS);
         if (validateConfig(merged) === '') config = merged;
         const { seed: _seed, ...currentPreferences } = config;
-        localStorage.setItem('neyra-config-v1', JSON.stringify(currentPreferences));
+        localStorage.setItem('neyra-config-v2-frontier', JSON.stringify(currentPreferences));
+        if (legacy) notice = '새 탐색은 첫 가방을 포함한 성공률을 미노 수별로 기록합니다. 이전 확률 설정은 별도로 보존했습니다.';
       }
     } catch { /* A fresh configuration remains usable when storage is unavailable. */ }
     previousTick = performance.now();
@@ -184,7 +202,7 @@
     };
   });
   function start() {
-    if (!client || active) return;
+    if (!client || active || gaGuideLoading) return;
     exportEpoch += 1;
     rejectDocument('새 탐색을 시작해 문서 준비를 멈췄어요.');
     exportBusy = false;
@@ -197,13 +215,14 @@
     elapsedMs = 0;
     snapshot = null;
     selectedDepth = 0;
+    selectedFrontierTarget = 0;
     view = 'best';
     frameIndex = -1;
     playing = false;
-    runConfig = { ...config };
+    runConfig = frontierSettings(config);
     previousTick = performance.now();
     client.observeCurrent(false);
-    client.start(runConfig);
+    client.start(runConfig, gaModelJson);
   }
   function pause() { client.pause(); }
   function resume() {
@@ -247,16 +266,37 @@
     if (!Number.isInteger(value.worker_count) || value.worker_count < 0 || value.worker_count > MAX_WORKERS) return `동시 탐색 수는 자동(0) 또는 1–${MAX_WORKERS} 사이의 정수로 입력해 주세요.`;
     return '';
   }
+  async function loadGaGuide(file: File | undefined) {
+    if (!file || active || status === 'paused') return;
+    gaGuideLoading = true; gaGuideMessage = ''; gaModelJson = undefined; gaModelName = ''; gaModelId = '';
+    try {
+      if (file.size > 32 * 1024 * 1024) throw new Error('로컬 GA 파일은 최대 32 MiB입니다.');
+      const encoded = await file.text(), model = JSON.parse(encoded);
+      if (!model || model.schemaVersion !== 'neyra-ga-model-v1' || model.trained !== true || typeof model.modelId !== 'string' ||
+          !Array.isArray(model.weights) || model.weights.length !== 24 || !model.weights.every((value: unknown) => typeof value === 'number' && Number.isFinite(value))) {
+        throw new Error('학습된 GA 평가기 JSON이 필요합니다. 체크포인트나 미학습 초기값은 적용하지 않습니다.');
+      }
+      gaModelJson = encoded; gaModelName = file.name; gaModelId = model.modelId;
+      gaGuideMessage = '새 탐색에서 Rust가 형식·가중치 검증 후 적용합니다. 파일은 이 탭과 탐색기의 메모리에만 둡니다.';
+    } catch (reason) {
+      gaGuideMessage = `${reason instanceof Error ? reason.message : '파일을 읽지 못했습니다.'} 새 탐색은 CPU 기본 평가기로 계속할 수 있습니다.`;
+    } finally { gaGuideLoading = false; if (gaGuideInput) gaGuideInput.value = ''; }
+  }
+  function clearGaGuide() {
+    if (active || status === 'paused') return;
+    gaModelJson = undefined; gaModelName = ''; gaModelId = ''; gaGuideMessage = 'CPU 기본 평가기로 새 탐색을 실행합니다.';
+  }
   function openSettings() { draft = { ...config }; settingsError = ''; settings.showModal(); }
   function saveSettings(event: SubmitEvent) {
     event.preventDefault();
-    settingsError = validateConfig(draft);
+    const next = frontierSettings(draft);
+    settingsError = validateConfig(next);
     if (settingsError) return;
-    config = { ...draft };
+    config = next;
     // Seeds identify this page's actual run. Every fresh entry gets a new one;
     // a manually chosen seed remains available for the lifetime of this tab.
     const { seed: _seed, ...preferences } = config;
-    try { localStorage.setItem('neyra-config-v1', JSON.stringify(preferences)); } catch { /* Settings still apply to this tab. */ }
+    try { localStorage.setItem('neyra-config-v2-frontier', JSON.stringify(preferences)); } catch { /* Settings still apply to this tab. */ }
     settings.close();
   }
   function newSeed() {
@@ -446,8 +486,17 @@
             <button class="button primary" onclick={resume}><Icon name="play" size={15} />계속 탐색</button>
             <button class="button quiet stop-button" onclick={stop} aria-label="탐색 중지"><Icon name="stop" size={13} /></button>
           {:else}
-            <button class="button primary" onclick={start}><Icon name={status === 'idle' ? 'play' : 'restart'} size={16} />{status === 'idle' ? '탐색 시작' : '새 탐색 시작'}</button>
+            <button class="button primary" onclick={start} disabled={gaGuideLoading}><Icon name={status === 'idle' ? 'play' : 'restart'} size={16} />{status === 'idle' ? '탐색 시작' : '새 탐색 시작'}</button>
           {/if}
+        </div>
+        <div class="local-guide">
+          <div><span>탐색 평가기</span><strong>{snapshot?.evaluatorWorkers ? `GA 가이드 ${snapshot.evaluatorWorkers.ga}개 · 기본 ${snapshot.evaluatorWorkers.heuristic}개` : gaModelJson ? '로컬 GA 가이드 준비' : 'CPU 기본 평가기'}</strong></div>
+          <input type="file" accept="application/json,.json" bind:this={gaGuideInput} hidden onchange={(event) => void loadGaGuide(event.currentTarget.files?.[0])} />
+          <div class="local-guide-actions"><button class="text-button" disabled={active || status === 'paused' || gaGuideLoading} onclick={() => gaGuideInput.click()}>{gaGuideLoading ? '파일 확인 중…' : '로컬 GA 파일 선택'}</button>{#if gaModelJson}<button class="text-button" disabled={active || status === 'paused'} onclick={clearGaGuide}>제거</button>{/if}</div>
+          {#if gaModelName}<p class="guide-name" title={gaModelId}>{gaModelName}</p>{/if}
+          {#if gaGuideMessage}<p role="status">{gaGuideMessage}</p>{/if}
+          {#each snapshot?.evaluatorFallbacks ?? [] as reason}<p class="guide-fallback" role="status">기본 평가기로 계속: {reason}</p>{/each}
+          <small>학습 성능의 채택 전 실험 경로 · 도달성·공급 증명은 같은 CPU 규칙으로 검증</small>
         </div>
         {#if error}<div class="error-message" role="alert">{error}</div>{/if}
         {#if notice}<p class="session-notice" role="status">{notice}</p>{/if}
@@ -501,23 +550,34 @@
     </aside>
   </section>
 
+  <section class="probability-frontier-panel" aria-label="미노 수별 고정 계획 성공률">
+    <div class="frontier-heading"><div><p class="eyebrow">PROBABILITY FRONTIER</p><h2>미노 수별 성공률</h2><p>미노 종류와 목표 칸이 고정된 계획 하나의 검증값입니다. 첫 가방의 확률도 포함합니다.</p></div><label>목표 스핀<select value={selectedFrontierTarget} onchange={(event) => selectedFrontierTarget = Number(event.currentTarget.value)}><option value={0}>관측된 최대 · {Math.max(0, ...frontierGroups.map(group => group.targetSpins)) || '대기'}</option>{#each frontierTargets as target}<option value={target}>{target}스핀{target === 40 ? ' · 완주' : ''}</option>{/each}</select></label></div>
+    {#if frontierPoints.length}
+      <svg class="frontier-chart" viewBox="0 0 790 195" role="img" aria-label={`${displayedFrontierTarget}스핀 이상인 고정 계획 전체의 미노 수별 최고 완성률`}>
+        {#each [0, 0.25, 0.5, 0.75, 1] as chance}<line x1="42" x2="758" y1={frontierY(chance)} y2={frontierY(chance)} class="frontier-grid" /><text x="4" y={frontierY(chance) + 4}>{chance * 100}%</text>{/each}
+        <path d={frontierPath} class="frontier-curve" />
+        {#each frontierPoints as point}<circle cx={frontierX(point.pieces)} cy={frontierY(point.probability)} r={point.exact100 ? 4 : 3} class:exact={point.exact100}><title>{point.pieces}미노 이하 · {probabilityLabel(point.probability, point.exact100, point.exactComparison)}</title></circle>{/each}
+        {#each [0, Math.round(displayedConfig.max_pieces / 2), displayedConfig.max_pieces] as pieces}<text x={frontierX(pieces)} y="187" text-anchor="middle">{pieces}미노</text>{/each}
+      </svg>
+      <div class="frontier-table-wrap"><table><thead><tr><th>미노 상한</th><th>{frontierGroup?.complete ? '40스핀 완주율' : '계획 전체 완성률'}</th><th>독립 고정 계획</th><th>대표 배치</th></tr></thead><tbody>{#each frontierPoints as point}<tr><td>{point.pieces}개 이하</td><td class:exact-probability={point.exact100}>{probabilityLabel(point.probability, point.exact100, point.exactComparison)}{#if point.exact100}<small>모델 전수 확인</small>{/if}</td><td>{point.candidate.bagCount}가방 · {point.candidate.spins}스핀</td><td><button class="text-button" disabled={point.replayAvailable === false} onclick={() => selectRoute(point.candidate)}>{point.replayAvailable === false ? '경로 기록 미보관' : '고정 경로 보기'}<Icon name="arrow" size={12} /></button></td></tr>{/each}</tbody></table></div>
+      <p class="frontier-note">표의 값은 목표 이상의 스핀을 담은 고정 계획 전체를 끝까지 완성할 확률입니다. 40스핀 종료 계획은 완주 비용의 정확한 누적 확률이며, 더 낮은 스핀 목표에서는 최초 도달 확률을 별도로 계산하지 않은 도달 확률의 보장 하한입니다.</p>
+      <p class="frontier-note">{frontierPoints.every(point => point.exactComparison) ? "관측한 독립 계획의 정수 증명 비율을 교차 곱으로 비교했습니다." : "정수 증명 비율이 없는 이전 기록은 부동소수 확률로 비교합니다."} 같은 스핀 목표에서 확률이 개선되는 지점만 표시합니다. 100%는 첫 가방 대칭 가정을 포함한 모델의 전수 증명입니다. 경로 보기는 원래 계획과 전체 증명을 열며, 표의 미노 상한으로 원본 증명을 바꾸지 않습니다.</p>
+    {:else}<div class="frontier-empty">{displayedFrontierTarget}스핀의 검증된 확률 기록을 아직 찾지 못했습니다. 일반 배치 안전성은 5,040가지 공급 모두에서 유지합니다.</div>{/if}
+  </section>
+
   <footer class="app-footer"><span>모든 탐색은 이 브라우저에서 실행됩니다.</span><span>Built with <a href="https://github.com/daejunnom/Clearra" target="_blank" rel="noreferrer">Clearra</a></span></footer>
 </main>
 
 <dialog class="settings-dialog" bind:this={settings}>
   <form onsubmit={saveSettings}>
     <div class="dialog-heading"><div><p class="eyebrow">SEARCH OPTIONS</p><h2>탐색 설정</h2></div><button class="icon-button" type="button" onclick={() => settings.close()} aria-label="설정 닫기"><Icon name="close" /></button></div>
+    <p class="settings-note">고정 계획의 성공률을 첫 가방부터 계산하고 미노 수별 최고 기록을 남깁니다. 일반 배치 안전성은 모든 공급에서 확인합니다.</p>
     <div class="settings-grid">
-      <label><span>전체 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '2가방부터 누적 성공률의 하한' : '첫 가방부터 누적 성공률의 하한'}</small></label>
-      <label><span>가방별 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.bag_min_success_percent} /><small>2가방부터 각 가방의 하한 · 첫 가방은 별도 설정</small></label>
-      <label class="full-row"><span>확률 완화 최소 스핀 <small>개/가방</small></span><input type="number" min="0" max="6" step="1" required bind:value={draft.risk_min_spins_per_bag} /><small>2가방부터 이 수 미만이면 100%를 요구해요. 0은 스핀 수 제한 없음입니다.</small></label>
       <label><span>미노 제한 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>탐색 상한 안의 더 긴 결과도 보관해요.</small></label>
       <label><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
-    <details class="advanced-options"><summary>추가 설정 <span>첫 가방 · 동시 탐색 · 범위</span></summary><div class="settings-grid">
-      <label class="full-row checkbox-setting" title="첫 가방은 별도 최소값으로 확인하고, 전체 성공률은 2가방부터 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">전체 성공률은 2가방부터 계산해요.</small></label>
-      <label><span>첫 가방 최소 성공률 <small>%</small></span><input type="number" min="0" max="100" step="0.01" required bind:value={draft.first_bag_min_success_percent} /><small>0%는 제한 없음</small></label>
-      <label><span>시작 예산 <small>0 = 자동</small></span><input type="number" min="0" max={draft.max_pieces} step="1" required bind:value={draft.budget_start} /></label>
+    <details class="advanced-options"><summary>추가 설정 <span>탐색 폭 · 동시 탐색 · 시드</span></summary>
+    <div class="settings-grid">
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
       <label><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
       <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div><small>접속할 때마다 무작위로 정해져요. 같은 탐색을 다시 실행하려면 직접 입력하세요.</small></label>
@@ -534,9 +594,10 @@
   <p>일반 배치는 홀드 없이 가능한지 확인하며, 홀드와 성공률 기준은 줄을 지우는 전개에 적용합니다.</p>
   <p><strong>최선 경로</strong>에서는 미노별 배치를 재생할 수 있고, <strong>탐색 중</strong>에서는 후보의 마지막 필드만 보여 줍니다. 오른쪽에서 작업 진척도를 확인할 수 있습니다.</p>
   <p>보드 오른쪽 아래의 <strong>가방 수별 후보</strong>에서 가방을 선택하고 같은 깊이의 최적·차선 경로를 골라 재생하고 저장할 수 있습니다. 선택한 경로는 탐색이 진행되어도 유지되며, 추천 경로로 돌아가면 새 최선 결과를 따라갑니다.</p>
-  <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
+  <p>각 가방의 미노 종류와 목표 칸을 고정하고, 가능한 공급 순서를 검증합니다. 공급에 따라 가방 안 계획을 다시 만들지 않습니다. 성공률은 첫 가방부터 포함하며, 일반 배치 안전성은 항상 5,040가지 공급 모두에서 확인합니다.</p>
+  <p><strong>미노 수별 성공률</strong>에서는 관측한 독립 계획 가운데 목표 이상의 스핀을 담은 계획 전체를 N개 이하로 완성하는 가장 높은 검증 확률을 보여 줍니다. 40스핀 종료 계획은 완주 비용의 정확한 누적 확률입니다. 더 낮은 목표의 값은 그 스핀에 처음 도달할 확률이 아니라, 도달 확률의 보장 하한입니다. 100% 증명에 도달한 이후의 더 큰 N은 그 목표에서만 생략합니다. 다른 목표 스핀 탐색은 계속합니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
-  <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
+  <p>선호 미노 수를 탐색 순서에 활용하며, 탐색 상한 안의 더 긴 고정 계획도 성공률 곡선에 남깁니다. 표의 확률을 누르면 해당 계획의 대표 배치를 볼 수 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

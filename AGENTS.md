@@ -1,6 +1,6 @@
 # Neyra development and delivery
 
-- Keep the user's fixed-bag, Sonic Drop, adjustable success threshold, and
+- Keep the user's fixed-bag, Sonic Drop, measured construction probability, and
   minimum-lock objective. The default 119-piece goal is an aspiration, not a rejection
   threshold. The v2 design remains implementation work until its acceptance
   criteria are demonstrated by real search results.
@@ -37,7 +37,52 @@
   additional computation sharing with matched-work ABBA measurements before
   adopting it; worker-local caches do not imply a global shared search DAG.
 
-## Active GA transition — user instruction of 2026-11-01
+## Active probability frontier and learned search — latest 2026-11-01 instruction
+
+- The task is a fixed typed bag plan that can be built under random bag order,
+  not a solution for one lucky queue. Generate one actual legal mino placement
+  at a time. CPU input replay and exact supply analysis own legality and proof.
+- New public searches use `probability_frontier=true`, include the first bag,
+  and expose no construction-probability budget. Accept nonzero measured
+  construction coverage while retaining quiet-safe coverage for all 5,040 model
+  supplies. This supersedes the older default floors/risk-minimum controls below
+  for frontier mode only. Legacy configs/checkpoints keep their original policy.
+- Report the best observed independent fixed-plan probability for each target
+  spin count and lock cap. Keep 40-spin completions separate from partial goals.
+  Only exact integer 100% for the same target can hide larger lock caps or reduce
+  its completion cost cap. Never round a neural prediction into certainty, union
+  separate plans/workers, or delete a different future board by display dominance.
+- Preserve an explicit quota and bounded archive for exact-100% prefixes. Quiet
+  safety stays mandatory when construction floors are removed. Keep the accepted
+  first-bag reflection model and disclose that it is not independent mirrored
+  input verification. A probability including the first bag is different from
+  success conditional on already building the first bag.
+- New GA policy v3 uses diverse retained records and separate raw, probability,
+  and strict-100% progress. Current selected raw progress may decrease; historical
+  raw maxima and their witnesses must not silently decrease or be reconstructed
+  from incomplete legacy history. Keep old user checkpoints; policy migration is
+  an explicit new run, not an in-place rewrite of legacy RNG/fitness semantics.
+- A fitted GA file can explicitly guide a new local search. Keep the default
+  structural evaluator available. Model files stay in browser memory; there is
+  no model upload, contribution transport, Supabase reconnection or private API
+  dependency on the public page. CPU workers own independent certificates.
+- The second-stage guide is a plan-conditioned nonlinear approximation. It may
+  order verification work, never certify legality, probability, terminal status,
+  a minimax bound or global optimality. Unknown/partial labels are not failures.
+  Deduplicate full typed plan contexts and split plan groups before fitting.
+- CPU-only inference and learning must remain usable. Optional GPU learning
+  failure retains committed optimizer/model state and retries the uncommitted
+  batch on CPU once. Report real active backend and fallback reasons. No GPU
+  capability or speedup is proved by a CPU smoke or an unavailable-device fallback.
+- Keep source research, implemented mechanisms and measured gains separate.
+  Go-Explore, AlphaStar, MEME and QD are references, not claims of full reproduction.
+  Rovent PALS is a design reference whose playing strength is unvalidated.
+  See docs/FRONTIER_ENGINE.md and docs/GUIDE_ENGINE.md for current contracts.
+
+## Retained transport retirement and legacy GA contract
+
+The original GA v2 rules below describe legacy runs. The newer frontier contract
+above takes precedence where it explicitly changes selection, floors or guides.
 
 - GA means genetic algorithm. The active learning experiment evolves a small
   vector of placement-evaluation coefficients. It does not require supervised

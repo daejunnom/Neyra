@@ -1,4 +1,4 @@
-import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus,
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, ProbabilityFrontierGroup, ProbabilityFrontierPoint, RunStatus,
   SearchConfig, SearchSnapshot } from './types';
 import { QuietTranspositionBroker } from './transpositions';
 import { base } from '$app/paths';
@@ -139,6 +139,28 @@ function complete(candidate: Candidate | null | undefined): candidate is Candida
   return !!candidate?.complete && candidate.qualified && candidate.verified && candidate.budgetPieces !== null;
 }
 
+const ratioCache = new WeakMap<ProbabilityFrontierPoint, { numerator: bigint; denominator: bigint } | null>();
+function frontierRatio(point: ProbabilityFrontierPoint) {
+  if (ratioCache.has(point)) return ratioCache.get(point)!;
+  const numerator = point.probabilityNumerator, denominator = point.probabilityDenominator;
+  let result: { numerator: bigint; denominator: bigint } | null = null;
+  if (typeof numerator === 'string' && typeof denominator === 'string' && numerator.length <= 4096 && denominator.length <= 4096 &&
+      /^\d+$/.test(numerator) && /^\d+$/.test(denominator)) {
+    const n = BigInt(numerator), d = BigInt(denominator);
+    if (d > 0n && n > 0n && n <= d) result = { numerator: n, denominator: d };
+  }
+  ratioCache.set(point, result); return result;
+}
+/** Compare whole independent proof ratios; floating equality never certifies 100%. */
+export function compareFrontierProbability(a: ProbabilityFrontierPoint, b: ProbabilityFrontierPoint): number {
+  const ar = frontierRatio(a), br = frontierRatio(b);
+  if (ar && br) {
+    const left = ar.numerator * br.denominator, right = br.numerator * ar.denominator;
+    return left > right ? 1 : left < right ? -1 : 0;
+  }
+  return a.probability > b.probability ? 1 : a.probability < b.probability ? -1 : 0;
+}
+
 export class SearchClient {
   private slots: WorkerSlot[] = [];
   private runId = '';
@@ -149,8 +171,10 @@ export class SearchClient {
   private nextFocusAt = 0;
   private lastProgressAt = 0;
   private progressTimer: ReturnType<typeof setTimeout> | undefined;
-  private pendingExports = new Map<string, { owner: number; view: CandidateView; candidateId: string }>();
+  private pendingExports = new Map<string, { owner: number; view: CandidateView; candidateId: string; select?: boolean }>();
+  private selectionRequestId: string | null = null;
   private bagRecords = new Map<number, ArchivedCandidate[]>();
+  private frontierRecords = new Map<string, ArchivedCandidate>();
   private selectedArchive: ArchivedCandidate | null = null;
   private bestSpinsByBag = Array<number>(101).fill(0);
   private transpositions = new QuietTranspositionBroker();
@@ -161,13 +185,13 @@ export class SearchClient {
 
   constructor(private receive: (event: EngineEvent) => void) {}
 
-  start(config: SearchConfig) {
+  start(config: SearchConfig, gaModelJson?: string) {
     this.dispose();
     this.runId = crypto.randomUUID();
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
-    this.shareSpinBenchmarks = config.min_success_percent === 100;
+    this.shareSpinBenchmarks = !config.probability_frontier && config.min_success_percent === 100;
     this.currentOwner = null;
     this.nextFocusAt = 0;
     this.lastProgressAt = 0;
@@ -203,7 +227,7 @@ export class SearchClient {
           config: { ...engineConfig, cnn_evaluation: false, board_evaluator: 'heuristic', seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
           assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching,
-          transpositionSharing: this.slots.length > 1
+          transpositionSharing: this.slots.length > 1, ...(gaModelJson ? { gaModelJson } : {})
         } satisfies EngineCommand);
       } catch (error) {
         this.failed(slot, error instanceof Error ? error.message : String(error));
@@ -252,13 +276,28 @@ export class SearchClient {
 
   /** Pin the actual selected certificate; later rankings do not switch its replay. */
   selectCandidate(id: string | null): boolean {
+    this.selectionRequestId = null;
     if (id === null) {
       this.selectedArchive = null;
       this.publishProgress(true);
       return true;
     }
-    const record = [...this.bagRecords.values()].flat().find((item) => this.ownedId(item) === id);
-    if (!record) return false;
+    const record = this.frontierRecords.get(id) ?? [...this.bagRecords.values()].flat().find((item) => this.ownedId(item) === id) ??
+      this.slots.flatMap(slot => slot.incumbent ? [{ slot, ...slot.incumbent }] : []).find(item => this.ownedId(item) === id);
+    if (!record) {
+      for (const slot of this.slots) {
+        const point = slot.snapshot?.probabilityFrontier?.flatMap(group => group.points).find(item => `w${slot.id}:${item.candidate.id}` === id);
+        if (!point || slot.status === 'failed') continue;
+        const requestId = crypto.randomUUID(), view: CandidateView = `candidate:${point.candidate.id}`;
+        this.selectionRequestId = requestId;
+        this.pendingExports.set(requestId, { owner: slot.id, view, candidateId: point.candidate.id, select: true });
+        try {
+          slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view } satisfies EngineCommand);
+          return true;
+        } catch { this.pendingExports.delete(requestId); this.selectionRequestId = null; return false; }
+      }
+      return false;
+    }
     this.selectedArchive = record;
     this.publishProgress(true);
     return true;
@@ -275,7 +314,7 @@ export class SearchClient {
       return true;
     }
     const archived = this.findArchive(owner);
-    if (selection === 'partial' && archived) {
+    if (archived) {
       this.receive({ type: 'export', runId: this.runId, requestId, data: archived.data });
       return true;
     }
@@ -306,7 +345,9 @@ export class SearchClient {
     for (const slot of this.slots) slot.worker.terminate();
     this.slots = [];
     this.pendingExports.clear();
+    this.selectionRequestId = null;
     this.bagRecords.clear();
+    this.frontierRecords.clear();
     this.selectedArchive = null;
     this.bestSpinsByBag.fill(0);
     this.transpositions.clear();
@@ -353,6 +394,17 @@ export class SearchClient {
       const request = this.pendingExports.get(message.requestId);
       if (!request || request.owner !== slot.id) return;
       this.pendingExports.delete(message.requestId);
+      if (request.select) {
+        if (this.selectionRequestId !== message.requestId) return;
+        this.selectionRequestId = null;
+        const candidate = message.type === 'export' ? (message.data as { candidate?: Candidate } | null)?.candidate : null;
+        if (!candidate || candidate.id !== request.candidateId) {
+          this.receive({ type: 'warning', runId: this.runId, message: '선택한 경로가 갱신되었거나 탐색기가 멈췄어요. 표에서 경로를 다시 선택해 주세요.' }); return;
+        }
+        this.retainFrontierRecord(slot, candidate, message.type === 'export' ? message.data : null);
+        this.selectedArchive = this.frontierRecords.get(`w${slot.id}:${candidate.id}`) ?? this.selectedArchive;
+        this.publishProgress(true); return;
+      }
       if (message.type === 'export-error') {
         this.receive({ type: 'export-error', runId: this.runId, requestId: message.requestId, message: message.message });
       } else {
@@ -494,7 +546,59 @@ export class SearchClient {
     const matches = (record: ArchivedCandidate) => record.slot.id === item.slot.id &&
       samePartialRecord(record.candidate, item.candidate);
     if (this.selectedArchive && matches(this.selectedArchive)) return this.selectedArchive;
-    return this.bagRecords.get(item.candidate.bagCount)?.find(matches) ?? null;
+    const frontier = this.frontierRecords.get(this.ownedId(item));
+    return frontier && matches(frontier) ? frontier : this.bagRecords.get(item.candidate.bagCount)?.find(matches) ?? null;
+  }
+
+  private retainFrontierRecord(slot: WorkerSlot, candidate: Candidate, data: unknown) {
+    const exported = (data as { candidate?: Candidate } | null)?.candidate;
+    if (!candidate.verified || !candidate.qualified || candidate.frames.length !== candidate.frameCount ||
+        !exported || !samePartialRecord(candidate, exported) || candidate.complete !== exported.complete ||
+        candidate.budgetPieces !== exported.budgetPieces || exported.frames.length !== exported.frameCount) {
+      this.failed(slot, '확률별 후보의 검증 기록이 일치하지 않아요.'); return;
+    }
+    const record: ArchivedCandidate = { slot, candidate, data }, key = this.ownedId(record);
+    this.frontierRecords.set(key, record);
+    while (this.frontierRecords.size > 32) this.frontierRecords.delete(this.frontierRecords.keys().next().value!);
+    if (this.selectedArchive && this.ownedId(this.selectedArchive) === key) this.selectedArchive = record;
+  }
+
+  private publishedProbabilityFrontier(): ProbabilityFrontierGroup[] {
+    const groups = new Map<string, ProbabilityFrontierGroup>();
+    for (const slot of this.slots) {
+      for (const group of slot.snapshot?.probabilityFrontier ?? []) {
+        if (!Number.isInteger(group.targetSpins) || group.targetSpins < 1 || group.targetSpins > 40) continue;
+        const key = `${group.targetSpins}:${group.complete}`, combined = groups.get(key) ?? { targetSpins: group.targetSpins, complete: group.complete, points: [] };
+        for (const point of group.points) {
+          const pointId = `w${slot.id}:${point.candidate.id}`;
+          const record = this.frontierRecords.get(pointId) ?? this.bagRecords.get(point.candidate.bagCount)?.find(item => this.ownedId(item) === pointId) ??
+            (slot.incumbent?.candidate.id === point.candidate.id ? { slot, ...slot.incumbent } : null);
+          const ratio = frontierRatio(point);
+          if (!point.candidate.verified || !point.candidate.qualified || !Number.isInteger(point.pieces) || point.pieces < 1 || !Number.isFinite(point.probability) ||
+              point.probability < 0 || (point.probability === 0 && !ratio) || point.probability > 1 || typeof point.exact100 !== 'boolean') continue;
+          if (ratio && point.exact100 && ratio.numerator !== ratio.denominator) continue;
+          combined.points.push({ pieces: point.pieces, probability: point.probability, exact100: point.exact100,
+            probabilityNumerator: point.probabilityNumerator, probabilityDenominator: point.probabilityDenominator, exactComparison: ratio !== null,
+            replayAvailable: Boolean(record || slot.status !== 'failed'),
+            candidate: { ...(record?.candidate ?? point.candidate), id: `w${slot.id}:${point.candidate.id}` } });
+        }
+        groups.set(key, combined);
+      }
+    }
+    return [...groups.values()].sort((a, b) => a.targetSpins - b.targetSpins || Number(a.complete) - Number(b.complete)).map(group => {
+      // Each point keeps one worker's whole fixed-plan certificate. Comparing
+      // probabilities never combines those plans' supply success sets.
+      const ordered = group.points.sort((a, b) => a.pieces - b.pieces || compareFrontierProbability(b, a) || Number(b.exact100) - Number(a.exact100));
+      const points: ProbabilityFrontierGroup['points'] = [];
+      let highest: ProbabilityFrontierPoint | null = null, exact = false;
+      for (const point of ordered) {
+        if (exact) break;
+        if (!highest || compareFrontierProbability(point, highest) > 0 || (point.exact100 && !exact)) {
+          points.push(point); highest = point; exact = point.exact100;
+        }
+      }
+      return { ...group, points };
+    }).filter(group => group.points.length > 0);
   }
 
   private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown) {
@@ -540,6 +644,11 @@ export class SearchClient {
   }
 
   private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
+    const retainedFrontier = new Map<string, Candidate>((snapshot.probabilityFrontier ?? []).flatMap(group => group.points.map(point => [`w${slot.id}:${point.candidate.id}`, point.candidate] as const)));
+    for (const [key, record] of this.frontierRecords) {
+      const current = retainedFrontier.get(key);
+      if (record.slot.id === slot.id && (!current || !samePartialRecord(record.candidate, current))) this.frontierRecords.delete(key);
+    }
     const merge = (next: Candidate | null, previous: Candidate | null | undefined, exactRecord = false) => {
       const sameRows = !!next && !!previous && next.rows.length === previous.rows.length &&
         next.rows.every((row, y) => row === previous.rows[y]);
@@ -651,6 +760,14 @@ export class SearchClient {
       finished: this.status === 'completed',
       current: owned(current), best: owned(best), bestPartial: owned(partial),
       bestByBag: this.publishedBagRecords(), selectedCandidate: owned(this.selectedArchive),
+      probabilityFrontier: this.publishedProbabilityFrontier(),
+      evaluator: values.find(value => value.evaluator?.active === 'ga-policy')?.evaluator ?? values.find(value => value.evaluator)?.evaluator,
+      evaluatorWorkers: {
+        ga: this.slots.filter(slot => slot.status !== 'failed' && slot.snapshot?.evaluator?.active === 'ga-policy').length,
+        heuristic: this.slots.filter(slot => slot.status !== 'failed' && slot.snapshot && slot.snapshot.evaluator?.active !== 'ga-policy').length,
+        failed: this.slots.filter(slot => slot.status === 'failed').length,
+      },
+      evaluatorFallbacks: [...new Set(values.flatMap(value => value.evaluator?.fallbackReason ? [value.evaluator.fallbackReason] : []))],
       workers: this.slots.filter((slot) => !['failed', 'completed', 'cancelled'].includes(slot.status)).length
     } });
   }

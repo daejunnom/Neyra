@@ -3,6 +3,7 @@ pub mod evaluator;
 pub mod completion;
 pub mod exploration;
 pub mod ga;
+pub mod guide;
 pub mod search;
 mod srs_plus;
 mod structure;
@@ -27,6 +28,23 @@ impl GaSession {
     #[wasm_bindgen(js_name = from_checkpoint_json)]
     pub fn from_checkpoint_json(json: &str) -> Result<GaSession, JsValue> {
         Ok(Self { trainer: ga::Trainer::from_checkpoint_json(json).map_err(|e| JsValue::from_str(&e))? })
+    }
+
+    /// Start a new v3 run from fitted coefficients, with new RNG and proof state.
+    #[wasm_bindgen(js_name = with_model)]
+    pub fn with_model(config_json: &str, model_json: &str) -> Result<GaSession, JsValue> {
+        let config = ga::GaConfig::from_json(config_json).map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { trainer: ga::Trainer::with_model(config, model_json)
+            .map_err(|e| JsValue::from_str(&e))? })
+    }
+
+    /// Explicit policy migration: preserve the source checkpoint and inherit
+    /// only its selected coefficients, never its fitness or certificate claims.
+    #[wasm_bindgen(js_name = fork_checkpoint)]
+    pub fn fork_checkpoint(config_json: &str, checkpoint_json: &str) -> Result<GaSession, JsValue> {
+        let config = ga::GaConfig::from_json(config_json).map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { trainer: ga::Trainer::fork_checkpoint(config, checkpoint_json)
+            .map_err(|e| JsValue::from_str(&e))? })
     }
 
     pub fn advance(&mut self, work_budget: u32) -> Result<String, JsValue> {
@@ -206,6 +224,15 @@ impl NeyraEngine {
         let config: SearchConfig = serde_json::from_str(config_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid settings: {e}")))?;
         let session = SearchSession::with_model(config, model_json).map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { session })
+    }
+
+    /// Local owner-selected GA guide. It never contacts a learning service.
+    #[wasm_bindgen(js_name = with_ga_model)]
+    pub fn with_ga_model(config_json: &str, model_json: &str) -> Result<NeyraEngine, JsValue> {
+        let config: SearchConfig = serde_json::from_str(config_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid settings: {e}")))?;
+        let session = SearchSession::with_ga_model(config, model_json).map_err(|e| JsValue::from_str(&e))?;
         Ok(Self { session })
     }
 

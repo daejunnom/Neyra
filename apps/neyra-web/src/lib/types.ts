@@ -1,4 +1,6 @@
 export interface SearchConfig {
+  /** New runs retain the probability-by-cost frontier instead of a chosen probability budget. */
+  probability_frontier?: boolean;
   min_success_percent: number;
   /** Minimum success of each bag after the independently filtered opening. */
   bag_min_success_percent: number;
@@ -76,6 +78,24 @@ export interface BagCandidates {
   runnerUp: Candidate | null;
 }
 
+export interface ProbabilityFrontierPoint {
+  pieces: number;
+  probability: number;
+  /** Exact proof flag from Rust; never infer this from a rounded floating value. */
+  exact100: boolean;
+  probabilityNumerator?: string;
+  probabilityDenominator?: string;
+  exactComparison?: boolean;
+  candidate: Candidate;
+  /** A live worker or a retained full record can supply this plan's replay. */
+  replayAvailable?: boolean;
+}
+export interface ProbabilityFrontierGroup {
+  targetSpins: number;
+  complete: boolean;
+  points: ProbabilityFrontierPoint[];
+}
+
 export interface SearchSnapshot {
   phase: string;
   expanded: number;
@@ -105,6 +125,11 @@ export interface SearchSnapshot {
   bestPartial: Candidate | null;
   /** Two distinct fields per depth (reflection-aware display only), each with its own certified route. */
   bestByBag?: BagCandidates[];
+  /** Independent certified plans; a winner is chosen without unioning supply sets. */
+  probabilityFrontier?: ProbabilityFrontierGroup[];
+  evaluator?: { enabled: boolean; requested: 'ga-policy' | 'heuristic'; active: 'ga-policy' | 'heuristic'; modelId: string | null; weightsSha256: string | null; fallbackReason: string | null; scope: string; learningComplete: false };
+  evaluatorWorkers?: { ga: number; heuristic: number; failed: number };
+  evaluatorFallbacks?: string[];
   /** Explicit browser selection, pinned while later records improve. */
   selectedCandidate?: Candidate | null;
   /** Added by the browser coordinator, not combined into any certificate. */
@@ -134,7 +159,7 @@ export type EngineEvent =
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; transpositionSharing?: boolean }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; transpositionSharing?: boolean; gaModelJson?: string }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
   | { type: 'benchmarks'; runId: string; bestSpinsByBag: number[] }
   | { type: 'transpositions'; runId: string; batch: QuietTranspositionBatch }
@@ -143,11 +168,12 @@ export type EngineCommand =
   | { type: 'export'; runId: string; requestId: string; view: CandidateView };
 
 export const defaultConfig: SearchConfig = {
-  min_success_percent: 100,
-  bag_min_success_percent: 100,
-  risk_min_spins_per_bag: 3,
-  ignore_first_bag_probability: true,
-  first_bag_min_success_percent: 80,
+  probability_frontier: true,
+  min_success_percent: 0.01,
+  bag_min_success_percent: 0.01,
+  risk_min_spins_per_bag: 0,
+  ignore_first_bag_probability: false,
+  first_bag_min_success_percent: 0,
   piece_goal: 119,
   max_pieces: 126,
   budget_start: 0,

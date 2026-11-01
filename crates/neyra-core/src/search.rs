@@ -6,6 +6,7 @@
 
 pub mod labels;
 pub(crate) mod ga_verify;
+mod frontier;
 mod transpositions;
 
 use crate::evaluator::SpinModel;
@@ -43,6 +44,10 @@ const PACE_REFERENCE: [u8; 18] = [0, 0, 2, 4, 8, 10, 12, 15, 17, 19, 22, 25, 28,
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
+    /// Explore every nonzero construction probability. The frontier, not a
+    /// user-selected probability floor, retains independently verified routes.
+    #[serde(alias = "probabilityFrontier")]
+    pub probability_frontier: bool,
     #[serde(alias = "minSuccessPercent")]
     pub min_success_percent: f64,
     /// Independent floor for every bag after the separately configured start.
@@ -86,6 +91,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
+            probability_frontier: false,
             min_success_percent: 100.0,
             bag_min_success_percent: 100.0,
             risk_min_spins_per_bag: 3,
@@ -281,10 +287,21 @@ pub struct EvaluatorStatus {
     pub learning_complete: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideStatus {
+    pub active: bool,
+    pub model_id: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub evaluations: u64,
+    pub failed_evaluations: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressSnapshot {
     pub evaluator: EvaluatorStatus,
+    pub guide: GuideStatus,
     pub phase: String,
     pub expanded: u64,
     pub candidates: u64,
@@ -305,6 +322,9 @@ pub struct ProgressSnapshot {
     /// Two certified whole-bag records per depth, independent of the live tree.
     /// Always compact; fetch one record's frames with candidate:<id> export.
     pub best_by_bag: Vec<BagCandidatesSnapshot>,
+    pub probability_frontier: Vec<frontier::GoalFrontierSnapshot>,
+    pub certain_lane_dispatches: u64,
+    pub frontier_bound_pruned: u64,
     pub duplicates: u64,
     /// Exact quiet-policy computations reused, never heuristic or mirror cuts.
     pub transposition_hits: u64,
@@ -1931,6 +1951,7 @@ impl ContinuationProbe {
 }
 
 struct RefinementJob {
+    preserve_learned_quality: bool,
     evaluator: Option<Rc<SpinModel>>,
     first_bag: bool,
     spin_priority: bool,
@@ -1942,9 +1963,10 @@ struct RefinementJob {
 }
 
 impl RefinementJob {
-    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool, spin_priority: bool, evaluator: Option<Rc<SpinModel>>) -> Self {
+    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool, spin_priority: bool, evaluator: Option<Rc<SpinModel>>, preserve_learned_quality: bool) -> Self {
         pending.reverse();
         Self {
+            preserve_learned_quality,
             evaluator,
             first_bag,
             spin_priority,
@@ -1961,10 +1983,10 @@ impl RefinementJob {
             probe.step(cache);
             if probe.finished() {
                 seed.future = probe.best;
-                seed.quality = self.evaluator.as_ref().map_or_else(
+                seed.quality = if self.preserve_learned_quality { seed.quality } else { self.evaluator.as_ref().map_or_else(
                     || boundary_quality(&seed.board, &seed.debt, &seed.future),
                     |model| model.boundary_quality(&seed.board).unwrap_or(0.0),
-                );
+                ) };
                 let rank = if self.spin_priority { candidate_priority_rank } else { candidate_rank };
                 seed.score = rank(seed.spins, seed.quality, self.first_bag, seed.spins >= goal);
                 insert_seed(&mut self.complete, seed, 8);
@@ -1993,6 +2015,7 @@ impl RefinementJob {
 }
 
 struct GenerationJob {
+    ga_weights: Option<Rc<Vec<f64>>>,
     evaluator: Option<Rc<SpinModel>>,
     parent: usize,
     start: Board,
@@ -2171,6 +2194,7 @@ impl GenerationJob {
         let terminal = seed.spins >= goal;
         Self {
             evaluator: None,
+            ga_weights: None,
             parent,
             start: node.board,
             start_spins: node.spins,
@@ -2305,7 +2329,9 @@ impl GenerationJob {
         // of each bag is built locally; no worker shares a supply certificate.
         // Quiet setup rounds discard every single. Their narrow proposal set
         // therefore needs no exact spin witness search at all.
-        let locks = if self.setup && !self.broad {
+        let locks = if self.ga_weights.is_some() {
+            Rc::new(state.board.reachable_locks(piece))
+        } else if self.setup && !self.broad {
             Rc::new(state.board.surface_locks(piece))
         } else { cache.proposals(state.board, piece, self.broad && !root_choice) };
         let hint = hint.filter(|placement| placement.pose.piece == piece);
@@ -2476,7 +2502,11 @@ impl GenerationJob {
                 structural -= pursuit.remaining(&result.board) as f64 * 8.0;
                 structural -= facts.unplanned_holes(&pursuit.required_empty) as f64 * 4.0;
             }
-            let quality = if self.start_pieces == 0 {
+            let quality = if let Some(weights) = &self.ga_weights {
+                // The fitted policy orders actual legal locks. Neither its
+                // score nor the search beam certifies supply or future spins.
+                crate::ga::score_placement(weights, &state.board, placement).unwrap_or(0.0) * 40.0
+            } else if self.start_pieces == 0 {
                 // Early floor freedom remains important, but the last four
                 // placements must also retain a useful workspace and roof.
                 // Every first-bag round uses this foundation order, even after
@@ -2599,6 +2629,7 @@ impl GenerationJob {
                     self.start_pieces == 0,
                     self.spin_priority,
                     self.evaluator.clone(),
+                    self.ga_weights.is_some(),
                 ));
                 false
             }
@@ -3198,6 +3229,12 @@ fn productive_rounds(
 }
 
 pub struct SearchSession {
+    ga_weights: Option<Rc<Vec<f64>>>,
+    guide: Option<crate::guide::GuideModel>,
+    guide_status: GuideStatus,
+    guide_scores: HashMap<u64, f64>,
+    guide_collection_limit: usize,
+    guide_samples: Vec<serde_json::Value>,
     evaluator: Option<Rc<SpinModel>>,
     evaluator_status: EvaluatorStatus,
     config: SearchConfig,
@@ -3218,6 +3255,7 @@ pub struct SearchSession {
     other_complete: Option<Archived>,
     best_partial: Option<Archived>,
     best_by_bag: Vec<Vec<Archived>>,
+    probability_frontier: frontier::Archive,
     finished: bool,
     last_checked: u16,
     last_success: u16,
@@ -3249,11 +3287,23 @@ pub struct SearchSession {
     focus_since_dispatch: u64,
     last_exploration_dispatch: u64,
     last_pace_probe_dispatch: u64,
+    last_certain_dispatch: u64,
+    certain_lane_dispatches: u64,
+    frontier_bound_pruned: u64,
     exploration_phase: u8,
 }
 
 impl SearchSession {
-    pub fn new(config: SearchConfig) -> Result<Self, String> {
+    pub fn new(mut config: SearchConfig) -> Result<Self, String> {
+        if config.probability_frontier {
+            // Compatibility fields do not impose a hidden probability budget
+            // in this mode. Exact positive coverage is checked below.
+            config.min_success_percent = 0.01;
+            config.bag_min_success_percent = 0.01;
+            config.first_bag_min_success_percent = 0.0;
+            config.risk_min_spins_per_bag = 0;
+            config.ignore_first_bag_probability = false;
+        }
         config.validate()?;
         let seed = if config.seed == 0 {
             0x9e37_79b9_7f4a_7c15
@@ -3292,6 +3342,12 @@ impl SearchSession {
         }
         .min(config.max_pieces);
         Ok(Self {
+            ga_weights: None,
+            guide: None,
+            guide_status: GuideStatus::default(),
+            guide_scores: HashMap::new(),
+            guide_collection_limit: 0,
+            guide_samples: vec![],
             evaluator: None,
             evaluator_status: EvaluatorStatus {
                 enabled: false, requested: config.board_evaluator.clone(), active: "heuristic",
@@ -3318,6 +3374,7 @@ impl SearchSession {
             other_complete: None,
             best_partial: None,
             best_by_bag: vec![],
+            probability_frontier: frontier::Archive::default(),
             finished: false,
             last_checked: 0,
             last_success: 0,
@@ -3347,6 +3404,9 @@ impl SearchSession {
             focus_since_dispatch: 0,
             last_exploration_dispatch: 0,
             last_pace_probe_dispatch: 0,
+            last_certain_dispatch: 0,
+            certain_lane_dispatches: 0,
+            frontier_bound_pruned: 0,
             exploration_phase: 0,
         })
     }
@@ -3372,6 +3432,86 @@ impl SearchSession {
         Ok(session)
     }
 
+    /// Optional fitted GA ordering with the ordinary anytime multi-path
+    /// search. Physics, fixed tilings and exact P7 evidence stay in this core.
+    pub fn with_ga_model(config: SearchConfig, model_json: &str) -> Result<Self, String> {
+        let mut session = Self::new(config)?;
+        session.evaluator_status.requested = "ga-policy".into();
+        match crate::ga::GaModel::from_json(model_json) {
+            Ok(model) if model.trained => {
+                // Reuse a discovered opening as a proposal, never trust the
+                // model's persisted proof fields. Its inputs are replayed now
+                // and the ordinary P7 verifier runs before it can enter a tree.
+                if let Some(best) = &model.best {
+                    if best.placements.len() >= 7 {
+                        let request = ga_verify::Request { start: Board::default(), start_spins: 0,
+                            start_pieces: 0, placements: best.placements[..7].to_vec(), assume_reflection: true };
+                        if let Ok(mut plan) = request.plan() {
+                            plan.id = session.next_id; session.next_id += 1;
+                            session.remember_plan(0, &plan);
+                            session.candidates += 1;
+                            session.waiting_plans.push((0, plan));
+                        }
+                    }
+                }
+                session.evaluator_status = EvaluatorStatus { enabled: true,
+                    requested: "ga-policy".into(), active: "ga-policy",
+                    model_id: Some(model.model_id), weights_sha256: Some(model.weights_sha256),
+                    fallback_reason: None, learning_complete: false,
+                    scope: "Fitted GA legal-placement ordering plus bounded multi-path search; exact physics and independent fixed-plan probability verification; no completion or optimality claim" };
+                session.ga_weights = Some(Rc::new(model.weights));
+            }
+            Ok(_) => session.evaluator_status.fallback_reason = Some("trained-ga-model-required".into()),
+            Err(error) => session.evaluator_status.fallback_reason = Some(format!("ga-model-rejected: {error}")),
+        }
+        Ok(session)
+    }
+
+    /// Optional second-stage CPU inference; CUDA training exports the same
+    /// portable parameters. A bad model removes its hint, not exact search.
+    pub fn with_guides(config: SearchConfig, ga_json: Option<&str>, guide_json: Option<&str>) -> Result<Self, String> {
+        let mut session = if let Some(model) = ga_json { Self::with_ga_model(config, model)? }
+            else { Self::new(config)? };
+        if let Some(json) = guide_json {
+            match crate::guide::GuideModel::from_json(json) {
+                Ok(model) if model.is_trained() => {
+                    session.guide_status.active = true;
+                    session.guide_status.model_id = Some(model.model_id().into());
+                    session.guide = Some(model);
+                }
+                Ok(_) => session.guide_status.fallback_reason = Some("guide-untrained".into()),
+                Err(error) => session.guide_status.fallback_reason = Some(format!("guide-rejected: {error}")),
+            }
+        }
+        Ok(session)
+    }
+
+    /// Explicit private/native collection only; the public browser does not
+    /// call this. No database, transport, callback or automatic upload exists.
+    pub fn enable_guide_collection(&mut self, limit: usize) { self.guide_collection_limit = limit.min(4096); }
+    pub fn take_guide_samples(&mut self) -> Vec<serde_json::Value> { std::mem::take(&mut self.guide_samples) }
+
+    fn guide_input(plan: &Plan) -> crate::guide::GuideInput {
+        crate::guide::GuideInput { start_rows: plan.start.rows, end_rows: plan.expected.rows,
+            targets: plan.targets.clone(), start_spins: plan.start_spins,
+            end_spins: plan.expected_spins, start_pieces: plan.start_pieces, terminal: plan.terminal }
+    }
+
+    fn evaluate_guide_plan(&mut self, plan: &Plan) {
+        let Some(model) = &self.guide else { return; };
+        self.guide_status.evaluations += 1;
+        match model.priority(&Self::guide_input(plan)) {
+            Some(priority) if priority.is_finite() => {
+                if self.guide_scores.len() >= 8192 { self.guide_scores.clear(); }
+                self.guide_scores.insert(plan.id, priority);
+            }
+            _ => {
+                self.guide_status.failed_evaluations += 1;
+                self.guide_status.fallback_reason = Some("guide-evaluation-failed-using-existing-order".into());
+            }
+        }
+    }
+
     /// One unit either expands a geometric piece choice, one execution node,
     /// or at most 64 finite supply products. No step consumes an entire search.
     pub fn step(&mut self, max_work: u32) {
@@ -3381,6 +3521,16 @@ impl SearchSession {
             }
             self.preview_steps = self.preview_steps.wrapping_add(1);
             if let Some(mut job) = self.verification.take() {
+                if self.config.probability_frontier && job.plan.terminal
+                    && self.probability_frontier.terminal_bound_dominated(self.goal,
+                        job.plan.start_pieces, &self.tree[job.parent].counts,
+                        job.coverage_upper(), self.config.max_pieces) {
+                    self.frontier_bound_pruned += 1;
+                    // Dominated for the requested terminal frontier, not a
+                    // failed supply proof. Do not publish an exact TT failure.
+                    self.backpropagate(job.parent, 0.0);
+                    continue;
+                }
                 let pieces = job.plan.start_pieces + job.plan.targets.len() as u16;
                 if !job.plan.terminal && selective_reason(
                     job.plan.expected.cell_count(), 0, pieces, job.plan.expected_spins,
@@ -3497,6 +3647,7 @@ impl SearchSession {
                             continue;
                         }
                         if self.remember_plan(parent, &plan) {
+                            self.evaluate_guide_plan(&plan);
                             self.candidates += 1;
                             self.waiting_plans.push((parent, plan));
                         } else {
@@ -3511,6 +3662,7 @@ impl SearchSession {
                 }
                 continue;
             }
+            if self.explore_certain_once() { continue; }
             if self.explore_once() { continue; }
             // A lease survives only until a better verified benchmark or a
             // bounded dispatch quantum. Descendants cannot refill ancestors.
@@ -3616,6 +3768,12 @@ impl SearchSession {
     }
 
     fn cost_cap(&self) -> u16 {
+        if self.config.probability_frontier {
+            // A short, low-probability completion cannot eliminate a longer,
+            // safer one. Only exact 100% for this same target gives that cap.
+            return self.probability_frontier.certain_cost(self.goal)
+                .unwrap_or(self.config.max_pieces).min(self.config.max_pieces);
+        }
         self.best
             .as_ref()
             .and_then(|b| b.summary.budget_pieces)
@@ -3735,10 +3893,12 @@ impl SearchSession {
         let horizon = self.config.piece_goal.max(material_floor)
             .min(self.config.max_pieces).max(1);
         probability_pace(self.path_probability(counts), self.counted_counts(counts).len(),
-            horizon, self.config.ignore_first_bag_probability, self.config.min_success_percent)
+            horizon, self.config.ignore_first_bag_probability,
+            if self.config.probability_frontier { 100.0 } else { self.config.min_success_percent })
     }
 
     fn first_bag_minimum(&self) -> u16 {
+        if self.config.probability_frontier { return 1; }
         // The integer threshold also makes 0 mean any nonzero coverage.
         let basis_points = (self.config.first_bag_min_success_percent * 100.0).round() as u32;
         (basis_points * P7_COUNT as u32).div_ceil(10_000).max(1) as u16
@@ -3749,17 +3909,20 @@ impl SearchSession {
     }
 
     fn bag_minimum(&self) -> u16 {
+        if self.config.probability_frontier { return 1; }
         let basis_points = (self.config.bag_min_success_percent * 100.0).round() as u32;
         (basis_points * P7_COUNT as u32).div_ceil(10_000).max(1) as u16
     }
 
     fn bag_minimum_for_spins(&self, actual_bag_spins: u8) -> u16 {
+        if self.config.probability_frontier { return 1; }
         if actual_bag_spins < self.config.risk_min_spins_per_bag {
             P7_COUNT as u16
         } else { self.bag_minimum() }
     }
 
     fn next_bag_minimum(&self, counts: &[u16]) -> u16 {
+        if self.config.probability_frontier { return 1; }
         if counts.is_empty() {
             self.first_bag_minimum().max(if self.config.ignore_first_bag_probability { 1 }
                 else { required_success(&[], self.config.min_success_percent) })
@@ -3780,6 +3943,9 @@ impl SearchSession {
     }
 
     fn path_qualifies(&self, counts: &[u16]) -> bool {
+        if self.config.probability_frontier {
+            return counts.iter().all(|&count| count > 0 && usize::from(count) <= P7_COUNT);
+        }
         self.start_qualifies(counts)
             && counts.iter().skip(1).all(|&count| count >= self.bag_minimum())
             && threshold_met(self.counted_counts(counts), self.config.min_success_percent)
@@ -3839,6 +4005,7 @@ impl SearchSession {
                     probability_scheduling_rank(plan.expected_spins,
                         plan.start_pieces + plan.targets.len() as u16, quality,
                         self.path_probability(&self.tree[parent].counts))
+                        + self.guide_scores.get(&plan.id).copied().unwrap_or(0.0) * 0.1
                 };
                 a.terminal.cmp(&b.terminal)
                     .then_with(|| priority(*a_parent, a).total_cmp(&priority(*b_parent, b)))
@@ -3938,6 +4105,30 @@ impl SearchSession {
         true
     }
 
+    fn explore_certain_once(&mut self) -> bool {
+        if !self.config.probability_frontier
+            || self.dispatches.saturating_sub(self.last_certain_dispatch) < 4 { return false; }
+        // Separate service for exact-100% prefixes. A neural probability or
+        // lower-risk incumbent can neither create nor remove this entitlement.
+        let certain = |i: usize| self.tree[i].counts.iter().all(|&c| usize::from(c) == P7_COUNT);
+        let parent = (0..self.tree.len()).filter(|&i| certain(i) && self.can_expand(i))
+            .min_by_key(|&i| (self.tree[i].last_selected, std::cmp::Reverse(self.tree[i].pieces)));
+        let Some(parent) = parent else { return false; };
+        self.last_certain_dispatch = self.dispatches;
+        self.certain_lane_dispatches += 1;
+        self.focus = None;
+        if let Some(index) = self.best_waiting_plan(Some(parent)) {
+            let (_, plan) = self.waiting_plans.remove(index);
+            self.begin_verification(parent, plan);
+        } else {
+            self.tree[parent].allowance = self.tree[parent].attempts + 1;
+            // Use the hard admissible horizon here. Pace and forecast remain
+            // bounded proposal heuristics, never exact rejection evidence.
+            self.begin_generation_with_pace(parent, true);
+        }
+        true
+    }
+
     fn begin_generation(&mut self, parent: usize) {
         self.begin_generation_with_pace(parent, false);
     }
@@ -3970,6 +4161,7 @@ impl SearchSession {
             self.config.search_lanes,
         ).prioritize_spins();
         if self.tree[parent].pieces >= 7 { generation.evaluator = self.evaluator.clone(); }
+        generation.ga_weights = self.ga_weights.clone();
         generation.best_bag_spins =
             self.selective_spin_reference((self.tree[parent].pieces as usize / 7) + 1);
         generation.bag_alpha = if parent != 0 && self.config.min_success_percent == 100.0 {
@@ -3988,8 +4180,8 @@ impl SearchSession {
         if parent == 0 {
             // Later unknown bag chances are never assumed to improve the
             // parent's probability. This remains an optimistic necessary floor.
-            generation.continuation_minimum_success = self.bag_minimum()
-                .max(required_success(&[], self.config.min_success_percent));
+            generation.continuation_minimum_success = if self.config.probability_frontier { 1 }
+                else { self.bag_minimum().max(required_success(&[], self.config.min_success_percent)) };
         }
         self.generation = Some(generation);
         self.tree[parent].attempts += 1;
@@ -4256,6 +4448,13 @@ impl SearchSession {
     fn finish_verification(&mut self, job: VerificationJob) {
         debug_assert!(!job.quiet_rejected && job.quiet_safe == P7_COUNT);
         self.verified_candidates += 1;
+        if self.guide_collection_limit > self.guide_samples.len()
+            && job.checked == P7_COUNT && !job.graph.overflow {
+            self.guide_samples.push(serde_json::json!({"input":Self::guide_input(&job.plan),
+                "checked":job.checked,"graphOverflow":job.graph.overflow,"quietSafeSupplies":job.quiet_safe,
+                "success":job.coverage_success(),"bagSpins":job.plan.expected_spins-job.plan.start_spins,
+                "holdPolicy":CLEAR_ONLY_HOLD_POLICY,"sourcePolicy":"neyra-exact-search-frontier-v1"}));
+        }
         let parent = &self.tree[job.parent];
         let mut counts = parent.counts.clone();
         counts.push(job.coverage_success());
@@ -4295,6 +4494,9 @@ impl SearchSession {
         } else {
             self.plan_path_qualifies(&counts, &job.plan)
         };
+        let displayed_probability = if self.config.probability_frontier && job.plan.terminal {
+            budget.and_then(|n| cdf.iter().find(|point| point.pieces == n)).map_or(0.0, |point| point.probability)
+        } else { total_probability };
         let desired = budget.map(|n| n - parent.pieces).unwrap_or(7) as u8;
         // The selected witness must have actually been queried and have
         // the orbit minimum cost. A skipped partner remains zero, not a path.
@@ -4317,7 +4519,7 @@ impl SearchSession {
         // Reuse this boundary's immutable geometry facts locally. No shared
         // cache or certificate policy is introduced by the reuse.
         let facts = BoardFacts::new(&job.plan.expected);
-        let quality = if parent.pieces >= 7 {
+        let quality = if self.ga_weights.is_some() { job.plan.quality } else if parent.pieces >= 7 {
             self.evaluator.as_ref().map_or_else(
                 || boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future),
                 |model| model.boundary_quality(&job.plan.expected).unwrap_or(0.0),
@@ -4357,9 +4559,9 @@ impl SearchSession {
             rows: last.rows,
             spins: last.spins,
             placed: last.placed,
-            probability: total_probability,
-            lower_probability: total_probability,
-            upper_probability: total_probability,
+            probability: displayed_probability,
+            lower_probability: displayed_probability,
+            upper_probability: displayed_probability,
             first_bag_probability: counts.first().map(|count| f64::from(*count) / P7_COUNT as f64),
             first_bag_symmetry: symmetry_assumed,
             first_bag_symmetry_assumed: symmetry_assumed,
@@ -4386,6 +4588,8 @@ impl SearchSession {
             pending_plan: None,
         };
         self.current = Some(archived.clone());
+        if qualified { self.probability_frontier.retain(&archived, self.goal, self.config.max_pieces,
+            self.config.ignore_first_bag_probability); }
         Self::retain_bag_candidate(&mut self.best_by_bag, &archived);
         if qualified {
             self.qualified_bags = self.qualified_bags.max(counts.len() as u16);
@@ -4538,13 +4742,19 @@ impl SearchSession {
             .then_with(|| self.node_scheduling_rank(b, self.tree[b].quality)
                 .total_cmp(&self.node_scheduling_rank(a, self.tree[a].quality))));
         untried_deep.truncate((self.config.beam_width / 16).clamp(2, 4));
+        let mut certain: Vec<_> = if self.config.probability_frontier {
+            (1..self.tree.len()).filter(|&i| self.can_expand(i)
+                && self.tree[i].counts.iter().all(|&c| usize::from(c) == P7_COUNT)).collect()
+        } else { vec![] };
+        certain.sort_by_key(|&i| (std::cmp::Reverse(self.tree[i].pieces), self.tree[i].last_selected));
+        certain.truncate((self.config.beam_width / 8).clamp(2, 16));
         let replaceable = |i: usize| {
             i != parent && self.focus != Some(i) && self.tree[i].children.is_empty()
                 && !self.waiting_plans.iter().any(|(pending, _)| *pending == i)
         };
         let victim = (1..self.tree.len())
             .filter(|i| {
-                replaceable(*i) && !foundations.contains(i) && !untried_deep.contains(i)
+                replaceable(*i) && !foundations.contains(i) && !untried_deep.contains(i) && !certain.contains(i)
             })
             .min_by(|a, b| {
                 let score = |i: usize| {
@@ -4553,8 +4763,8 @@ impl SearchSession {
                 };
                 let eligible = |i| self.can_expand(i) && self.node_selective_reason(i).is_none();
                 eligible(*a).cmp(&eligible(*b)).then_with(|| score(*a).total_cmp(&score(*b)))
-            }).or_else(|| foundations.iter().rev().copied().find(|&i| replaceable(i)))
-            .or_else(|| untried_deep.iter().rev().copied().find(|&i| replaceable(i)));
+            }).or_else(|| foundations.iter().rev().copied().find(|&i| replaceable(i) && !certain.contains(&i)))
+            .or_else(|| untried_deep.iter().rev().copied().find(|&i| replaceable(i) && !certain.contains(&i)));
         let Some(index) = victim else { return None };
         if let Some(old_parent) = self.tree[index].parent {
             self.tree[old_parent].children.retain(|i| *i != index);
@@ -4608,6 +4818,7 @@ impl SearchSession {
     fn snapshot_with_frames(&self, include_frames: bool) -> ProgressSnapshot {
         ProgressSnapshot {
             evaluator: self.evaluator_status.clone(),
+            guide: self.guide_status.clone(),
             phase: if self.finished {
                 "stopped"
             } else if self.verification.is_some() {
@@ -4652,6 +4863,9 @@ impl SearchSession {
                     runner_up: records.get(1).map(|a| a.for_snapshot(false)),
                 })
             }).collect(),
+            probability_frontier: self.probability_frontier.snapshot(),
+            certain_lane_dispatches: self.certain_lane_dispatches,
+            frontier_bound_pruned: self.frontier_bound_pruned,
             duplicates: self.duplicates,
             transposition_hits: self.quiet_table.hits,
             transposition_stores: self.quiet_table.stores,
@@ -4678,6 +4892,7 @@ impl SearchSession {
             "partial" => self.best_partial.as_ref(),
             _ => selection.strip_prefix("candidate:").and_then(|id| {
                 self.best_by_bag.iter().flatten().find(|record| record.summary.id == id)
+                    .or_else(|| self.probability_frontier.find(id))
                     .or_else(|| self.best_partial.as_ref().filter(|record| record.summary.id == id))
                     .or_else(|| self.best.as_ref().filter(|record| record.summary.id == id))
             }),

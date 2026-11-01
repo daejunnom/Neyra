@@ -1,7 +1,7 @@
 //! Portable GA runner. Keep generated checkpoints, models and measurement
 //! reports outside the source repository.
 
-use neyra_core::ga::{FrozenRunner, GaConfig, GaModel, Trainer, SOURCE_POLICY};
+use neyra_core::ga::{FrozenRunner, GaConfig, GaModel, Trainer};
 use neyra_core::search::SearchSession;
 use serde_json::json;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ fn required<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str,
     args.get(key).map(String::as_str).ok_or_else(|| format!("Missing --{key}"))
 }
 fn config(args: &HashMap<String, String>) -> Result<GaConfig, String> {
-    args.get("config").map_or(Ok(GaConfig::default()), |p| GaConfig::from_json(&read(p)?))
+    args.get("config").map_or(Ok(GaConfig::frontier_defaults()), |p| GaConfig::from_json(&read(p)?))
 }
 fn emit(args: &HashMap<String, String>, value: &str) -> Result<(), String> {
     if let Some(path) = args.get("output") { write(path, value) } else { println!("{value}"); Ok(()) }
@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
     let mut raw = std::env::args().skip(1);
     let command = raw.next().unwrap_or_else(|| "help".into());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
-        println!("neyra-ga initializer [--config FILE] --output MODEL\nneyra-ga train [--config FILE | --resume CHECKPOINT] [--seconds N] [--work N] --output MODEL --checkpoint FILE [--report FILE]\nneyra-ga evaluate --model MODEL [--config FILE] [--seeds 1,2,3 | --seed-start N --episodes N] [--seconds N] [--work N] --output REPORT\nneyra-ga baseline [--config FILE] [--seed N] [--beam-width N] [--search-profile N] [--seconds N] [--work N] --output REPORT\nneyra-ga checkpoint --resume FILE [--work N] --checkpoint FILE [--output SNAPSHOT]\nWork units differ between policies; elapsed time and actual query counters are reported. Generated files belong outside the repository.");
+        println!("neyra-ga initializer [--config FILE] --output MODEL\nneyra-ga train [--config FILE] [--model MODEL | --resume CHECKPOINT] [--seconds N] [--work N] --output MODEL --checkpoint FILE [--report FILE]\nneyra-ga fork --resume CHECKPOINT [--config FILE] --checkpoint NEW_CHECKPOINT [--output SNAPSHOT]\nneyra-ga evaluate --model MODEL [--config FILE] [--seeds 1,2,3 | --seed-start N --episodes N] [--seconds N] [--work N] --output REPORT\nneyra-ga baseline [--config FILE] [--seed N] [--beam-width N] [--search-profile N] [--seconds N] [--work N] --output REPORT\nneyra-ga checkpoint --resume FILE [--work N] --checkpoint FILE [--output SNAPSHOT]\nNew runs default to v3 probability-frontier policy; exact resumed v2 runs retain their original policy. Work units differ between policies; elapsed time and actual query counters are reported. Generated files belong outside the repository.");
         return Ok(());
     }
     let mut args = HashMap::new();
@@ -48,7 +48,9 @@ fn run() -> Result<(), String> {
         "initializer" => emit(&args, &serde_json::to_string(&GaModel::initializer(config(&args)?)?).map_err(|e| e.to_string())?),
         "train" => {
             if args.contains_key("resume") && args.contains_key("config") { return Err("A resumed run uses its exact saved configuration".into()); }
+            if args.contains_key("resume") && args.contains_key("model") { return Err("Choose exact resume or a new inherited-weight experiment".into()); }
             let mut trainer = if let Some(path) = args.get("resume") { Trainer::from_checkpoint_json(&read(path)?)? }
+                else if let Some(path) = args.get("model") { Trainer::with_model(config(&args)?, &read(path)?)? }
                 else { Trainer::new(config(&args)?)? };
             let initial_work = trainer.counters().work_units;
             let mut generation = 0;
@@ -64,11 +66,16 @@ fn run() -> Result<(), String> {
             emit(&args, &trainer.champion_json()?)?;
             if let Some(path) = args.get("report") {
                 let snapshot: serde_json::Value = serde_json::from_str(&trainer.snapshot_json()?).map_err(|e| e.to_string())?;
-                write(path, &json!({"schemaVersion":"neyra-ga-training-report-v1","sourcePolicy":SOURCE_POLICY,
+                write(path, &json!({"schemaVersion":"neyra-ga-training-report-v1","sourcePolicy":trainer.config().source_policy(),
                     "wallMs":start.elapsed().as_secs_f64()*1000.0,"runWorkUnits":trainer.counters().work_units-initial_work,
                     "stopReason":if trainer.finished(){"generations-complete"}else{"budget-exhausted"},"snapshot":snapshot}).to_string())?;
             }
             Ok(())
+        }
+        "fork" => {
+            let trainer = Trainer::fork_checkpoint(config(&args)?, &read(required(&args,"resume")?)?)?;
+            write(required(&args,"checkpoint")?, &trainer.checkpoint_json()?)?;
+            emit(&args,&trainer.snapshot_json()?)
         }
         "evaluate" => {
             let model = GaModel::from_json(&read(required(&args, "model")?)?)?;

@@ -1065,15 +1065,41 @@ impl VerificationJob {
     }
 }
 
+const CONTINUATION_BAGS: usize = 2;
+const CONTINUATION_SPINS: u8 = 6;
+const CONTINUATION_ALTERNATIVES: usize = 3;
+const CONTINUATION_TASKS: usize = 192;
+const CONTINUATION_RESERVED: usize = 24;
+const CONTINUATION_DEEP_WORK: u16 = 128;
+
 #[derive(Clone, Default)]
 struct Continuation {
     placements: Vec<Placement>,
+    alternatives: Vec<Vec<Placement>>,
     score: f64,
     paid: u16,
+    /// Immediate forecast bag only; selective cuts must not borrow bag two.
     spins: u8,
+    /// One coherent geometric path, never a sum over the alternatives.
+    planned_spins: u8,
     anchor: Option<Rc<SingleGoal>>,
-    /// Obstruction left by this one replayed continuation, not an exact bound.
+    /// Obstruction after the first forecast bag/prefix, not an exact bound.
     obstructed_mass: Option<u16>,
+}
+
+impl Continuation {
+    fn ordered_path(&self, variant: u64) -> &[Placement] {
+        let index = variant as usize % (self.alternatives.len() + 1);
+        if index == 0 { &self.placements } else { &self.alternatives[index - 1] }
+    }
+}
+
+#[derive(Clone)]
+struct FirstBagForecast {
+    spins: u8,
+    quality: f64,
+    paid: u16,
+    obstructed_mass: u16,
 }
 
 #[derive(Clone)]
@@ -1089,25 +1115,65 @@ struct ProbeState {
     anchor: Option<Rc<SingleGoal>>,
     deleted: u32,
     first_mask: u8,
+    bag: usize,
+    bag_start: Board,
+    bag_spawn: u8,
+    first_bag: Option<FirstBagForecast>,
+    assignments: [[u64; 7]; CONTINUATION_BAGS],
+    bridge_used: bool,
+}
+
+#[derive(PartialEq)]
+struct ProbeKey {
+    board: Board,
+    inventory: u8,
+    debt: CellMask,
+    pursuit: Option<Rc<SingleGoal>>,
+    anchor: Option<Rc<SingleGoal>>,
+    deleted: u32,
+    first_mask: u8,
+    quiet_since_spin: u8,
+    bag: usize,
+    assignments: [[u64; 7]; CONTINUATION_BAGS],
+    bridge_used: bool,
+}
+
+impl From<&ProbeState> for ProbeKey {
+    fn from(state: &ProbeState) -> Self {
+        Self {
+            board: state.board, inventory: state.inventory, debt: state.debt,
+            pursuit: state.pursuit.clone(), anchor: state.anchor.clone(), deleted: state.deleted,
+            first_mask: state.first_mask, quiet_since_spin: state.quiet_since_spin,
+            bag: state.bag, assignments: state.assignments, bridge_used: state.bridge_used,
+        }
+    }
 }
 
 enum ProbeTask {
-    Expand(ProbeState),
-    Finish(ProbeState, Pose),
-    Support(ProbeState, Rc<SingleGoal>, Piece),
+    Expand(Rc<ProbeState>),
+    Finish(Rc<ProbeState>, Pose),
+    Support(Rc<ProbeState>, Rc<SingleGoal>, Piece),
+    Bank(Rc<ProbeState>, Piece),
 }
 
-/// A small geometric continuation search. It consumes each available piece at
-/// most once and never crosses a bag. A miss or exhausted budget is Unknown;
-/// it never changes the exact P7 failure language or the cost lower bound.
+struct ForecastLine {
+    continuation: Continuation,
+    assignments: [[u64; 7]; CONTINUATION_BAGS],
+    rank: f64,
+}
+
+/// A bounded geometric portfolio, not P7 certification. A second inventory is
+/// available only after all seven first-bag labels have actually been placed.
+/// Exhaustion or a missing forecast is Unknown, never a proven failed supply.
 struct ContinuationProbe {
-    tasks: Vec<ProbeTask>,
-    seen: Vec<(Board, u8, CellMask, Option<Rc<SingleGoal>>, u32, u8, u8)>,
+    tasks: std::collections::VecDeque<ProbeTask>,
+    reserved: std::collections::VecDeque<ProbeTask>,
+    seen: Vec<ProbeKey>,
     work: u16,
     debt_count: u16,
     base_score: f64,
     best: Continuation,
-    start: Board,
+    lines: Vec<ForecastLine>,
     minimum_success: u16,
     profile: u8,
     budget: u16,
@@ -1116,180 +1182,268 @@ struct ContinuationProbe {
 impl ContinuationProbe {
     fn new(board: Board, debt: CellMask, profile: u8, minimum_success: u16) -> Self {
         Self {
-            tasks: vec![ProbeTask::Expand(ProbeState {
-                board,
-                inventory: ALL_PIECES,
-                debt,
-                quiet: 0,
-                quiet_since_spin: 0,
-                spins: 0,
-                placements: vec![],
-                pursuit: None,
-                anchor: None,
-                deleted: 0,
-                first_mask: ALL_PIECES,
-            })],
-            seen: vec![],
-            work: 0,
-            debt_count: mask_count(&debt),
-            base_score: BoardFacts::new(&board).score(),
-            best: Continuation::default(),
-            start: board,
-            minimum_success,
-            profile,
+            tasks: std::collections::VecDeque::from([ProbeTask::Expand(Rc::new(ProbeState {
+                board, inventory: ALL_PIECES, debt, quiet: 0, quiet_since_spin: 0,
+                spins: 0, placements: vec![], pursuit: None, anchor: None,
+                deleted: 0, first_mask: ALL_PIECES, bag: 0, bag_start: board,
+                bag_spawn: spawn_mask(&board), first_bag: None,
+                assignments: [[0; 7]; CONTINUATION_BAGS], bridge_used: false,
+            }))]),
+            reserved: std::collections::VecDeque::new(),
+            seen: vec![], work: 0, debt_count: mask_count(&debt),
+            base_score: BoardFacts::new(&board).score(), best: Continuation::default(),
+            lines: vec![], minimum_success, profile,
             budget: if profile == 3 { 96 } else { 64 },
         }
     }
 
     fn finished(&self) -> bool {
-        self.work >= self.budget || self.tasks.is_empty()
+        self.work >= self.budget || (self.tasks.is_empty() && self.reserved.is_empty())
+    }
+
+    fn push(&mut self, task: ProbeTask) {
+        if self.tasks.len() == CONTINUATION_TASKS { self.tasks.pop_front(); }
+        self.tasks.push_back(task);
+    }
+
+    /// The first DFS branch cannot consume every first-finisher/preparation try.
+    /// Reserving tasks shares their immutable state, not certificates or caches.
+    fn schedule(&mut self, pending: Vec<ProbeTask>, root: bool) {
+        if root {
+            let mut finish = std::collections::VecDeque::new();
+            let mut prepare = std::collections::VecDeque::new();
+            for task in pending {
+                if matches!(task, ProbeTask::Finish(..)) { finish.push_back(task); }
+                else { prepare.push_back(task); }
+            }
+            if let Some(first) = finish.pop_front().or_else(|| prepare.pop_front()) {
+                self.push(first);
+            }
+            // Keep both ready finishers and distinct preparation goals even
+            // when a field offers many rotations of already-open spin slots.
+            while self.reserved.len() < CONTINUATION_RESERVED
+                && (!finish.is_empty() || !prepare.is_empty()) {
+                if let Some(task) = finish.pop_front() { self.reserved.push_back(task); }
+                for _ in 0..2 {
+                    if self.reserved.len() == CONTINUATION_RESERVED { break; }
+                    if let Some(task) = prepare.pop_front() { self.reserved.push_back(task); }
+                }
+            }
+        } else {
+            for task in pending.into_iter().rev() { self.push(task); }
+        }
     }
 
     fn step(&mut self, cache: &mut PhysicsCache) {
-        if self.finished() {
-            return;
-        }
+        if self.finished() { return; }
+        let task = if self.tasks.is_empty() || (self.work % 4 == 3 && !self.reserved.is_empty()) {
+            self.reserved.pop_front()
+        } else { self.tasks.pop_back() };
+        let Some(task) = task else { return; };
         self.work += 1;
-        let Some(task) = self.tasks.pop() else { return };
         match task {
             ProbeTask::Expand(state) => {
-                let lock_limit = if state.spins == 0 { 4 } else { 7 };
-                if state.placements.len() >= lock_limit || state.inventory == 0 {
-                    return;
+                let lock_limit = if state.spins == 0 { 4 } else { CONTINUATION_BAGS * 7 };
+                if state.placements.len() >= lock_limit || state.inventory == 0
+                    || state.spins >= CONTINUATION_SPINS { return; }
+                let mut pending = Vec::new();
+                for pose in single_targets(&state.board, state.inventory) {
+                    pending.push(ProbeTask::Finish(Rc::clone(&state), pose));
                 }
-                // A one- or two-piece preparation may create the corner,
-                // floor, or row cells needed by a final rotation. Looking only
-                // for currently grounded spin slots would miss these plans.
-                if state.quiet < 4
-                    && state.quiet_since_spin < 2
-                    && state.placements.len() + 1 < lock_limit
-                {
+                // A two-spin bag still contains five quiet pieces. Finish its
+                // real inventory before borrowing any next-bag finisher.
+                let banking = state.bag == 0 && state.spins >= 2;
+                let closeout = banking && state.inventory.count_ones() <= 2;
+                if closeout {
+                    for piece in Piece::ALL {
+                        if state.inventory & piece.bit() != 0 {
+                            pending.push(ProbeTask::Bank(Rc::clone(&state), piece));
+                        }
+                    }
+                }
+                if state.quiet_since_spin < 2 && state.placements.len() + 1 < lock_limit {
                     let goals = if let Some(goal) = &state.pursuit {
                         vec![Rc::clone(goal)]
                     } else {
                         single_goals_for(&state.board, state.inventory, 12, self.profile)
-                            .into_iter()
-                            .map(Rc::new)
-                            .collect()
+                            .into_iter().map(Rc::new).collect()
                     };
-                    for goal in goals.into_iter().rev() {
-                        if goal.ready(&state.board) || goal.remaining(&state.board) > 8 {
-                            continue;
-                        }
-                        for piece in Piece::ALL.into_iter().rev() {
-                            if state.inventory & piece.bit() != 0 && piece != goal.pose.piece {
-                                self.tasks.push(ProbeTask::Support(
-                                    state.clone(),
-                                    Rc::clone(&goal),
-                                    piece,
+                    // Interleave goals by piece: a single goal does not occupy
+                    // all reserved root tasks before alternatives get a try.
+                    for round in 0..goals.len() {
+                        for (offset, piece) in Piece::ALL.into_iter().enumerate() {
+                            if state.inventory & piece.bit() == 0 { continue; }
+                            let goal = &goals[(round + offset) % goals.len()];
+                            if piece != goal.pose.piece && !goal.ready(&state.board)
+                                && goal.remaining(&state.board) <= 8 {
+                                pending.push(ProbeTask::Support(
+                                    Rc::clone(&state), Rc::clone(goal), piece,
                                 ));
                             }
                         }
                     }
                 }
-                // Ready goals are generated from the exact missing-row
-                // footprint; only these targets pay for reverse reachability.
-                for pose in single_targets(&state.board, state.inventory)
-                    .into_iter()
-                    .rev()
-                {
-                    self.tasks.push(ProbeTask::Finish(state.clone(), pose));
+                if banking && !closeout {
+                    for piece in Piece::ALL {
+                        if state.inventory & piece.bit() != 0 {
+                            pending.push(ProbeTask::Bank(Rc::clone(&state), piece));
+                        }
+                    }
                 }
+                self.schedule(pending, state.placements.is_empty());
             }
             ProbeTask::Finish(state, pose) => {
-                let Some(placement) = cache.target(state.board, pose, true) else {
-                    return;
-                };
-                let Some(result) = state.board.apply(&placement) else {
-                    return;
-                };
-                if result.lines != 1 || !result.spin {
-                    return;
-                }
-                self.accept(
-                    state,
-                    placement,
-                    result.board,
-                    result.cleared_rows,
-                    true,
-                    None,
-                );
+                let Some(placement) = cache.target(state.board, pose, true) else { return; };
+                let Some(result) = state.board.apply(&placement) else { return; };
+                if result.lines != 1 || !result.spin { return; }
+                self.accept(&state, placement, result.board, result.cleared_rows, true, None, false);
             }
             ProbeTask::Support(state, goal, piece) => {
                 let locks = cache.proposals(state.board, piece, self.profile == 3);
                 let mut best = Vec::<(f64, Placement, Board)>::new();
+                let mut bridge = None::<(f64, Placement, Board)>;
                 for placement in locks.iter() {
-                    if !goal.accepts_support(&state.board, placement.pose) {
-                        continue;
-                    }
-                    let Some(result) = state.board.apply(placement) else {
-                        continue;
-                    };
-                    if result.lines != 0 {
-                        continue;
-                    }
+                    let direct = goal.accepts_support(&state.board, placement.pose);
+                    if !direct && (state.bridge_used || state.quiet_since_spin != 0
+                        || !Self::bridge_support(&state.board, &goal, placement.pose)) { continue; }
+                    let Some(result) = state.board.apply(placement) else { continue; };
+                    if result.lines != 0 { continue; }
                     let score = BoardFacts::new(&result.board).terrain_score(Some(&goal))
                         - goal.remaining(&result.board) as f64 * 8.0;
-                    if best.iter().any(|(_, _, board)| *board == result.board) {
+                    if !direct {
+                        if bridge.as_ref().is_none_or(|prior| score > prior.0) {
+                            bridge = Some((score, placement.clone(), result.board));
+                        }
                         continue;
                     }
+                    if best.iter().any(|(_, _, board)| *board == result.board) { continue; }
+                    let at = best.iter().position(|b| b.0 < score).unwrap_or(best.len());
+                    best.insert(at, (score, placement.clone(), result.board));
+                    best.truncate(2);
+                }
+                // One indirect footing may support a later roof piece (for
+                // example an interchangeable pair). It earns no spin itself.
+                if let Some((_, placement, board)) = bridge {
+                    self.accept(&state, placement, board, 0, false, Some(Rc::clone(&goal)), true);
+                }
+                for (_, placement, board) in best.into_iter().rev() {
+                    self.accept(&state, placement, board, 0, false, Some(Rc::clone(&goal)), false);
+                }
+            }
+            ProbeTask::Bank(state, piece) => {
+                let locks = cache.proposals(state.board, piece, false);
+                let mut best = Vec::<(f64, Placement, Board)>::new();
+                for placement in locks.iter() {
+                    let Some(result) = state.board.apply(placement) else { continue; };
+                    if result.lines != 0 { continue; }
+                    let score = BoardFacts::new(&result.board).score();
+                    if best.iter().any(|(_, _, board)| *board == result.board) { continue; }
                     let at = best.iter().position(|b| b.0 < score).unwrap_or(best.len());
                     best.insert(at, (score, placement.clone(), result.board));
                     best.truncate(2);
                 }
                 for (_, placement, board) in best.into_iter().rev() {
-                    self.accept(
-                        state.clone(),
-                        placement,
-                        board,
-                        0,
-                        false,
-                        Some(Rc::clone(&goal)),
-                    );
+                    self.accept(&state, placement, board, 0, false, None, false);
                 }
             }
         }
     }
 
+    fn bridge_support(board: &Board, goal: &SingleGoal, pose: Pose) -> bool {
+        if !board.legal(pose) { return false; }
+        let mut useful = false;
+        for (x, y) in pose.cells() {
+            let y = y as usize;
+            let bit = 1_u16 << x;
+            if goal.required_empty[y] & bit != 0 { return false; }
+            if y + 1 < HEIGHT {
+                let missing = goal.required_filled[y + 1] & !board.rows[y + 1];
+                useful |= missing & bit != 0;
+                useful |= goal.support_any.iter().any(|clause| {
+                    clause[y + 1] & bit != 0
+                        && !(0..HEIGHT).any(|row| clause[row] & board.rows[row] != 0)
+                });
+            }
+        }
+        useful
+    }
+
+    fn observe(&mut self, state: &ProbeState, facts: Option<&BoardFacts>) {
+        if state.spins == 0 { return; }
+        let current = facts.map(|facts| FirstBagForecast {
+            spins: state.spins,
+            quality: -(state.quiet as f64) * 10.0
+                + self.debt_count.saturating_sub(mask_count(&state.debt)) as f64 * 6.0
+                + (facts.score() - self.base_score) * 0.25,
+            paid: self.debt_count.saturating_sub(mask_count(&state.debt)),
+            obstructed_mass: facts.obstructed_mass,
+        });
+        let Some(first) = state.first_bag.as_ref().or(current.as_ref()) else { return; };
+        let extra = state.spins.saturating_sub(first.spins);
+        // Bag-two singles have a small preparation value only. Immediate
+        // future.spins/debt/access remain a snapshot of the first inventory.
+        let score = first.spins as f64 * 60.0 + first.quality + extra as f64 * 18.0;
+        let rank = first.spins as f64 + extra as f64 * 0.3
+            + 0.45 * first.quality / (120.0 + first.quality.abs());
+        let line = ForecastLine {
+            continuation: Continuation {
+                placements: state.placements.clone(), alternatives: vec![], score,
+                paid: first.paid, spins: first.spins, planned_spins: state.spins,
+                anchor: state.anchor.clone(), obstructed_mass: Some(first.obstructed_mass),
+            },
+            assignments: state.assignments, rank,
+        };
+        // An extension replaces its own prefix; two incompatible typed tilings
+        // remain alternatives even when their occupied union is identical.
+        let comparable = |prior: &ForecastLine| {
+            prior.continuation.anchor == line.continuation.anchor && (
+                prior.assignments.iter().flatten().zip(line.assignments.iter().flatten())
+                    .all(|(&old, &new)| old == 0 || old == new)
+                || line.assignments.iter().flatten().zip(prior.assignments.iter().flatten())
+                    .all(|(&new, &old)| new == 0 || new == old))
+        };
+        if self.lines.iter().any(|prior| comparable(prior)
+            && (prior.continuation.planned_spins > line.continuation.planned_spins
+                || (prior.continuation.planned_spins == line.continuation.planned_spins
+                    && prior.rank >= line.rank))) { return; }
+        self.lines.retain(|prior| !comparable(prior));
+        self.lines.push(line);
+        self.lines.sort_by(|a, b| b.rank.total_cmp(&a.rank));
+        // Reserve one alternative first spin when available. Three nearby
+        // banking variants must not expel every independent first finisher.
+        if let Some(other) = (1..self.lines.len()).find(|&index| {
+            self.lines[index].continuation.anchor != self.lines[0].continuation.anchor
+        }) { self.lines.swap(1, other); }
+        self.lines.truncate(CONTINUATION_ALTERNATIVES);
+        self.best = self.lines[0].continuation.clone();
+        self.best.alternatives = self.lines.iter().skip(1)
+            .map(|line| line.continuation.placements.clone()).collect();
+    }
+
     fn accept(
-        &mut self,
-        mut state: ProbeState,
-        placement: Placement,
-        board: Board,
-        cleared_rows: u32,
-        spin: bool,
-        pursuit: Option<Rc<SingleGoal>>,
+        &mut self, source: &ProbeState, placement: Placement, board: Board,
+        cleared_rows: u32, spin: bool, pursuit: Option<Rc<SingleGoal>>, bridge: bool,
     ) {
-        let Some(target) = normalize_target(placement.pose, state.deleted) else {
-            return;
-        };
-        if !can_be_first(&self.start, &target) {
-            state.first_mask &= !placement.pose.piece.bit();
-        }
-        if first_pair_upper(state.first_mask, spawn_mask(&self.start), false) < self.minimum_success
-        {
-            return;
-        }
-        let Some(deleted) = deleted_after(state.deleted, cleared_rows) else {
-            return;
-        };
+        let Some(target) = normalize_target(placement.pose, source.deleted) else { return; };
+        let mut first_mask = source.first_mask;
+        if !can_be_first(&source.bag_start, &target) { first_mask &= !placement.pose.piece.bit(); }
+        if first_pair_upper(first_mask, source.bag_spawn, false) < self.minimum_success { return; }
+        let Some(deleted) = deleted_after(source.deleted, cleared_rows) else { return; };
+        let mut state = source.clone();
+        state.first_mask = first_mask;
         state.deleted = deleted;
-        // Quiet support may accidentally enable a different spin than its
-        // proposed goal. Only the first *executed* spin owns a terrain region.
+        state.assignments[state.bag][placement.pose.piece as usize] = target_code(&target);
+        // Only an executed first spin owns a terrain region. Preparation and
+        // alternative routes cannot claim witnessed-hole exemptions.
         if state.anchor.is_none() && spin {
             let mut empty = [0; HEIGHT];
-            for (x, y) in placement.pose.cells() {
-                empty[y as usize] |= 1 << x;
-            }
+            for (x, y) in placement.pose.cells() { empty[y as usize] |= 1 << x; }
             let row = cleared_rows.trailing_zeros() as usize;
             let mut filled = [0; HEIGHT];
             filled[row] = crate::physics::FULL_ROW & !empty[row];
             state.anchor = Some(Rc::new(SingleGoal {
-                pose: placement.pose,
-                clear_row: row as u8,
-                required_filled: filled,
-                required_empty: empty,
-                support_any: vec![],
+                pose: placement.pose, clear_row: row as u8,
+                required_filled: filled, required_empty: empty, support_any: vec![],
             }));
         }
         state.inventory &= !placement.pose.piece.bit();
@@ -1299,49 +1453,41 @@ impl ContinuationProbe {
         state.quiet += u8::from(!spin);
         state.quiet_since_spin = if spin { 0 } else { state.quiet_since_spin + 1 };
         state.placements.push(placement);
+        state.bridge_used = !spin && (state.bridge_used || bridge);
         state.pursuit = pursuit;
+        let base = if self.profile == 3 { 96 } else { 64 };
         if state.spins != 0 {
-            let facts = BoardFacts::new(&board);
-            let paid = self.debt_count.saturating_sub(mask_count(&state.debt));
-            // Use one coherent route. Do not sum incompatible pockets or
-            // spend the same finisher several times for hypothetical rewards.
-            let quality = -(state.quiet as f64) * 10.0
-                + paid as f64 * 6.0
-                + (facts.score() - self.base_score) * 0.25;
-            let score = state.spins as f64 * 60.0 + quality;
-            if self.best.placements.is_empty()
-                || spin_rank(state.spins, quality)
-                    > spin_rank(
-                        self.best.spins,
-                        self.best.score - self.best.spins as f64 * 60.0,
-                    )
-            {
-                self.best = Continuation {
-                    placements: state.placements.clone(),
-                    score,
-                    paid,
-                    spins: state.spins,
-                    anchor: state.anchor.clone(),
-                    obstructed_mass: Some(facts.obstructed_mass),
-                };
-                // Spend more only after an actual coherent spin witness.
-                // The total remains bounded even if many support tasks exist.
-                self.budget =
-                    (if self.profile == 3 { 96 } else { 64 }) + u16::from(state.spins.min(4)) * 32;
+            if state.bag == 0 {
+                let facts = BoardFacts::new(&board);
+                self.observe(&state, Some(&facts));
+                self.budget = self.budget.max(base + u16::from(state.spins.min(4)) * 32);
+                if state.inventory == 0 && state.spins >= 2 {
+                    state.first_bag = Some(FirstBagForecast {
+                        spins: state.spins,
+                        quality: -(state.quiet as f64) * 10.0
+                            + self.debt_count.saturating_sub(mask_count(&state.debt)) as f64 * 6.0
+                            + (facts.score() - self.base_score) * 0.25,
+                        paid: self.debt_count.saturating_sub(mask_count(&state.debt)),
+                        obstructed_mass: facts.obstructed_mass,
+                    });
+                    state.bag = 1;
+                    state.inventory = ALL_PIECES;
+                    state.bag_start = board;
+                    state.bag_spawn = spawn_mask(&board);
+                    state.deleted = 0;
+                    state.first_mask = ALL_PIECES;
+                    state.quiet_since_spin = 0;
+                    state.pursuit = None;
+                    state.bridge_used = false;
+                    self.budget = self.budget.max(base + 128 + CONTINUATION_DEEP_WORK);
+                }
             }
         }
-        let key = (
-            state.board,
-            state.inventory,
-            state.debt,
-            state.pursuit.clone(),
-            state.deleted,
-            state.first_mask,
-            state.quiet_since_spin,
-        );
+        if source.bag == 1 && spin { self.observe(&state, None); }
+        let key = ProbeKey::from(&state);
         if !self.seen.contains(&key) {
             self.seen.push(key);
-            self.tasks.push(ProbeTask::Expand(state));
+            self.push(ProbeTask::Expand(Rc::new(state)));
         }
     }
 }
@@ -1554,7 +1700,7 @@ impl GenerationJob {
             let mut board = node.board;
             let mut used = 0;
             let mut spins = node.spins;
-            for placement in &node.future.placements {
+            for placement in node.future.ordered_path(variant).iter().take(7) {
                 if spins >= goal || used & placement.pose.piece.bit() != 0 { break; }
                 let Some(result) = board.apply(placement) else { break; };
                 if result.lines > 1 || (result.lines == 1 && !result.spin) { break; }
@@ -3760,6 +3906,12 @@ impl SearchSession {
                 "staleGenerationRounds": 1,
                 "staleAfterUnimprovedAttempts": 4,
                 "generationInventory": "AllSevenFromBagStart;principalContinuationOrdersOnly",
+                "continuationBags": CONTINUATION_BAGS,
+                "continuationSpinTarget": CONTINUATION_SPINS,
+                "continuationAlternatives": CONTINUATION_ALTERNATIVES,
+                "continuationMeaning": "CoherentGeometricPathsOnly;FirstBagGainAndDebtSeparate;NotP7",
+                "continuationTaskLimit": CONTINUATION_TASKS,
+                "continuationWorkCap": if self.config.search_profile == 3 { 352 } else { 320 },
                 "siblingWindow": "SameParentNextPiece;noLessActualOrOptimisticSpins;supplyMaskSuperset;samePursuit",
                 "equalSpinSiblingQualityMargin": 24,
                 "proposalScope": "FastSurfaceAndWitnessedSingles;periodicBroadSonicLocks;notExhaustive",

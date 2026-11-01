@@ -125,6 +125,19 @@
   actual spin witness may exempt its required-empty cells from the extra 0.5
   cost; a speculative goal cannot claim that exemption. Preserve open channels
   and the witnessed roof, and never turn this score into a hard impossibility.
+- Prefer dense side banks beside accessible low working space, without fixing
+  the center column or rewarding absolute stack height. A capped prepared-roof
+  preference must refer to an existing roof over a concrete single goal; it is
+  not a spin witness and cannot cancel hole, access or debt obligations.
+- Continuation forecasts may span two bag inventories and seek six coherent
+  Spin Singles. Consume all seven labels before resetting inventory and its
+  bag-local start board, deleted rows and supply mask. Keep at most three
+  distinct alternative paths, including piece-to-target assignment; never sum
+  their spins, debt payments or supply success. First-forecast-bag spins and
+  obstruction/debt relief stay separate from discounted deeper preparation.
+  These are bounded geometric move-ordering hints, not P7 certificates or a
+  mandatory prefix. Actual progress and public best routes count executed,
+  verified bags only. Failure to find a forecast is unknown, not impossibility.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.

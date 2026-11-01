@@ -16,6 +16,9 @@ const SKYLINE_PREFERENCE_LIMIT: f64 = 6.0;
 // Existing cavities still have their base cost. Only a replayed spin goal can
 // explain the additional burden; a proposed pocket alone is not a repair plan.
 const UNEXPLAINED_HOLE_COST: f64 = 0.5;
+// Prepared roofs may justify some local surface damage, but never acquire the
+// value of an executed spin or cancel the board's hole/access obligations.
+const PREPARED_ROOF_LIMIT: f64 = 6.0;
 
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
     mask.iter().map(|row| row.count_ones() as u16).sum()
@@ -72,10 +75,12 @@ pub(crate) struct BoardFacts {
     service_air: CellMask,
     obstructed_cells: CellMask,
     workspace_roof_top: u8,
+    workspace_row: u8,
     lower_floor: u8,
     lower_narrow: [u16; 3],
     lower_slits: [u16; 3],
     workspace_reward: f64,
+    bank_reward: f64,
 }
 
 impl BoardFacts {
@@ -104,6 +109,7 @@ impl BoardFacts {
             service_air: [0; HEIGHT],
             obstructed_cells: [0; HEIGHT],
             workspace_roof_top: 0,
+            workspace_row: 0,
             lower_floor: board
                 .rows
                 .iter()
@@ -112,6 +118,7 @@ impl BoardFacts {
             lower_narrow: [0; 3],
             lower_slits: [0; 3],
             workspace_reward: 0.0,
+            bank_reward: 0.0,
         };
         for x in 0..WIDTH {
             let bit = 1 << x;
@@ -309,14 +316,31 @@ impl BoardFacts {
                 let level = y.saturating_sub(self.lower_floor as usize);
                 let reward = lower_weight(level)
                     * (opening_width_reward(width as u8) + (depth - 1) as f64 * 0.6);
-                let value = reward - level as f64 * 0.4;
+                // Count the density of each bank, not its absolute mass or
+                // height. A solid pair of banks beside usable low air earns
+                // more than isolated blocks around the same opening. The
+                // weaker side limits this small bonus without demanding
+                // equal bank widths, heights, or a fixed central column.
+                let bank_reward = if width >= 3 && level < 3 {
+                    let right = left + width;
+                    let left_cells = (board.rows[y] & ((1_u16 << left) - 1)).count_ones();
+                    let right_cells = (board.rows[y] & (FULL_ROW << right)).count_ones();
+                    let density = (left_cells as f64 / left as f64)
+                        .min(right_cells as f64 / (WIDTH - right) as f64);
+                    lower_weight(level) * density * 4.0
+                } else {
+                    0.0
+                };
+                let value = reward + bank_reward - level as f64 * 0.4;
                 if value > best {
                     best = value;
                     self.workspace_columns = columns;
                     self.workspace_width = width as u8;
                     self.workspace_depth = depth as u8;
                     self.workspace_roof_top = (y + 4).min(HEIGHT) as u8;
+                    self.workspace_row = y as u8;
                     self.workspace_reward = reward;
+                    self.bank_reward = bank_reward;
                 }
             }
         }
@@ -341,6 +365,73 @@ impl BoardFacts {
                     * (narrow.count_ones() as f64 * 0.8 + slit.count_ones() as f64 * 1.2)
             })
             .sum()
+    }
+
+    /// Recover occupancy from already computed column tops and buried holes.
+    /// Only the selected goal's row needs this, so no board copy or new flood
+    /// is necessary for roof preparation ordering.
+    fn occupied_row(&self, row: usize) -> u16 {
+        self.heights.iter().enumerate().fold(0, |mask, (x, &height)| {
+            mask | if row < height as usize && self.holes[row] & (1 << x) == 0 {
+                1 << x
+            } else {
+                0
+            }
+        })
+    }
+
+    /// A currently present overhang is useful only in the context of a low,
+    /// accessible single goal with an unoccupied finisher footprint and some
+    /// of its target row already built. This is capped preparation value, not
+    /// a future-spin count, a reachability witness, or a hole/debt exemption.
+    fn prepared_roof_reward(&self, goal: &SingleGoal) -> f64 {
+        let row = goal.clear_row as usize;
+        if row >= HEIGHT
+            || self.workspace_columns == 0
+            || self.workspace_row > self.lower_floor.saturating_add(2)
+            || row > self.lower_floor as usize + 2
+        {
+            return 0.0;
+        }
+        let cells = goal.pose.cells();
+        let mut contacts = 0;
+        let mut columns = 0_u16;
+        for &(x, y) in &cells {
+            if x < 0 || x >= WIDTH as i8 || y < 0 || y >= HEIGHT as i8 {
+                return 0.0;
+            }
+            let (x, y) = (x as usize, y as usize);
+            let bit = 1 << x;
+            columns |= bit;
+            if y < self.heights[x] as usize && self.holes[y] & bit == 0 {
+                return 0.0;
+            }
+            if y + 1 < HEIGHT
+                && y + 1 < self.heights[x] as usize
+                && self.holes[y + 1] & bit == 0
+            {
+                contacts += 1;
+            }
+        }
+        if contacts == 0 || columns & self.workspace_columns == 0 {
+            return 0.0;
+        }
+        let required = goal.required_filled[row];
+        let needed = required.count_ones();
+        let present = (required & self.occupied_row(row)).count_ones();
+        if needed == 0 || present * 2 < needed {
+            return 0.0;
+        }
+        let readiness = present as f64 / needed as f64;
+        let low = match row.saturating_sub(self.lower_floor as usize) {
+            0 => 1.0,
+            1 => 0.75,
+            _ => 0.5,
+        };
+        (2.0 + f64::from(contacts.min(2)) * 1.5 + self.bank_reward * 0.375)
+            .min(PREPARED_ROOF_LIMIT)
+            * readiness
+            * low
     }
 
     // Flood only buried cells. Any adjacent empty non-hole cell has an open
@@ -497,6 +588,8 @@ impl BoardFacts {
             .min(SKYLINE_PREFERENCE_LIMIT);
         -defects - skyline - repair_pressure - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
             + self.workspace_reward
+            + self.bank_reward
+            + usable_goal.map_or(0.0, |goal| self.prepared_roof_reward(goal))
     }
 
     /// Ordinary bank steps only affect the capped skyline preference. Large

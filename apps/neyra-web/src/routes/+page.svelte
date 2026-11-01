@@ -47,6 +47,9 @@
 
   const number = new Intl.NumberFormat('ko-KR');
   const compactNumber = new Intl.NumberFormat('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
+  const evaluationNumber = new Intl.NumberFormat('ko-KR', {
+    minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'exceptZero'
+  });
   const piecePlayback = createPiecePlayback();
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
@@ -100,6 +103,10 @@
   }
   function efficiencyLabel(item: Candidate) {
     return spinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function evaluationLabel(item: Candidate | null) {
+    if (!item || !Number.isFinite(item.fieldQuality)) return '—';
+    return evaluationNumber.format(Math.abs(item.fieldQuality) < 0.05 ? 0 : item.fieldQuality);
   }
   function verificationLabel(item: Candidate | null) {
     if (!item) return '발견한 후보의 구축률을 여기에 표시합니다.';
@@ -406,16 +413,25 @@
         </div></div>
         {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
+            <div>
+              {#if bestRoute.complete}
+                <strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong>
+              {:else}
+                <strong title="첫 가방을 포함한 전체 배치 기준">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong>
+              {/if}
+              <span class="best-card-meta">
+                <span class="verified-tag"><Icon name="check" size={12} />{bestRoute.complete ? '완주' : `${bestRoute.bagCount}가방`}</span>
+                <span class="field-evaluation" title="최선 경로의 마지막 필드와 후속 스핀 계획 평가">필드 평가 <b>{evaluationLabel(bestRoute)}</b></span>
+              </span>
+            </div>
             {#if bestRoute.complete}
-              <div><strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong><span class="verified-tag"><Icon name="check" size={12} />완주</span></div>
               <p>{budgetCoverageLabel(bestRoute)} {conditionalProbability ? '2가방부터 성공률' : '성공률'} <Icon name="arrow" size={13} /></p>
             {:else}
-              <div><strong title="첫 가방을 포함한 전체 배치 기준">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong><span class="verified-tag"><Icon name="check" size={12} />{bestRoute.bagCount}가방</span></div>
               <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
             {/if}
           </button>
         {:else}
-          <div class="best-empty"><span class="empty-line"></span><strong>첫 가방을 확인하고 있어요.</strong><p>검증된 스핀 효율이 높은 경로를 표시합니다.</p></div>
+          <div class="best-empty"><span class="empty-line"></span><div class="best-empty-heading"><strong>첫 가방을 확인하고 있어요.</strong><span class="field-evaluation">필드 평가 <b>—</b></span></div><p>검증된 스핀 효율이 높은 경로를 표시합니다.</p></div>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>

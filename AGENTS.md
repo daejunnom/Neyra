@@ -80,6 +80,13 @@
   Traverse the first bag's 2,520 reflection pairs directly. A proven pair cost
   may skip its other canonical query; skipped raw entries remain unknown.
   Distinguish effective model coverage from actual canonical query counts.
+  In empty-root placement generation, keep one representative of a reflected
+  chronological typed-target prefix. Defer the decision for a self-reflecting
+  prefix and keep its first asymmetric decision stable under later extensions.
+  This uses the accepted reflection model, not a new mirrored-input proof.
+  Do not merge unrelated piece-to-target assignments by board occupancy alone.
+  Partition retained first placements into worker lanes after the mirror cut,
+  and account for symmetry skips separately from failed supplies or bounds.
 - Share only monotonic verified same-depth spin benchmarks between workers.
   Imported hints never create local progress or supply certificates. New
   benchmarks revoke old scheduling leases; backpropagation must not refill
@@ -121,14 +128,24 @@
   to one narrow generation. Failed retries alone must not widen its frontier;
   productive or improved boundaries retain larger budgets. Fresh root
   foundations keep their separate exploration allowance.
-- Charge cavity defects and historical debt only outside the local body-clear
-  component connected to the low dynamic central workspace. Keep raw hole and
-  debt facts for row mapping; merely opening a cavity does not repay its cells.
-  Apply the same charged subset to holes, cover, fragmentation, prefix and
-  boundary debt so usable side pockets do not receive hidden duplicate costs.
-  Forecast repayment credit starts from initially charged debt only. Static
-  connectivity is an ordering feature, not a reachability certificate; an
-  actual spin witness may additionally explain its own required-empty cells.
+- Body-clearance connectivity alone must not exempt buried cavities in the
+  side banks or under a roof. Preserve cavity/cover/fragmentation costs unless
+  an actual immediate spin witness explains its own footprint. Keep the low
+  central working passage distinct from adjacent storage cavities. Raw hole
+  and debt history remains available for row mapping; opening a roof is not
+  cell repayment. Historical debt uses the same current-board classification
+  in generation and boundary ordering, and repayment starts from initially
+  charged cells. Never subtract a witness footprint from debt and then also
+  claim its repayment. Static clearance is an ordering approximation.
+- Penalize a straight central passage that keeps the same span for at least
+  three consecutive rows. Preserve genuine bends and displaced openings.
+  Keep geometry-only rewards small; a precise spin witness may justify more
+  preparation value. Analyze all connected depth branches rather than taking
+  the first left-hand branch. Static field evaluation and reflected goals must
+  respect reflection; finite-budget forecast evidence remains a separate fact.
+  Preserve at least one empty cell in every non-target row touched by a planned
+  finisher. A local double-shaped pocket is legal when the whole board clears
+  exactly one row; quiet support must not accidentally turn it into a double.
 - Prefer dense side banks beside accessible low working space, without fixing
   the center column or rewarding absolute stack height. A capped prepared-roof
   preference must refer to an existing roof over a concrete single goal; it is
@@ -137,12 +154,15 @@
   and excess towers above a useful roof.
   Root prefixes with no actual spin keep foundation-dependency weighting in
   mixed rounds too; this changes ordering, not their permission to clear.
-- Continuation forecasts may span two bag inventories and seek six coherent
+- Continuation forecasts may span three bag inventories and seek eight coherent
   Spin Singles. Consume all seven labels before resetting inventory and its
   bag-local start board, deleted rows and supply mask. Keep at most three
   distinct alternative paths, including piece-to-target assignment; never sum
   their spins, debt payments or supply success. First-forecast-bag spins and
-  obstruction/debt relief stay separate from discounted deeper preparation.
+  obstruction/debt relief stay separate from discounted deeper preparation;
+  second and third bag contributions have separate discounts. Extra horizon
+  work requires actual productive completed inventories, not open space or an
+  unexecuted goal. Keep the base and second-bag work limits bounded.
   These are bounded geometric move-ordering hints, not P7 certificates or a
   mandatory prefix. Actual progress and public best routes count executed,
   verified bags only. Failure to find a forecast is unknown, not impossibility.
@@ -166,6 +186,9 @@
 - Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
+  The compact best-route field evaluation displays that route's final raw
+  fieldQuality, not normalized rankingScore or the currently replayed frame.
+  Same-ID quality improvements must update it; missing values remain unknown.
   Keep desktop controls within an ordinary Chrome viewport and label an exact
   100% threshold as 100%, without an "at least" suffix.
   CTK3/Fumen documents remain bag diagrams. Recover their colors only from

@@ -12,15 +12,13 @@ export interface SearchConfig {
   budget_start: number;
   seed: number;
   beam_width: number;
-  /** Legacy compatibility only; use the explicit board evaluator selection. */
-  cnn_evaluation: boolean;
-  board_evaluator: 'heuristic' | 'cnn-v5';
   /** Browser scheduling only; zero uses all reported logical processors. */
   worker_count: number;
 }
 
-export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count' | 'cnn_evaluation'> & {
+export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count'> & {
   cnn_evaluation: false;
+  board_evaluator: 'heuristic';
   search_profile: number;
   search_lane: number;
   search_lanes: number;
@@ -36,201 +34,6 @@ export interface BoardFrame {
   spin: boolean;
   /** Actual pre-clear physical cells; absent only in older saved records. */
   placedCells?: [number, number][];
-}
-
-/** Actual certified boundary input for the offline label collector. No labels are invented here. */
-export interface TrainingField {
-  schemaVersion: 1;
-  id: string;
-  rows: number[];
-  source: {
-    kind: 'search';
-    family: string;
-    reference: string;
-    runId: string;
-    candidateId: string;
-    bagBoundary: number;
-    probability: number;
-    firstBagProbability: number | null;
-    ignoreFirstBagProbability: boolean;
-    verified: true;
-    qualified: true;
-    seed: number;
-    runSeed: number;
-    modelMode: 'heuristic' | 'cnn';
-    evaluatorModelId?: string;
-    evaluatorWeightsSha256?: string;
-    buildVersion: string;
-    rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
-    searchConfig: {
-      minSuccessPercent: number;
-      bagMinSuccessPercent: number;
-      firstBagMinSuccessPercent: number;
-      riskMinSpinsPerBag: number;
-      pieceGoal: number;
-      maxPieces: number;
-      beamWidth: number;
-    };
-  };
-  /** Opt-in observation only; never an input feature or an authoritative training label. */
-  trace?: RetainedSearchTrace;
-}
-
-export interface SearchRecordCounters {
-  expanded: number;
-  candidates: number;
-  verifiedCandidates: number;
-  pruned: number;
-}
-
-export interface RetainedSearchTrace {
-  schemaVersion: 1;
-  kind: 'retained-path';
-  prefixOmittedBags: number;
-  start: { rows: number[]; spins: number; placed: number };
-  steps: Pick<BoardFrame, 'piece' | 'rows' | 'spins' | 'placed' | 'lines' | 'spin'>[];
-  evaluation: {
-    kind: 'heuristic' | 'cnn';
-    modelId?: string;
-    weightsSha256?: string;
-    rawQuality: number | null;
-    rankingScore: number | null;
-    forecastSpins: number | null;
-    forecastSpinsByBag: number[];
-    forecastPlacements: number | null;
-  };
-  search: {
-    scope: 'worker-total-at-record';
-    budgetStart: number;
-    expanded: number | null;
-    candidates: number | null;
-    verifiedCandidates: number | null;
-    pruned: number | null;
-  };
-  outcome: { spins: number; placed: number; bagCount: number; countedProbability: number };
-}
-
-export type TrainingContribution = TrainingField & { trace: RetainedSearchTrace };
-
-/** New bounded observations are generated only while explicit contribution is enabled. */
-export interface FocusedInput {
-  id: string;
-  rows: number[];
-  source: {
-    kind: 'search';
-    family: string;
-    reference: string;
-    bagBoundary: number;
-    runId: string;
-    rootCandidateId: string;
-    rootBagBoundary: number;
-    rootSeed: number;
-    buildVersion: string;
-    rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
-    trust: 'client-reported';
-    /** Sampling provenance only; never a CNN feature or supervised target. */
-    selection?: FocusedSelection;
-  };
-}
-
-export interface FocusedSelection {
-  policy: 'uniform-score-stratum-v1';
-  seed: number;
-  draw: number;
-  stratum: number;
-  strata: number;
-  poolSize: number;
-  evaluator: 'heuristic' | 'cnn' | 'unknown';
-  scoreMin: number | null;
-  scoreMax: number | null;
-}
-
-export interface FocusedLabelConfig {
-  observationVersion?: 2 | 3 | 4 | 5;
-  horizonBags: number;
-  workBudget: number;
-  beamWidth: number;
-  profile: number;
-  seed: number;
-  maxNodes: number;
-  attemptsPerNode: number;
-  sourceRevision: string;
-}
-
-export interface FocusedWitness {
-  id: number;
-  parentId: number | null;
-  bags: number;
-  startRows: number[];
-  endRows: number[];
-  startSpins: number;
-  endSpins: number;
-  checked: number;
-  success: number;
-  quietSafeSupplies: number;
-  firstBagSymmetryAssumed: boolean;
-  frames: BoardFrame[];
-  [key: string]: unknown;
-}
-
-export interface FocusedSpinLabel {
-  schemaVersion: 2 | 3 | 4 | 5;
-  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3' | 'naga-next-bag-spin-v4' | 'naga-next-bag-spin-v5';
-  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3' | 'concentrated-next-bag-spin-v4' | 'precision-single-bag-spin-v5';
-  /** Prediction horizon; v5 concentrates all collection on that same bag. */
-  targetHorizonBags?: 1;
-  input: FocusedInput;
-  config: FocusedLabelConfig;
-  targets: { foundSpin: boolean; observedSpins: number };
-  measured: { workUsed: number; censored: boolean; [key: string]: unknown };
-  certifiedWitnesses: FocusedWitness[];
-  reachableWholeBagWitnesses?: FocusedReachableWitness[];
-  targetWitness?: unknown;
-  reachableWitness: unknown;
-  [key: string]: unknown;
-}
-
-/** One exact input-replayed inventory, with no all-supply success claim. */
-export interface FocusedReachableWitness {
-  id: number;
-  parentId: number | null;
-  bags: number;
-  startRows: number[];
-  endRows: number[];
-  startSpins: number;
-  endSpins: number;
-  deletedRows: number;
-  targets: { piece: string; cells: [number, number][] }[];
-  representativeQueue: number[];
-  representativeInputs: string[][];
-  frames: BoardFrame[];
-  trust: 'input-reachable';
-  wholeBag: true;
-}
-
-export interface FocusedObservation {
-  schemaVersion: 1;
-  kind: 'focused-spin-observation';
-  id: string;
-  runId: string;
-  rootCandidateId: string;
-  sequence: number;
-  parentObservationId: string | null;
-  parentWitnessId: number | null;
-  label: FocusedSpinLabel;
-}
-
-export interface LearningFocusStatus {
-  enabled: boolean;
-  active: number;
-  queued: number;
-  awaitingDelivery: number;
-  completed: number;
-  failed: number;
-  deepestOriginBag: number;
-  activeBag: number | null;
-  latestObservedSpins: number | null;
-  rows: number[] | null;
 }
 
 export interface Candidate {
@@ -274,8 +77,6 @@ export interface BagCandidates {
 }
 
 export interface SearchSnapshot {
-  evaluator?: { requested: string; active: 'heuristic' | 'cnn-v5'; modelId: string | null; weightsSha256: string | null;
-    fallbackReason: string | null; scope: string; learningComplete: boolean };
   phase: string;
   expanded: number;
   candidates: number;
@@ -308,8 +109,6 @@ export interface SearchSnapshot {
   selectedCandidate?: Candidate | null;
   /** Added by the browser coordinator, not combined into any certificate. */
   workers?: number;
-  /** Conditional deep observation work; distinct from full-build progress. */
-  learningFocus?: LearningFocusStatus;
 }
 
 export type RunStatus = 'idle' | 'loading' | 'running' | 'paused' | 'cancelled' | 'completed' | 'failed';
@@ -327,21 +126,15 @@ export type EngineEvent =
   | { type: 'status'; runId: string; status: RunStatus; message?: string }
   | { type: 'error'; runId: string; message: string }
   | { type: 'warning'; runId: string; message: string }
-  | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
-  | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
+  | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown }
+  | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown }
   | { type: 'transpositions'; runId: string; batch: QuietTranspositionBatch }
-  | { type: 'observation'; runId: string; observationId: string; label: FocusedSpinLabel }
-  | { type: 'observation-error'; runId: string; observationId: string; message: string }
   | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
   | { type: 'export'; runId: string; requestId: string; data: unknown; snapshot?: SearchSnapshot }
   | { type: 'export-error'; runId: string; requestId: string; message: string };
 
 export type EngineCommand =
-  | { type: 'start'; runId: string; config: WorkerSearchConfig; modelJson?: string; assetBase: string; assetVersion: string; watchCurrent: boolean; learningEnabled?: boolean; transpositionSharing?: boolean }
-  | { type: 'learning-mode'; runId: string; enabled: boolean }
-  | { type: 'observe'; runId: string; observationId: string; input: FocusedInput }
-  | { type: 'observation-idle'; runId: string }
-  | { type: 'observation-wait'; runId: string }
+  | { type: 'start'; runId: string; config: WorkerSearchConfig; assetBase: string; assetVersion: string; watchCurrent: boolean; transpositionSharing?: boolean }
   | { type: 'pause' | 'resume' | 'cancel'; runId: string }
   | { type: 'benchmarks'; runId: string; bestSpinsByBag: number[] }
   | { type: 'transpositions'; runId: string; batch: QuietTranspositionBatch }
@@ -360,7 +153,5 @@ export const defaultConfig: SearchConfig = {
   budget_start: 0,
   seed: 1,
   beam_width: 64,
-  cnn_evaluation: false,
-  board_evaluator: 'heuristic',
   worker_count: 0
 };

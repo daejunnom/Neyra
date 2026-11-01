@@ -1,9 +1,5 @@
-import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, FocusedObservation,
-  FocusedSpinLabel, LearningFocusStatus, RetainedSearchTrace, RunStatus,
-  SearchConfig, SearchRecordCounters, SearchSnapshot, TrainingContribution, TrainingField } from './types';
-import { FocusedFrontier, focusedBoardKey, focusedDescendants, focusedRoot, validNextBagLabel, type FocusedOrigin } from './focused-learning';
-import { NEXT_BAG_LABEL_CONFIG } from './learning-policy';
-import { MAX_PENDING_OBSERVATIONS, type ContributionState, type ObservationDelivery } from './contributions';
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus,
+  SearchConfig, SearchSnapshot } from './types';
 import { QuietTranspositionBroker } from './transpositions';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
@@ -15,22 +11,23 @@ type WorkerSlot = {
   snapshot: SearchSnapshot | null;
   incumbent: { candidate: Candidate; data: unknown } | null;
   watching: boolean;
-  focusedJob: { id: string; sequence: number; origin: FocusedOrigin } | null;
-  focusedWaiting: boolean;
 };
 type OwnedCandidate = { slot: WorkerSlot; candidate: Candidate };
 type ArchivedCandidate = OwnedCandidate & { data: unknown };
 const NEW_DEPLOYMENT_NOTICE = '새 버전이 배포되어 현재 페이지가 이전 버전이에요. 필요한 결과가 있다면 먼저 저장한 뒤 페이지를 새로고침하고 탐색을 다시 시작해 주세요.';
 
 export const MAX_WORKERS = 128;
-export const MAX_FOCUSED_JOBS = 3;
-
-function sameSource(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
-  const left = a as Record<string, unknown>, right = b as Record<string, unknown>;
-  const keys = Object.keys(left);
-  return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && sameSource(left[key], right[key]));
+/** Reflection groups displayed fields only; keep each original certificate. */
+function displayedBoardKey(value: number[]): string {
+  const reflection = value.map(row => {
+    let result = 0;
+    for (let x = 0; x < 10; x++) result |= ((row >>> x) & 1) << (9 - x);
+    return result;
+  });
+  for (let y = 0; y < value.length; y++) {
+    if (reflection[y] !== value[y]) return (reflection[y] < value[y] ? reflection : value).join(',');
+  }
+  return value.join(',');
 }
 
 /** The browser can expose fewer logical processors than the operating system. */
@@ -145,7 +142,6 @@ function complete(candidate: Candidate | null | undefined): candidate is Candida
 export class SearchClient {
   private slots: WorkerSlot[] = [];
   private runId = '';
-  private runConfig: SearchConfig | null = null;
   private intent: 'running' | 'paused' | 'cancelled' = 'cancelled';
   private status: RunStatus = 'idle';
   private currentOwner: number | null = null;
@@ -159,73 +155,15 @@ export class SearchClient {
   private bestSpinsByBag = Array<number>(101).fill(0);
   private transpositions = new QuietTranspositionBroker();
   private shareSpinBenchmarks = true;
-  private contributionEnabled = false;
-  private focusedFrontier = new FocusedFrontier();
-  private awaitingObservations = new Map<string, FocusedObservation>();
-  private observationSequence = 0;
-  private focusedCompleted = 0;
-  private focusedFailed = 0;
-  private deepestFocusedOrigin = 0;
-  private focusedDisplay: { id: string; origin: FocusedOrigin; observedSpins: number | null } | null = null;
-  private observationTransportPending = 0;
-  private observationTransportReady = true;
   private startupVersionCheck: Promise<boolean> | null = null;
   private startupCheckAbort: AbortController | null = null;
   private startupVersionMismatch = false;
 
-  constructor(private receive: (event: EngineEvent) => void,
-    private contribute: (field: TrainingContribution) => void = () => {},
-    private contributeObservation: (observation: FocusedObservation) => boolean = () => false) {}
+  constructor(private receive: (event: EngineEvent) => void) {}
 
-  /** Existing archives may seed new bounded work. Their past traces are never backfilled. */
-  setContributionEnabled(enabled: boolean) {
-    if (enabled === this.contributionEnabled) return;
-    this.contributionEnabled = enabled;
-    if (!enabled) {
-      this.focusedFrontier.clear(false);
-      this.awaitingObservations.clear();
-    }
-    for (const slot of this.slots) {
-      if (['failed', 'completed', 'cancelled'].includes(slot.status)) continue;
-      if (!enabled) { slot.focusedJob = null; slot.focusedWaiting = false; }
-      slot.worker.postMessage({ type: 'learning-mode', runId: this.runId, enabled } satisfies EngineCommand);
-    }
-    if (enabled && this.intent !== 'cancelled') {
-      for (const field of this.trainingFields()) {
-        const origin = focusedRoot(field);
-        if (origin) this.focusedFrontier.add(origin);
-      }
-      this.scheduleFocused();
-    }
-    this.publishProgress(true);
-  }
-
-  /** A descendant cannot be collected until its parent is safely in the relay.
-   * Failed/rejected parents retain no runnable descendants. */
-  observationDelivery(id: string, status: ObservationDelivery['status']) {
-    const observation = this.awaitingObservations.get(id);
-    if (!observation || !this.contributionEnabled) return;
-    this.awaitingObservations.delete(id);
-    if (status === 'acknowledged') {
-      for (const origin of focusedDescendants(observation)) this.focusedFrontier.add(origin);
-    } else this.focusedFailed++;
-    this.scheduleFocused();
-    this.publishProgress(true);
-  }
-
-  /** Include pending labels from an earlier run in this tab's work cap. */
-  setObservationTransport(state: ContributionState) {
-    this.observationTransportPending = state.observationQueued;
-    this.observationTransportReady = state.enabled &&
-      !['disabled', 'unavailable', 'recovering', 'paused'].includes(state.phase);
-    this.scheduleFocused();
-  }
-
-  start(config: SearchConfig, modelJson?: string) {
+  start(config: SearchConfig) {
     this.dispose();
     this.runId = crypto.randomUUID();
-    this.runConfig = { ...config, cnn_evaluation: false };
-    this.focusedFrontier.setSeed(config.seed);
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
@@ -242,7 +180,7 @@ export class SearchClient {
         worker = new Worker(new URL('./search.worker.ts', import.meta.url), { type: 'module' });
         const id = this.slots.length;
         const slot: WorkerSlot = { id, worker, status: 'loading', snapshot: null, incumbent: null,
-          watching: this.observingCurrent && id === 0, focusedJob: null, focusedWaiting: false };
+          watching: this.observingCurrent && id === 0 };
         worker.onmessage = (event: MessageEvent<EngineEvent>) => {
           if (this.runId !== runId || event.data.runId !== runId) return;
           this.handle(slot, event.data);
@@ -262,11 +200,10 @@ export class SearchClient {
       try {
         slot.worker.postMessage({
           type: 'start', runId,
-          modelJson: config.board_evaluator === 'cnn-v5' ? modelJson : undefined,
-          config: { ...engineConfig, cnn_evaluation: false, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
+          config: { ...engineConfig, cnn_evaluation: false, board_evaluator: 'heuristic', seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
           assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching,
-          learningEnabled: this.contributionEnabled, transpositionSharing: this.slots.length > 1
+          transpositionSharing: this.slots.length > 1
         } satisfies EngineCommand);
       } catch (error) {
         this.failed(slot, error instanceof Error ? error.message : String(error));
@@ -302,7 +239,6 @@ export class SearchClient {
     this.intent = 'running';
     this.nextFocusAt = performance.now() + 2000;
     this.broadcast('resume');
-    this.scheduleFocused();
     this.publishStatus();
   }
 
@@ -310,9 +246,6 @@ export class SearchClient {
     this.intent = 'cancelled';
     this.startupCheckAbort?.abort();
     this.startupCheckAbort = null;
-    this.focusedFrontier.clear(false);
-    this.awaitingObservations.clear();
-    for (const slot of this.slots) slot.focusedJob = null;
     this.broadcast('cancel');
     this.publishStatus();
   }
@@ -363,199 +296,6 @@ export class SearchClient {
     }
   }
 
-  /** Export the retained certified boundaries, including a selection displaced
-   * by later records. A run is one training family to keep its related boards
-   * together when splitting training and validation data. */
-  trainingFields(): TrainingField[] {
-    if (!this.runConfig || !this.runId) return [];
-    const records: OwnedCandidate[] = [...this.bagRecords.values()].flat();
-    if (this.selectedArchive) records.push(this.selectedArchive);
-    for (const slot of this.slots) {
-      if (slot.incumbent) records.push({ slot, candidate: slot.incumbent.candidate });
-    }
-    const seen = new Set<string>();
-    const fields: TrainingField[] = [];
-    for (const record of records) {
-      const id = this.ownedId(record);
-      const field = this.trainingField(record);
-      if (seen.has(id) || !field) continue;
-      seen.add(id);
-      fields.push(field);
-    }
-    return fields.sort((a, b) => a.source.bagBoundary - b.source.bagBoundary || a.id.localeCompare(b.id));
-  }
-
-  private trainingField(record: OwnedCandidate): TrainingField | null {
-    if (!this.runConfig || !this.runId) return null;
-    const config = this.runConfig;
-    const candidate = record.candidate;
-    const id = this.ownedId(record);
-    // A terminal result may stop inside a bag. Only completed post-clear
-    // boundaries with a captured representative are useful collection origins.
-    if (!candidate.verified || !candidate.qualified ||
-        !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 ||
-        candidate.placed !== candidate.bagCount * 7 ||
-        candidate.frames.length !== candidate.frameCount || candidate.rows.length !== 24 ||
-        !candidate.rows.some((row) => row !== 0) ||
-        !candidate.rows.every((row) => Number.isInteger(row) && row >= 0 && row < 1023)) return null;
-    return { schemaVersion: 1, id: `${this.runId}:${id}`, rows: [...candidate.rows], source: {
-      kind: 'search', family: `search:${this.runId}`,
-      reference: `neyra:run:${this.runId}/candidate:${id}`,
-      runId: this.runId, candidateId: id, bagBoundary: candidate.bagCount,
-      probability: candidate.probability, firstBagProbability: candidate.firstBagProbability ?? null,
-      ignoreFirstBagProbability: config.ignore_first_bag_probability, verified: true, qualified: true,
-      seed: workerSeed(config.seed, record.slot.id), runSeed: config.seed,
-      modelMode: candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? 'cnn' : 'heuristic',
-      ...(candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? {
-        evaluatorModelId: record.slot.snapshot.evaluator.modelId ?? undefined,
-        evaluatorWeightsSha256: record.slot.snapshot.evaluator.weightsSha256 ?? undefined } : {}), buildVersion: version,
-      rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1',
-      searchConfig: {
-        minSuccessPercent: config.min_success_percent,
-        bagMinSuccessPercent: config.bag_min_success_percent,
-        firstBagMinSuccessPercent: config.first_bag_min_success_percent,
-        riskMinSpinsPerBag: config.risk_min_spins_per_bag,
-        pieceGoal: config.piece_goal, maxPieces: config.max_pieces, beamWidth: config.beam_width
-      }
-    }, trace: this.retainedTrace(record) ?? undefined };
-  }
-
-  private retainedTrace(record: OwnedCandidate, counters?: SearchRecordCounters): RetainedSearchTrace | null {
-    const candidate = record.candidate;
-    const frames = candidate.frames;
-    const integer = (value: unknown, max: number): value is number =>
-      typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= max;
-    const rows = (value: number[]) => value.length === 24 && value.every((row) => integer(row, 1022));
-    // Public search begins at the empty root. A full frame history must prove
-    // that origin before an empty start can be used for the first two bags.
-    if (!this.runConfig || frames.length !== candidate.placed || frames[0]?.placed !== 1 ||
-        candidate.placed % 7 !== 0 || !integer(candidate.placed, 700) ||
-        !integer(candidate.spins, 40) || !integer(candidate.bagCount, 100) || candidate.bagCount < 1) return null;
-    const offset = Math.max(0, frames.length - 14);
-    const preceding = offset > 0 ? frames[offset - 1] : null;
-    const start = preceding ? { rows: [...preceding.rows], spins: preceding.spins, placed: preceding.placed }
-      : { rows: Array<number>(24).fill(0), spins: 0, placed: 0 };
-    if (!rows(start.rows) || start.placed !== offset || !integer(start.spins, 40)) return null;
-    let previousSpins = start.spins;
-    const steps: RetainedSearchTrace['steps'] = [];
-    for (const frame of frames.slice(offset)) {
-      if (!/^[IJLOSTZ]$/.test(frame.piece) || !rows(frame.rows) || !integer(frame.spins, 40) ||
-          frame.placed !== start.placed + steps.length + 1 || !integer(frame.lines, 1) ||
-          typeof frame.spin !== 'boolean' || (frame.lines === 1 && (!frame.spin || frame.piece === 'O')) ||
-          frame.spins !== previousSpins + (frame.spin ? frame.lines : 0)) return null;
-      steps.push({ piece: frame.piece, rows: [...frame.rows], spins: frame.spins,
-        placed: frame.placed, lines: frame.lines, spin: frame.spin });
-      previousSpins = frame.spins;
-    }
-    const last = steps.at(-1);
-    if (!last || last.spins !== candidate.spins || last.placed !== candidate.placed ||
-        last.rows.some((row, y) => row !== candidate.rows[y])) return null;
-    const finite = (value: number | undefined) => typeof value === 'number' && Number.isFinite(value) ? value : null;
-    const count = (value: number | undefined) => integer(value, Number.MAX_SAFE_INTEGER) ? value : null;
-    const forecastByBag = candidate.forecastSpinsByBag ?? [];
-    return { schemaVersion: 1, kind: 'retained-path', prefixOmittedBags: offset / 7, start, steps,
-      evaluation: { kind: candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? 'cnn' : 'heuristic',
-        ...(candidate.bagCount >= 2 && record.slot.snapshot?.evaluator?.active === 'cnn-v5' ? {
-          modelId: record.slot.snapshot.evaluator.modelId ?? undefined, weightsSha256: record.slot.snapshot.evaluator.weightsSha256 ?? undefined } : {}),
-        rawQuality: finite(candidate.fieldQuality), rankingScore: finite(candidate.rankingScore),
-        forecastSpins: integer(candidate.forecastSpins, 6) ? candidate.forecastSpins : null,
-        forecastSpinsByBag: forecastByBag.length <= 2 && forecastByBag.every((value) => integer(value, 6)) ? [...forecastByBag] : [],
-        forecastPlacements: integer(candidate.forecastPlacements, 14) ? candidate.forecastPlacements : null },
-      search: { scope: 'worker-total-at-record', budgetStart: this.runConfig.budget_start,
-        expanded: count(counters?.expanded), candidates: count(counters?.candidates),
-        verifiedCandidates: count(counters?.verifiedCandidates), pruned: count(counters?.pruned) },
-      outcome: { spins: candidate.spins, placed: candidate.placed, bagCount: candidate.bagCount,
-        countedProbability: candidate.probability } };
-  }
-
-  private contributeRecord(record: OwnedCandidate, counters?: SearchRecordCounters) {
-    if (!this.contributionEnabled) return;
-    const field = this.trainingField(record);
-    if (!field) return;
-    const trace = this.retainedTrace(record, counters);
-    if (!trace) return;
-    // Data transport is optional and must never interrupt search or alter a record.
-    try { this.contribute({ ...field, trace }); } catch { /* The transport reports its own state. */ }
-    const origin = focusedRoot({ ...field, trace });
-    if (origin) this.focusedFrontier.add(origin);
-    this.scheduleFocused();
-  }
-
-  private focusedStatus(): LearningFocusStatus {
-    return { enabled: this.contributionEnabled,
-      active: this.slots.filter((slot) => slot.focusedJob !== null).length,
-      queued: this.focusedFrontier.length, awaitingDelivery: this.awaitingObservations.size,
-      completed: this.focusedCompleted, failed: this.focusedFailed,
-      deepestOriginBag: this.deepestFocusedOrigin,
-      activeBag: this.focusedDisplay?.origin.input.source.bagBoundary ?? null,
-      latestObservedSpins: this.focusedDisplay?.observedSpins ?? null,
-      rows: this.focusedDisplay ? [...this.focusedDisplay.origin.input.rows] : null };
-  }
-
-  private scheduleFocused() {
-    if (!this.contributionEnabled || this.intent !== 'running' || !this.runId) return;
-    let active = this.slots.filter((slot) => slot.focusedJob !== null).length;
-    let occupied = Math.max(this.awaitingObservations.size, this.observationTransportPending) + active;
-    const available = this.slots.filter((slot) => slot.status === 'running');
-    for (const slot of available) {
-      if (slot.focusedJob || !this.observationTransportReady ||
-          active >= MAX_FOCUSED_JOBS || occupied >= MAX_PENDING_OBSERVATIONS || this.observationSequence >= 1_000_000) continue;
-      const origin = this.focusedFrontier.take();
-      if (!origin) break;
-      const sequence = ++this.observationSequence;
-      const id = `${this.runId}:observation-${sequence}`;
-      slot.focusedJob = { id, sequence, origin };
-      slot.focusedWaiting = false;
-      this.focusedDisplay = { id, origin, observedSpins: null };
-      this.deepestFocusedOrigin = Math.max(this.deepestFocusedOrigin, origin.input.source.bagBoundary);
-      occupied++;
-      active++;
-      slot.worker.postMessage({ type: 'observe', runId: this.runId, observationId: id, input: origin.input } satisfies EngineCommand);
-    }
-    for (const slot of available) {
-      if (slot.focusedJob || !slot.focusedWaiting) continue;
-      // Receipt/backpressure limits only collection. Spare workers can keep
-      // discovering deeper certified roots instead of idling on the network.
-      slot.focusedWaiting = false;
-      slot.worker.postMessage({ type: 'observation-idle', runId: this.runId } satisfies EngineCommand);
-    }
-  }
-
-  private observed(slot: WorkerSlot, observationId: string, label: FocusedSpinLabel | null) {
-    const job = slot.focusedJob;
-    // Withdrawal invalidates the job before its synchronous collector yields.
-    // An immediate OFF→ON must not revive that old result under new consent.
-    if (!job || job.id !== observationId || !this.contributionEnabled) return;
-    slot.focusedJob = null;
-    slot.focusedWaiting = true;
-    if (!label || !validNextBagLabel(label) ||
-        Object.keys(label.config).length !== Object.keys(NEXT_BAG_LABEL_CONFIG).length ||
-        Object.entries(NEXT_BAG_LABEL_CONFIG).some(([key, value]) =>
-          (label.config as unknown as Record<string, unknown>)[key] !== value) ||
-        label.input?.id !== job.origin.input.id ||
-        label.input.rows.length !== job.origin.input.rows.length ||
-        label.input.rows.some((row, y) => row !== job.origin.input.rows[y]) ||
-        !sameSource(label.input.source, job.origin.input.source)) {
-      this.focusedFailed++;
-    } else {
-      this.focusedCompleted++;
-      if (this.focusedDisplay?.id === job.id) this.focusedDisplay.observedSpins = label.targets.observedSpins;
-      const observation: FocusedObservation = { schemaVersion: 1, kind: 'focused-spin-observation',
-        id: job.id, runId: this.runId, rootCandidateId: job.origin.rootCandidateId,
-        sequence: job.sequence, parentObservationId: job.origin.parentObservationId,
-        parentWitnessId: job.origin.parentWitnessId, label };
-      this.awaitingObservations.set(observation.id, observation);
-      let accepted = false;
-      try { accepted = this.contributeObservation(observation); } catch { /* Transport reports its own state. */ }
-      if (!accepted) {
-        this.awaitingObservations.delete(observation.id);
-        this.focusedFailed++;
-      }
-    }
-    this.scheduleFocused();
-    this.publishProgress(true);
-  }
-
   dispose() {
     clearTimeout(this.progressTimer);
     this.progressTimer = undefined;
@@ -570,16 +310,8 @@ export class SearchClient {
     this.selectedArchive = null;
     this.bestSpinsByBag.fill(0);
     this.transpositions.clear();
-    this.focusedFrontier.clear();
-    this.awaitingObservations.clear();
-    this.observationSequence = 0;
-    this.focusedCompleted = 0;
-    this.focusedFailed = 0;
-    this.deepestFocusedOrigin = 0;
-    this.focusedDisplay = null;
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
-    this.runConfig = null;
     this.intent = 'cancelled';
   }
 
@@ -600,31 +332,19 @@ export class SearchClient {
       // A start acknowledgement can arrive after pause/cancel was requested.
       // Keep waiting for the matching control acknowledgement from every worker.
       slot.status = message.status;
-      if (message.status === 'completed' && slot.focusedJob) {
-        this.focusedFrontier.release(slot.focusedJob.origin);
-        slot.focusedJob = null;
-        slot.focusedWaiting = false;
-        slot.worker.postMessage({ type: 'observation-idle', runId: this.runId } satisfies EngineCommand);
-      }
-      this.scheduleFocused();
       this.publishStatus();
       this.publishProgress(true);
     } else if (message.type === 'incumbent') {
       if (complete(message.candidate) &&
           (!slot.incumbent || betterComplete(message.candidate, slot.incumbent.candidate))) {
         slot.incumbent = { candidate: message.candidate, data: message.data };
-        this.contributeRecord({ slot, candidate: message.candidate }, message.counters);
       }
       this.publishProgress();
     } else if (message.type === 'bag-record') {
-      this.retainBagRecord(slot, message.candidate, message.data, message.counters);
+      this.retainBagRecord(slot, message.candidate, message.data);
       this.publishProgress();
     } else if (message.type === 'transpositions') {
       if (this.intent !== 'cancelled') this.transpositions.accept(slot.id, message.batch);
-    } else if (message.type === 'observation') {
-      this.observed(slot, message.observationId, message.label);
-    } else if (message.type === 'observation-error') {
-      this.observed(slot, message.observationId, null);
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
     } else if (message.type === 'warning') {
@@ -668,8 +388,6 @@ export class SearchClient {
     if (slot.status === 'failed') return;
     const startupFailure = slot.snapshot === null;
     slot.status = 'failed';
-    if (slot.focusedJob) this.focusedFailed++;
-    slot.focusedJob = null;
     slot.worker.onmessage = null;
     slot.worker.onerror = null;
     slot.worker.terminate();
@@ -690,7 +408,6 @@ export class SearchClient {
       this.publishStatus();
     }
     this.publishProgress(true);
-    this.scheduleFocused();
     if (startupFailure) this.checkStartupVersion();
   }
 
@@ -780,7 +497,7 @@ export class SearchClient {
     return this.bagRecords.get(item.candidate.bagCount)?.find(matches) ?? null;
   }
 
-  private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown, counters?: SearchRecordCounters) {
+  private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown) {
     const exported = (data as { candidate?: Candidate } | null)?.candidate;
     if (!candidate.verified || !candidate.qualified || candidate.complete ||
         !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 || candidate.bagCount > 100 ||
@@ -806,13 +523,12 @@ export class SearchClient {
     // is displaced by another worker's stronger route to the same field.
     const seenFields = new Set<string>();
     const distinct = records.filter((item) => {
-      const key = focusedBoardKey(item.candidate.rows);
+      const key = displayedBoardKey(item.candidate.rows);
       if (seenFields.has(key)) return false;
       seenFields.add(key);
       return true;
     }).slice(0, 2);
     this.bagRecords.set(candidate.bagCount, distinct);
-    if (distinct.includes(record)) this.contributeRecord(record, counters);
   }
 
   private publishedBagRecords(): BagCandidates[] {
@@ -913,7 +629,6 @@ export class SearchClient {
     const selected = current?.slot.snapshot;
     const owned = (item: OwnedCandidate | null) => item ? { ...item.candidate, id: this.ownedId(item) } : null;
     this.receive({ type: 'progress', runId: this.runId, snapshot: {
-      evaluator: selected?.evaluator ?? values[0]?.evaluator,
       phase: selected?.phase ?? 'searching',
       expanded: sum((value) => value.expanded),
       candidates: sum((value) => value.candidates),
@@ -936,7 +651,6 @@ export class SearchClient {
       finished: this.status === 'completed',
       current: owned(current), best: owned(best), bestPartial: owned(partial),
       bestByBag: this.publishedBagRecords(), selectedCandidate: owned(this.selectedArchive),
-      learningFocus: this.focusedStatus(),
       workers: this.slots.filter((slot) => !['failed', 'completed', 'cancelled'].includes(slot.status)).length
     } });
   }

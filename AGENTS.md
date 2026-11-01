@@ -27,7 +27,7 @@
   instruction retires the frozen af8 source baseline; do not restore or maintain
   a parallel historical implementation. Accept changes against the immediately
   preceding accepted source using matched rules, settings and work, preserving
-  probability and transport contracts. Keep benchmark tools and results outside
+  physics and probability contracts. The retired CNN transport is not an active contract. Keep benchmark tools and results outside
   the repository. Preserve existing test modules and do not commit new tests.
 - Exclude O spins in this build-search profile. Keep physical rotation data
   separate from search-state equivalence: an origin-only rotation need not
@@ -36,268 +36,74 @@
   or benchmark result reports. Keep these outside the repository. Evaluate
   additional computation sharing with matched-work ABBA measurements before
   adopting it; worker-local caches do not imply a global shared search DAG.
-- Public Pages defaults to the existing structural search evaluator. Accept the
-  old cnn_evaluation setting for compatibility but ignore it in ranking. Only an
-  explicit board_evaluator=cnn-v5 selection with an attached, validated trained
-  v5 checkpoint enables experimental CNN evaluation of completed boundaries
-  from bag two. Keep first-bag foundations and unfinished prefixes structural;
-  replace that boundary quality with 120*(observedSpins+0.05*foundSpinLikelihood),
-  without blending structural scores. Missing, untrained or invalid artifacts
-  fall back before search starts. Verify the actual float32 weight digest,
-  one-bag task/policy, architecture and recorded dataset lineage. Record the
-  active evaluator, model ID/hash and any fallback reason in snapshots/exports
-  and preserve actual evaluator provenance in contributions. Activation does
-  not establish learning completion or generalization. Never automatically
-  fetch/promote a private candidate or pass it into the fixed-policy collector.
-  Public learning-data sharing defaults off and requires explicit versioned consent;
-  legacy default-on settings are not consent. Learning stays off. Generate a
-  fresh nonzero random seed on page entry, then honor the user's manual seed.
-  Preserve physics, probability, necessary bounds and supply certificates.
-- The CPU CNN learns current occupancy only and predicts bounded-search spin
-  discovery and observed spin count. Do not mix in structural teachers, Terrain
-  scores, shape preferences, opener priors or path-count targets. Preserve the
-  released two-bag v2 checkpoint. Explicit v3 initialization may reuse its
-  convolution/hidden features only with a reset output head and recorded source
-  provenance; it must remain marked untrained until actual v3-only fitting.
-  The v4 refinement contract keeps the same occupancy tensor, architecture and
-  two one-bag heads. Give it distinct policy/derivation metadata and a reset
-  output head; never reinterpret v2/v3 targets or add heuristic/dependency values
-  as features or labels. Preserve raw evidence and exact source/weight hashes.
-  Active v5 also preserves those 33,442 parameters and two one-bag outputs.
-  Record its one-inventory precision policy and asymmetric count objective:
-  underestimating an observed count costs twice the same-size overestimate.
-  Keep both directions penalized, report deficit/excess and underestimate rate,
-  and select by held-out validation with the unchanged parent eligible.
-  Keep history, inventory, forecasts and opener identity out of inference inputs.
-  Inspect actual accessible source before using another engine's board features;
-  never infer closed-source evaluation or copy private reference implementation.
-  The portable Rust/WASM CNN uses no GPU connection or runtime ML dependency.
-- Learning observations begin at nonempty completed boundaries of at least two
-  bags. Active v5 precisely explores one new inventory from a small selected
-  set of supplied nodes; bag depth is source provenance, not a priority or a
-  substitute for within-bag precision. Do not start empty first-bag or full
-  completion searches. Keep input-reachable observations distinct from exact
-  P7/quiet-safe chains. Limited search is censored: a miss is not impossibility,
-  and the discovery head is not construction probability. Split whole opener
-  families and search runs; isolate identical and reflected boards across splits.
-  V3 labels predict only the first new bag, with targetHorizonBags=1, while
-  the collector still attempts at least two new inventories. Retain the actual
-  reached depth, zero-spin endpoints, physical input witnesses and censored
-  capacity/work limits. Do not apply peer score, completion pace, sibling
-  futility or all-P7-parent gates in this learning-only path. Public certified
-  search keeps those separate rules. Preserve historical v2/v3 collection ranges;
-  they do not define the active v5 one-inventory policy.
-  Commit reusable collection/training/storage tools and the selected runtime
-  model, but keep datasets, new tests, one-time experiments and result reports
-  outside this repository. Record dataset, labeling-source and model hashes.
-- Historical v4 learning collection concentrates on a supplied root and at most three
-  selected next-bag result boards under declared equal phase quotas. Keep the
-  candidate search pool independent of serialized proof capacity. Preserve a
-  randomized quality spectrum instead of trimming all low-score proposals;
-  uniformly select a nonempty equal-width score band, then a random node in it.
-  Do not mix score units from heuristic and CNN evaluators. Keep actual best
-  prefixes separately, preserve zero-spin reachable boundaries and record
-  selection seeds, consumed work, capacity losses and unfinished phases.
-  V4 measures exactly two inventories and predicts one; it must reject
-  a requested third inventory rather than claiming it was measured.
-- Active v5 uses one persistent single-bag frontier with a declared 524,288 work
-  ceiling, beam 48, node cap 96 and one attempt. Reserve a small bounded share
-  for proof replay and contact diagnostics; do not split the main budget among
-  second-bag arms. A work unit is a full reachable-lock query for one unused
-  piece/state, a retained input replay or a component query; legacy advance-unit
-  counts are not CPU-time equivalents. Preserve the strongest actual spin
-  prefix before capacity trimming. Share future expansion only for identical
-  oriented occupancy plus remaining labels, with higher-spin dominance.
-  Record a state as fully expanded only after all its piece queries finish;
-  dropped or interrupted work cannot suppress an unsearched replacement.
-  Keep bounded deferred alternatives, transposition/capacity counters and
-  physical witnesses. Frontier exhaustion after drops is still censored.
-- Only the v4/v5 learning paths may use touching-component order approximations.
-  Partition typed logical target cells by orthogonal contact, then test each
-  component's internal orders against the origin with other current-bag minos
-  absent. Sum the component counters; never multiply them into supply odds.
-  SRS+ can create dependencies between disconnected components. This diagnostic
-  cannot prune a physical path or certify P7/quiet-safe construction. Supervised
-  targets still need actual full-board input replay.
-- The developer learning Site stays owner-private with sharing and learning on,
-  without mode selectors. Analyze received fixed-policy observations first;
-  do not rerun the collector to consume an already supplied observation. Only
-  when both the received analysis queue and relay are empty may the versioned
-  collector continue from an actual received result board or a recorded
-  input-reachable descendant. Do not generate empty first-bag/bootstrap searches.
-  Sites D1/R2 holds observations and model artifacts; Supabase is the bounded
-  public relay. Received labels remain client-reported even after structural
-  validation; independent private measurements retain their separate trust.
-  Keep depth-qualified trace receipts and identity-qualified observation receipts,
-  acknowledge only stored or explicitly excluded inputs, and preserve source
-  groups across descendants. Never expose privileged keys in browser bundles,
-  logs or commits, or allow anonymous access to private labels or model writes.
-- Capture public search traces only after explicit consent, using existing
-  retained frames and worker totals. Do not retrospectively upload old traces.
-  With consent on, use a verified boundary of at least two bags as an origin
-  for the v5 single-bag collector. Select a nonempty evaluator score band and a
-  node within it uniformly, without prioritizing bag depth; keep evaluator units
-  separate. Replayed zero-spin boundaries remain eligible for later independent
-  one-bag jobs. Existing retained boards may seed new jobs.
-  Use the selected worker pool, at most three active expensive collection jobs,
-  a bounded global frontier, and parent delivery
-  acknowledgement before dispatching descendants. Keep queued observations
-  under backpressure rather than evicting parents. With consent off, discard
-  new collector outputs, stop new collection/upload and resume ordinary search.
-  Do not cap shallow origins merely to force later bags. Keep bounded per-run
-  dispatch history through consent toggles, and refund unstarted jobs when
-  a worker completes before dispatch. Do not invent certified deeper fields.
-  Keep heuristic scores and bounded path observations
-  in separate untrusted trace records, never in the CNN's supervised targets.
-  Reject old default-on ingress envelopes. Deduplicate trace identity separately
-  from training occupancy so different runs of a known board retain evidence.
-- Keep queued frontier keys separate from dispatched-job history. Evicted or
-  unstarted proposals must remain eligible; admission limits still apply.
-  Unassigned public workers continue broad search during focused collection
-  and acknowledgement backpressure. Immutable wire payloads may be shared,
-  but consent generations and parent acknowledgements must remain independent.
-  Persist consented pending observations in the browser outbox when storage is
-  available, recover the exact payload on reconnect/reload, and erase pending
-  payloads on consent withdrawal. An HTTP success alone is not delivery: check
-  observation ID, queue ID, payload digest and receipt state; trace receipts
-  must match each identity and depth. The 4,096-entry completed-work ledger is
-  qualified by exact physical rows and full collector policy, and accepts only
-  acknowledged work. It is bounded history, not permanent global deduplication.
-  Retain service-only relay content receipts after raw import so an identical
-  retry neither recreates work nor consumes quota again; reject identity reuse
-  with different content. Acknowledgement and raw removal must be transactional.
-- Private parallel claims are atomic and lease-qualified. Received acceptance
-  and its label insertion must commit together; late work cannot bypass
-  quarantine or release another worker's lease. Reuse exact validated model
-  weights within each worker, with private engine instances and memory.
-  Private CPU capacity follows the selected hardware thread count up to 128;
-  candidate training shares at most 20 attempted epochs per cycle, at most ten
-  per candidate and two concurrent GPU candidates. Preserve the parent as a
-  validation candidate and record actual allocation and backend metadata.
-  Load the training runtime only for training work. Interrupted recorded child
-  admission must be repairable from the immutable parent proof, with a bounded
-  repair batch after received-work priority checks; do not rerun collection.
-  Renew only matching live leases, keep claim/commit retries idempotent and stop
-  work when ownership is lost. Temporary connection failures reconnect without
-  charging a collector failure or overriding manual pause. Recover committed
-  results by exact request/lease identity instead of fitting or collecting again.
-- Preserve the released v2 checkpoint and legacy collector semantics. V3 uses
-  an explicitly different policy, model task and one-bag output contract; never
-  relabel a two-bag prediction or mix versions in a training dataset. Private seeded
-  exploration changes proposal ordering only, within the same declared budget;
-  store its seed, ordinal and distinct policy. Its replayed child boards may
-  enter fixed-policy collection, but stochastic labels must not silently mix
-  with the fixed-policy training set. Pin the served champion independently of
-  newer private candidates; training never promotes a checkpoint automatically.
-- V4 preprocessing produces one local best-replayed next-bag target per actually
-  attempted root/arm. An arm's input is its own exact result board; its next-bag
-  gain is not added to the original root label. Keep work scope, raw observation,
-  witness and measurement-group references. Choose the strongest eligible
-  representative only within the same canonical board, policy and work scope.
-  V5 has one actually attempted root and no arms; preserve its distinct task,
-  config and single-bag expansion work scope when deriving the same record kind.
-  V3's earliest-eligible representative rule remains its historical contract.
-  Private training uses bounded random replay, not a full-dataset fit for each
-  arrival: at most 16 fresh and 48 eligible historical train rows, plus a stable
-  validation roster of at most 64. Test rows never enter fitting or selection.
-  Drain fresh winners in arrival order; a row cursor is not evidence of use.
-  Only exact selected IDs in a successfully completed/unchanged attempt consume
-  freshness. Historical replay is intentional reuse. Failed attempts keep their
-  sample, with cooldown and at most two retries for the same parent/eligibility;
-  exhausted failures wait for different fresh work and do not count as fitting.
-  Record the exact selected IDs/order and distinguish random database selection
-  from the recorded training shuffle seed. Atomically prepare and complete each
-  attempt, rechecking parent lineage, exclusions and eligibility at both ends.
-  Removing a bad row from today's batch does not remove its influence from a
-  trained parent: invalidate that lineage and use an eligible ancestor or an
-  honestly untrained initializer. Preserve immutable historical memberships.
-- Keep trained, learning complete and deployment ready distinct. The versioned
-  neyra-next-bag-readiness-v1 policy requires eligible canonical board counts
-  2,048/256/256 and source-group counts 32/8/8 in train/validation/test, plus
-  2,048 unique train boards in the selected checkpoint's successful fitting
-  ancestry. Unchanged/failed attempts cannot manufacture fitted coverage.
-  Follow docs/LEARNING_CHECKPOINT.md and the Site's learning-readiness.ts for
-  frozen audit coverage, multi-spin strata, MAE/Brier/calibration and CPU parity
-  gates. These are engineering acceptance floors, not a sufficient-sample
-  theorem. Reserve final test groups once for a frozen candidate; never use
-  them for fitting or epoch selection. Source exclusions invalidate the audit.
-  Learning completion does not authorize model promotion: deploymentReady stays
-  false until separately recorded matched-rule/search-work quality and CPU-cost
-  evidence has an acceptance contract. Do not invent that missing comparison.
-- Verify workers in the agent's internal environment. Prefer the supported
-  private Sites service-access path and managed internal preview; never weaken
-  owner privacy for testing. Use the user's Chrome only as a limited fallback
-  after internal access has proved unavailable. Do not put service credentials
-  in browser code, command arguments, repository files or logs.
-- Retire old opener/bootstrap/perturbed examples from the active corpus. Keep
-  immutable historical proofs/exports only for previous model provenance.
-  Use corpus-qualified canonical board identity so old labels cannot silently
-  enter the new public-results training set. Preserve all physical witness
-  orientations and per-link trust when attaching ancestor feedback.
-  Keep historical geometry/run split constraints even after corpus retirement.
-  Assign a durable source group before admitting its first board. A new group
-  first inherits an unambiguous existing geometry component's split; hash a new
-  component only when no prior constraint exists. Record duplicate-only source
-  occurrences and exact orientations independently of canonical training rows.
-  Never move historical groups/geometry between splits or clear old exclusions.
-  Quarantine a genuine cross-split component conflict and its descendants.
-  V3 proofs keep their actual measurement group, physical orientation and source;
-  an excluded first canonical owner must not poison a later independent group
-  that inherits one unambiguous historical split. Keep immutable proofs per
-  measurement group and select one earliest eligible representative per canonical
-  board and policy for fitting. Legacy v2 eligibility remains unchanged. Full
-  exports retain evidence; derived training files honor manifest exclusions.
-  Excluded raw aliases in the active corpus without qualifying prior observations
-  cannot impose new split constraints.
-  Keep legacy corpus memberships authoritative. An excluded active canonical
-  owner anchors historical membership only when that board had an observation
-  from its own measurement group, or a legacy NULL measurement slot, no later
-  than its exclusion. Another group's observation does not authorize that owner.
-  Otherwise retain the alias as raw provenance. V3 dataset split selection
-  follows the actual measurement group's durable assignment. Its own observation
-  no later than exclusion also preserves that group's historical membership when
-  another source owns the canonical alias.
-- Separate raw result retention from explicit supervised-input admission.
-  An output-only cross-split collision must block that exact group/board and
-  affected descendants, not unrelated inputs in the source run. Genuine admitted
-  root conflicts still quarantine the source. Preserve immutable exclusions and
-  splits; an owner-only recovery may append a resolution only after auditing
-  the original output-only trigger, all previously admitted/measured inputs and
-  the full affected branch. Pin the audit to current global anchor authority in
-  the atomic write, and derive received-parent admission context from verified
-  server evidence, never client metadata. A stale audit must fail without writes.
-  Apply effective group exclusions plus scoped input blocks to leasing, fitting,
-  replay completion and model ancestry. Export the effective filters and the
-  immutable historical exclusions/resolutions separately. Analysis receipts must
-  report post-materialization eligibility rather than a stale pre-child result.
-- CPU remains the default. Optional private GPU learning must finish an active
-  unit before switching off and retry failed GPU work from retained CPU weights
-  and optimizer state. Native training uses epoch boundaries; ORT inference
-  uses batch boundaries. The Site uses bounded parallel candidate workers and
-  actual backend metadata, with validation-only selection and the unchanged
-  parent eligible. A portable model's device=cpu does not describe training
-  hardware. ONNX export must verify CPU parity without replacing the frozen
-  JSON checkpoint. Rust placement search remains CPU; do not label it GPU search.
-- Limit private CNN decision capture to the supplied board and one selected
-  successor. Keep predicted values, allocated work, consumed work and measured
-  outcomes distinct. Ancestor feedback needs an exact physical recorded bridge
-  and witness references; it is a censored path lower bound, not a replacement
-  for the original versioned label. One-bag targets and coherent measured
-  two-bag path totals remain separate. Do not fabricate remaining-to-40/completion
-  cost labels from unfinished searches. The separate naga-completion-cost-v1
-  model, proof verifier, CPU trainer and Rust/WASM inference are implemented in
-  docs/COMPLETION_CNN.md's contract. Reuse trained v5 features only with exact
-  parent lineage; explicitly condition on remaining spins and the fixed rules.
-  Its target is best observed representative completed-path lock cost, not a
-  globally optimal or all-supplies bound. Unfinished proofs cannot supply exact
-  targets. No trained stage-two artifact is bundled or activated automatically.
-  Adaptive budgets and cost-head adoption still need separate policy evidence.
-  Keep the current mino controls.
-- Export complete immutable private snapshots separately from bounded training
-  samples, with cursor/count/hash checks and atomic local latest-pointer updates.
-  Preserve earlier snapshots. Fine-tuning requires the retained parent model and
-  parent dataset provenance, stable family/reflection splits, and validation-only
-  checkpoint selection with the unchanged parent as an eligible candidate.
+
+## Active GA transition — user instruction of 2026-11-01
+
+- GA means genetic algorithm. The active learning experiment evolves a small
+  vector of placement-evaluation coefficients. It does not require supervised
+  CNN labels, Expert Iteration, an external data service or a GPU. Keep the
+  initial coefficient vector explicitly untrained and distinct from a fitted
+  champion. Hand-designed features are an inductive bias, not a learned teacher.
+- The immediate objective is a certified 40 Spin Single completion within the
+  configured hard cap. The preferred 119-piece goal must not reject a valid
+  120–126-piece completion. Fewer locks matter after completion. Never report
+  generations, raw spins or the end of a configured run as learning complete.
+- The GA rollout must enumerate the canonical Sonic Drop reachable locks for
+  every unused piece. It must not call the baseline's bounded proposal beam,
+  structural teacher, pace/futility cuts or selective forecast frontier as its
+  fitness environment. Real collision, input reachability, spin/clear legality
+  and finite configured work/lock limits remain necessary. A greedy action
+  policy is still selective: full legal action enumeration is not exhaustive
+  search of all sequences and does not prove a global optimum.
+- Generate a fixed typed plan for each bag and certify it with the existing
+  exact clear-only-hold supply verifier. Keep all physics, quiet-safe coverage,
+  first-bag reflection assumptions, independent floors, cumulative chance and
+  terminal cost-CDF rules below. Do not adapt the fixed plan to each supply.
+  Do not hardcode an opener, reference route or a repeated loop.
+- Keep certified prefix and raw physical rollout metrics separate. A failed
+  bag ends the certified prefix. Any later exploratory rollout is auxiliary
+  fitness only, never a certified successor or 40L result. Champion selection
+  must prioritize certified completion/progress over auxiliary scores. Preserve
+  actual representative replay frames and the certificate context.
+- Use bounded CPU work with visible progress, pause and exact checkpoint resume.
+  Persist the population, RNG state, generation/member/episode position and
+  unfinished evaluator state. Reject malformed, incompatible and nonfinite
+  checkpoint values; untrusted persisted fields cannot fabricate physical or
+  supply proof. A checkpoint digest detects corruption, not arbitrary forgery.
+- Keep training, checkpoint-selection and held-out comparison seeds disjoint.
+  Evaluate a frozen policy without updating its weights on comparison seeds.
+  Different tie-break seeds are repeated searches of the same empty-board task,
+  not independent game problems or a broad generalization proof. Compare the
+  initializer, learned policy and accepted baseline under matched rules and
+  declared CPU/work budgets; report actual elapsed time and uncertified results.
+- Public GitHub Pages is an ordinary local search application. It must contain
+  no active contribution/relay/learning/model-upload route, Supabase client or
+  private service credential. Force the existing heuristic evaluator. Retire
+  old browser learning queues without reading or sending their payloads.
+- The existing owner-private Site is the GA workbench. Preserve its audience.
+  Run placement/fitness work in browser workers; use only that Site's D1/R2 for
+  durable GA checkpoints. Every save needs versioned schema, digest, idempotency
+  and optimistic revision handling. Disable legacy learning endpoints with 410
+  so stale clients cannot repopulate retired data.
+- The user explicitly ordered deletion of the old Site training data and
+  disconnection/deactivation of Supabase. This replaces earlier instructions
+  to retain CNN datasets/models/snapshots or keep collection enabled. Remove
+  only the dedicated legacy Site rows and object data, preserve new ga-v1 data,
+  and record bounded, retryable retirement progress. Remove retired runtime
+  secrets and pause the dedicated Supabase project after the cutover. Do not
+  alter unrelated projects, organization billing, access controls or Library
+  evidence. Historical source remains available through Git history.
+- Existing offline CNN compatibility code and its existing tests may remain
+  until a separate source cleanup; it is not an active UI, service, data or
+  learning contract. Do not reconnect it automatically. See docs/GA_TRAINING.md
+  for the active experiment and completion criteria.
+
+## Retained public search and comparison baseline
+
+The following probability/physics contracts also apply to GA certification.
+Baseline structural ranking, forecasts, beams, pace and scheduler heuristics
+apply only to the existing public SearchSession; they are not GA fitness rules.
+
 - The overall construction-success threshold defaults to 100%; preserve
   explicit saved user settings. The independent per-bag floor defaults to 100%
   and applies from bag two; the first-bag floor is separate, as below.
@@ -346,8 +152,7 @@
 - After the first bag, within the same bag depth and probability resource,
   completed-bag and terminal proposals use S + 0.45Q/(120+abs(Q)), so field
   quality cannot reverse one actual spin. Incomplete ordinary prefixes retain
-  the historical 0.95 coefficient to preserve preparation diversity; v2-v4
-  collectors also retain their original ordering. Keep composite
+  the historical 0.95 coefficient to preserve preparation diversity. Keep composite
   forecast/terrain quality separate from the actual-spin rank; apply that rank
   normalization once and add no bonuses afterwards.
   Normalize scheduling quality in spin units before dividing by productive
@@ -499,7 +304,7 @@
   Use at most two points of ordering jitter. A first-bag pursuit may refer to a
   next-bag finisher already spent in this inventory if its footprint remains
   preserved; actual clears release it. This is ordering, not permission to clear.
-- Keep the af8 preparation gradient: the selected low workspace uses explicit
+- Keep the retained preparation gradient: the selected low workspace uses explicit
   width/depth preference and weaker-side occupancy density, plus the increased
   concrete prepared-roof value recorded in STRUCTURAL_EVALUATION.md. Do not
   multiply these positive preferences down merely because the finishing spin
@@ -572,8 +377,7 @@
   A1=-10*q+6*p+0.25*dT, forecastLine=60*g1+18*g2+A1, and select lines with
   g1+0.3*g2+0.45*A1/(120+abs(A1)). Add the best readiness and independence
   evidence once. In structural mode, boundary quality is
-  2*terrain+forecast-12*unpaidHistory; the explicit cnn-v5 boundary replacement
-  above has its own score units.
+  2*terrain+forecast-12*unpaidHistory.
   Keep this direct raw composition; do not reintroduce 120*totalForecast or
   an additional 48-point saturation that suppresses all secondary differences.
   Never assume an unprobed prefix already has forecast spins. Extra work needs
@@ -631,7 +435,7 @@
   target assignments, goal and symmetry context. Never cache heuristic misses,
   interrupted work or probability cutoffs as failures. Shared immutable batches
   must not block workers, echo imports, cross run generations or merge success
-  sets. Mirror deduplication is for display/training identity only; actual physics
+  sets. Mirror deduplication is for display identity only; actual physics
   and certificates keep their original orientation. Retain two distinct final
   field identities per bag before truncation, plus the explicitly pinned route.
 - Default to the latest retained route and render Clearra piece colors without
@@ -645,10 +449,7 @@
   route resumes automatic best selection. At equal chance, six spins in three
   bags outranks nine in five, while both depths remain separately inspectable.
   Keep playback on the retained best route; the current-search tab shows only
-  its final board and has no autoplay or replay controls. A focused-learning
-  view shows its real origin board and next-bag target separately from deeper
-  observed continuations, never
-  inventing cumulative progress toward 40 clears from that isolated board.
+  its final board and has no autoplay or replay controls.
   The compact best-route field evaluation displays that route's final raw
   fieldQuality, not normalized rankingScore or the currently replayed frame.
   Same-ID quality improvements must update it; missing values remain unknown.

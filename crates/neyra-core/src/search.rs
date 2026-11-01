@@ -5,6 +5,7 @@
 //! retained here, with a 24-row SonicDropOnly physics backend.
 
 pub mod labels;
+pub(crate) mod ga_verify;
 mod transpositions;
 
 use crate::evaluator::SpinModel;
@@ -153,7 +154,7 @@ impl SearchConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisplayFrame {
     pub rows: [u16; HEIGHT],
@@ -166,7 +167,7 @@ pub struct DisplayFrame {
     pub spin: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdfPoint {
     pub pieces: u16,
@@ -315,7 +316,7 @@ pub struct ProgressSnapshot {
     pub best_spins_by_bag: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetOperation {
     pub piece: Piece,

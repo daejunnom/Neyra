@@ -2,6 +2,7 @@ pub mod physics;
 pub mod evaluator;
 pub mod completion;
 pub mod exploration;
+pub mod ga;
 pub mod search;
 mod srs_plus;
 mod structure;
@@ -9,6 +10,50 @@ pub mod supply;
 
 use search::{SearchConfig, SearchSession};
 use wasm_bindgen::prelude::*;
+
+/// Private, dataset-free GA. This API does not select a public evaluator or
+/// connect to any database. Use a worker and retain checkpoints as opaque JSON.
+#[wasm_bindgen]
+pub struct GaSession { trainer: ga::Trainer }
+
+#[wasm_bindgen]
+impl GaSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new(config_json: &str) -> Result<GaSession, JsValue> {
+        Ok(Self { trainer: ga::Trainer::new(ga::GaConfig::from_json(config_json)
+            .map_err(|e| JsValue::from_str(&e))?).map_err(|e| JsValue::from_str(&e))? })
+    }
+
+    #[wasm_bindgen(js_name = from_checkpoint_json)]
+    pub fn from_checkpoint_json(json: &str) -> Result<GaSession, JsValue> {
+        Ok(Self { trainer: ga::Trainer::from_checkpoint_json(json).map_err(|e| JsValue::from_str(&e))? })
+    }
+
+    pub fn advance(&mut self, work_budget: u32) -> Result<String, JsValue> {
+        self.advance_work(work_budget)?;
+        self.snapshot_json()
+    }
+
+    /// Advance without serializing a UI snapshot. Workers can update their
+    /// view on a wall-clock cadence instead of copying proof/frame metadata
+    /// after every small physics slice. True means training is complete.
+    pub fn advance_work(&mut self, work_budget: u32) -> Result<bool, JsValue> {
+        self.trainer.advance(work_budget).map_err(|e| JsValue::from_str(&e))?;
+        Ok(self.trainer.finished())
+    }
+
+    pub fn snapshot_json(&self) -> Result<String, JsValue> {
+        self.trainer.snapshot_json().map_err(|e| JsValue::from_str(&e))
+    }
+
+    pub fn checkpoint_json(&self) -> Result<String, JsValue> {
+        self.trainer.checkpoint_json().map_err(|e| JsValue::from_str(&e))
+    }
+
+    pub fn champion_json(&self) -> Result<String, JsValue> {
+        self.trainer.champion_json().map_err(|e| JsValue::from_str(&e))
+    }
+}
 
 /// Evaluate a current post-clear board without starting or advancing search.
 #[wasm_bindgen]

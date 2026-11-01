@@ -1,3 +1,0 @@
-[functions.neyra-contribute]
-verify_jwt = true
-entrypoint = "./functions/neyra-contribute/index.ts"

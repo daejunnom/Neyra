@@ -1,3 +1,5 @@
+> **종료된 CNN 경로의 역사적 문서입니다.** 2026-11-01 사용자 결정으로 공개 수집·전송과 비공개 CNN 학습을 종료하고 GA로 전환했습니다. 아래 계약은 현재 서비스나 자료 보존 의무가 아닙니다. 현재 구현과 완료 기준은 [GA_TRAINING.md](GA_TRAINING.md)를 따릅니다.
+
 # Naga Eyes spin evaluator and observation analysis
 
 Neyra separates public search from private CNN learning. Public GitHub Pages

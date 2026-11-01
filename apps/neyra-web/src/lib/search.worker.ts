@@ -1,5 +1,4 @@
-import type { Candidate, EngineCommand, EngineEvent, FocusedInput, FocusedSpinLabel, SearchSnapshot } from './types';
-import { NEXT_BAG_LABEL_CONFIG } from './learning-policy';
+import type { Candidate, EngineCommand, EngineEvent, SearchSnapshot } from './types';
 import { QUIET_TT_BATCH_ENTRIES, quietTranspositionBatch } from './transpositions';
 
 type WasmEngine = {
@@ -14,9 +13,7 @@ type WasmEngine = {
 };
 type WasmModule = {
   default(options: { module_or_path: string }): Promise<unknown>;
-  NeyraEngine: { new (config: string): WasmEngine; with_model(config: string, model: string): WasmEngine };
-  label_board(input: string, config: string): string;
-  spin_model_json(): string;
+  NeyraEngine: { new (config: string): WasmEngine };
 };
 
 const scope = globalThis as unknown as {
@@ -37,11 +34,6 @@ let detailedCurrentKey = '';
 let modulePromise: Promise<WasmModule> | undefined;
 let bestSpinsByBag = Array<number>(101).fill(0);
 let bagRecordVersions = new Map<string, string>();
-let loadedModule: WasmModule | null = null;
-let fixedLabelConfig = '';
-let learningEnabled = false;
-let pendingObservation: { id: string; input: FocusedInput } | null = null;
-let waitingObservationDecision = false;
 let transpositionSharing = false;
 
 function send(message: EngineEvent) { scope.postMessage(message); }
@@ -89,11 +81,6 @@ async function wasm(assetBase: string, build: string): Promise<WasmModule> {
   return modulePromise;
 }
 
-function recordCounters(value: SearchSnapshot) {
-  return { expanded: value.expanded, candidates: value.candidates,
-    verifiedCandidates: value.verifiedCandidates, pruned: value.pruned };
-}
-
 function readSnapshot(full = false): SearchSnapshot | null {
   if (!engine) return null;
   const compact = JSON.parse(engine.snapshot_compact()) as SearchSnapshot;
@@ -119,7 +106,7 @@ function readSnapshot(full = false): SearchSnapshot | null {
       // This is a selected certificate archive. Its aggregate search snapshot
       // is unrelated to that selection and would repeat other routes' replays.
       delete data.snapshot;
-      send({ type: 'bag-record', runId, candidate: record, data, counters: recordCounters(compact) });
+      send({ type: 'bag-record', runId, candidate: record, data });
     }
   }
   bagRecordVersions = retained;
@@ -154,7 +141,7 @@ function retainIncumbent(value: SearchSnapshot) {
     incumbentId = value.best.id;
     // The archive includes full frames even if this worker only sends compact
     // routine updates. Retain complete results across a worker failure.
-    send({ type: 'incumbent', runId, candidate: data.candidate, data, counters: recordCounters(value) });
+    send({ type: 'incumbent', runId, candidate: data.candidate, data });
   }
 }
 
@@ -197,23 +184,6 @@ tasks.port1.onmessage = ({ data }: MessageEvent<number>) => {
 function tick() {
   if (!running || !engine) return;
   try {
-    if (learningEnabled && pendingObservation && loadedModule) {
-      const job = pendingObservation;
-      pendingObservation = null;
-      // One selected field owns a bounded deep observation. The new one-bag
-      // target is separate from measured two-bag continuation evidence.
-      waitingObservationDecision = true;
-      try {
-        fixedLabelConfig ||= JSON.stringify(NEXT_BAG_LABEL_CONFIG);
-        const label = JSON.parse(loadedModule.label_board(JSON.stringify(job.input), fixedLabelConfig)) as FocusedSpinLabel;
-        send({ type: 'observation', runId, observationId: job.id, label });
-      } catch (error) {
-        send({ type: 'observation-error', runId, observationId: job.id,
-          message: error instanceof Error ? error.message : String(error) });
-      }
-      return;
-    }
-    if (learningEnabled && waitingObservationDecision) return;
     const started = performance.now();
     do { engine.advance(1); } while (performance.now() - started < 12);
     if (performance.now() - lastSnapshot >= 200) {
@@ -239,9 +209,6 @@ scope.onmessage = async ({ data }) => {
     detailedCurrentKey = '';
     bestSpinsByBag.fill(0);
     bagRecordVersions.clear();
-    pendingObservation = null;
-    waitingObservationDecision = false;
-    learningEnabled = data.learningEnabled === true;
     transpositionSharing = data.transpositionSharing === true;
     runId = data.runId;
     const requestedId = runId;
@@ -251,16 +218,11 @@ scope.onmessage = async ({ data }) => {
       // An explicit cancel while the module is loading must not allocate a
       // new engine afterwards. Already initialized archives remain available.
       if (!mayInitialize()) return;
-      loadedModule = module;
       // Pause/cancel can arrive while the async module is loading.
       // Public Pages always runs the established search. A stale saved config
       // or an old caller must not re-enable learned ordering or training here.
-      const configJson = JSON.stringify({ ...data.config, cnn_evaluation: false });
-      engine = data.config.board_evaluator === 'cnn-v5' && typeof data.modelJson === 'string'
-        ? module.NeyraEngine.with_model(configJson, data.modelJson) : new module.NeyraEngine(configJson);
-      const evaluator = (JSON.parse(engine.snapshot_compact()) as SearchSnapshot).evaluator;
-      if (evaluator?.fallbackReason) send({ type: 'warning', runId,
-        message: '선택한 CNN의 학습·형식·해시를 확인하지 못해 이번 실행은 기존 보드 평가기로 진행합니다.' });
+      const configJson = JSON.stringify({ ...data.config, cnn_evaluation: false, board_evaluator: 'heuristic' });
+      engine = new module.NeyraEngine(configJson);
       if (bestSpinsByBag.some((spins) => spins > 0)) {
         engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
       }
@@ -272,30 +234,6 @@ scope.onmessage = async ({ data }) => {
     return;
   }
   if (data.runId !== runId) return;
-  if (data.type === 'learning-mode') {
-    learningEnabled = data.enabled;
-    if (!learningEnabled) { pendingObservation = null; waitingObservationDecision = false; }
-    if (running) schedule();
-    return;
-  }
-  if (data.type === 'observe') {
-    if (learningEnabled && requested !== 'cancelled') {
-      pendingObservation = { id: data.observationId, input: data.input };
-      waitingObservationDecision = false;
-      if (running) schedule();
-    }
-    return;
-  }
-  if (data.type === 'observation-idle') {
-    pendingObservation = null;
-    waitingObservationDecision = false;
-    if (running) schedule();
-    return;
-  }
-  if (data.type === 'observation-wait') {
-    if (learningEnabled) waitingObservationDecision = true;
-    return;
-  }
   if (data.type === 'benchmarks') {
     try { if (requested !== 'cancelled') observeBenchmarks(data.bestSpinsByBag); }
     catch (error) { fail(error); }
@@ -355,8 +293,6 @@ scope.onmessage = async ({ data }) => {
       requested = 'cancelled';
       running = false;
       invalidateTask();
-      pendingObservation = null;
-      waitingObservationDecision = false;
       snapshot();
       send({ type: 'status', runId, status: 'cancelled' });
     }

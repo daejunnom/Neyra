@@ -16,6 +16,7 @@ import sys
 import numpy as np
 import onnxruntime as ort
 from spin_contract import (ARCHITECTURE, HASH, MAX_RECORD_BYTES, TASK, NEXT_BAG_TASK, REFINED_TASK, TARGET_DERIVATION,
+                           PRECISION_TASK, PRECISION_TARGET_DERIVATION, PRECISION_TRAINING_OBJECTIVE,
                            canonical_rows, integer, reject_constant, unique_keys, validate_config)
 
 CPU = "CPUExecutionProvider"
@@ -58,19 +59,22 @@ class SpinInference:
         self.model_path = Path(model_path)
         self.manifest = read_json(manifest_path or self.model_path.with_suffix(".manifest.json"))
         m = self.manifest
-        if (m.get("format") != FORMAT or m.get("task") not in {TASK, NEXT_BAG_TASK, REFINED_TASK} or m.get("architecture") != ARCHITECTURE
+        if (m.get("format") != FORMAT or m.get("task") not in {TASK, NEXT_BAG_TASK, REFINED_TASK, PRECISION_TASK} or m.get("architecture") != ARCHITECTURE
                 or m.get("input") != {"name": "occupancy", "shape": ["batch", 1, 24, 10], "encoding": "canonical-reflection-bottom-up-f32"}
                 or m.get("output") != {"name": "raw_scores", "shape": ["batch", 2], "countScale": 6}):
             raise ValueError("Unexpected ONNX model contract")
         for key in ("onnxSha256", "weightsSha256", "sourceModelSha256"):
             if not isinstance(m.get(key), str) or not HASH.fullmatch(m[key]):
                 raise ValueError("Missing ONNX model provenance")
-        integer(m.get("horizonBags"), "horizonBags", 2, 3)
-        refined = m["task"] == REFINED_TASK
+        precision = m["task"] == PRECISION_TASK
+        integer(m.get("horizonBags"), "horizonBags", 1 if precision else 2, 1 if precision else 3)
+        refined = precision or m["task"] == REFINED_TASK
         next_bag = refined or m["task"] == NEXT_BAG_TASK
-        config = validate_config(m.get("labelConfig"), 4 if refined else 3 if next_bag else 2)
-        if refined and m.get("targetDerivation") != TARGET_DERIVATION:
-            raise ValueError("ONNX v4 must retain its measured target derivation")
+        config = validate_config(m.get("labelConfig"), 5 if precision else 4 if refined else 3 if next_bag else 2)
+        if refined and m.get("targetDerivation") != (PRECISION_TARGET_DERIVATION if precision else TARGET_DERIVATION):
+            raise ValueError("ONNX refined models must retain their versioned measured target derivation")
+        if precision and m.get("trainingObjective") != PRECISION_TRAINING_OBJECTIVE:
+            raise ValueError("ONNX v5 must retain its asymmetric spin-underestimation objective")
         self.target_horizon = 1 if next_bag else m["horizonBags"]
         if (m["horizonBags"] != config["horizonBags"]
                 or next_bag and m.get("targetHorizonBags") != 1
@@ -113,13 +117,20 @@ class SpinInference:
         if (metadata.get("neyra.task", TASK) != self.manifest["task"]
                 or metadata.get("neyra.targetHorizonBags", str(self.manifest["horizonBags"])) != str(self.target_horizon)):
             raise ValueError("ONNX task metadata cannot reinterpret retained output heads")
-        if self.manifest["task"] == REFINED_TASK:
+        if self.manifest["task"] in {REFINED_TASK, PRECISION_TASK}:
             try:
                 derivation = json.loads(metadata.get("neyra.targetDerivation", "null"), object_pairs_hook=unique_keys, parse_constant=reject_constant)
             except (ValueError, TypeError):
-                raise ValueError("ONNX v4 has invalid target derivation metadata") from None
-            if derivation != TARGET_DERIVATION:
-                raise ValueError("ONNX graph and manifest disagree on the v4 target derivation")
+                raise ValueError("ONNX has invalid refined target derivation metadata") from None
+            if derivation != self.manifest["targetDerivation"]:
+                raise ValueError("ONNX graph and manifest disagree on the refined target derivation")
+        if self.manifest["task"] == PRECISION_TASK:
+            try:
+                objective = json.loads(metadata.get("neyra.trainingObjective", "null"), object_pairs_hook=unique_keys, parse_constant=reject_constant)
+            except (ValueError, TypeError):
+                raise ValueError("ONNX v5 has invalid training objective metadata") from None
+            if objective != self.manifest["trainingObjective"]:
+                raise ValueError("ONNX graph and manifest disagree on the v5 training objective")
         return session
 
     def set_gpu_enabled(self, enabled):

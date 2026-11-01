@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from spin_contract import (EXPLORATION_POLICY, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, CONCENTRATED_POLICY,
+from spin_contract import (EXPLORATION_POLICY, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, CONCENTRATED_POLICY, PRECISION_POLICY,
                            canonical_rows, integer, refined_selection_key, refined_rank,
                            read_jsonl, reject_constant, unique_keys, validate_label,
                            validate_model, validate_sample, validate_refined_record, validate_refined_evidence)
@@ -201,10 +201,15 @@ def manifest_exclusions(manifest):
     return groups, hashlib.sha256(encoded).hexdigest()
 
 
-def excluded_label_groups(record, exclusions):
+def excluded_label_groups(record, exclusions, *, actual_only=False):
     if not exclusions:
         return set()  # Old snapshots retain exactly their previous behavior.
     source = record["input"]["source"]
+    if actual_only and (record.get("schemaVersion") in (3, 4, 5) or record.get("kind") == "refined-next-bag-target"):
+        # Canonical aliases can belong to another run. Eligibility follows the
+        # actual measurement owner, not the first owner of the shared occupancy.
+        group = measurement_group(record)
+        return {group} & exclusions
     candidates = {bounded_text(source["family"], "source family")}
     for container, key in ((source, "group"), (record, "measurementGroup")):
         if key in container:
@@ -215,6 +220,46 @@ def excluded_label_groups(record, exclusions):
         run = bounded_text(source["runId"], "source runId", 128)
         candidates.update((run, "search:" + run))
     return candidates & exclusions
+
+
+def measurement_group(record):
+    source = record["input"]["source"]
+    return bounded_text(record.get("evidence", {}).get("measurementGroup",
+                        record.get("measurementGroup", source.get("group", source["family"]))), "measurement group")
+
+
+def manifest_input_exclusions(manifest):
+    """Effective exact input blocks; historical group events remain audit-only."""
+    entries = manifest.get("excludedTrainingInputs", [])
+    if not isinstance(entries, list) or len(entries) > MAX_EXCLUDED_GROUPS:
+        raise ValueError("Manifest input exclusions exceed their bounded contract")
+    blocked = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"group", "canonicalBoardId", "reason", "excludedAt"}:
+            raise ValueError("Malformed manifest input exclusion")
+        board = entry["canonicalBoardId"]
+        if not isinstance(board, str) or not re.fullmatch("[0-9a-f]{64}", board):
+            raise ValueError("Invalid excluded canonical board identity")
+        group = bounded_text(entry["group"], "excluded input group")
+        key = group, board
+        if key in blocked:
+            raise ValueError("Duplicate manifest input exclusion")
+        # Reuse the existing bounded reason/time contract, without collapsing
+        # independent boards in the same group into a whole-group exclusion.
+        manifest_exclusions({**{k: manifest[k] for k in ("corpus", "createdAt") if k in manifest},
+                             "excludedTrainingGroups": [{k: entry[k] for k in ("group", "reason", "excludedAt")}]})
+        blocked.add(key)
+    encoded = (json.dumps(sorted(entries, key=lambda e: (e["group"], e["canonicalBoardId"])), sort_keys=True,
+                          ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    return blocked, hashlib.sha256(encoded).hexdigest()
+
+
+def excluded_label_inputs(record, exclusions, corpus):
+    if not exclusions or corpus != "public-results-v1" or record.get("schemaVersion") == 2:
+        return set()
+    canonical = ",".join(map(str, canonical_rows(record["input"]["rows"])))
+    board = hashlib.sha256(("public-results-v1:" + canonical).encode()).hexdigest()
+    return {(measurement_group(record), board)} & exclusions
 
 
 def manifest_source_groups(manifest, maximum):
@@ -264,6 +309,7 @@ def validate_source_occurrence(record, record_id, registry, corpus):
 def download_snapshot(origin, token, opener, identity, destination, *, manifest_hash=None,
                       max_records=250000, max_bytes=512 * 1024 * 1024):
     identity = snapshot_id(identity)
+    export_identity = identity
     base = "/api/learning/exports/" + identity
     manifest, encoded, digest = get_verified(origin, token, opener, base + "/manifest")
     if manifest_hash is not None and manifest_hash != digest:
@@ -284,6 +330,8 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
     if sum(counts.values()) > max_records:
         raise ValueError("Snapshot exceeds --max-records; raise the explicit local download bound")
     exclusions, exclusion_hash = manifest_exclusions(manifest)
+    input_exclusions, input_exclusion_hash = manifest_input_exclusions(manifest)
+    scoped_exclusions = "excludedTrainingInputs" in manifest
     registry = manifest_source_groups(manifest, max_records)
     if "sources" in counts and "trainingSourceGroups" not in manifest:
         raise ValueError("Source occurrences require the immutable source-group registry")
@@ -294,33 +342,35 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
     (folder / "pages").mkdir()
     (folder / "manifest.json").write_bytes(encoded)
     downloaded_bytes, observed, file_hashes = len(encoded), {}, {}
-    policy_counts = {POLICY: 0, EXPLORATION_POLICY: 0, NEXT_BAG_POLICY: 0, CONCENTRATED_POLICY: 0}
+    policy_counts = {POLICY: 0, EXPLORATION_POLICY: 0, NEXT_BAG_POLICY: 0, CONCENTRATED_POLICY: 0, PRECISION_POLICY: 0}
     eligible_counts = dict(policy_counts)
     excluded_counts = dict(policy_counts)
     selected_counts = dict(policy_counts)
     duplicate_counts = dict(policy_counts)
     next_bag_representatives = {}
     applied_exclusions = set()
+    applied_input_exclusions = set()
     fixed_path, exploration_path = folder / "fixed-labels.jsonl", folder / "exploration-labels.jsonl"
     next_bag_path = folder / "next-bag-fixed-labels.jsonl"
     concentrated_path, refined_path = folder / "refined-observations.jsonl", folder / "refined-targets.jsonl"
+    precision_path, precision_refined_path = folder / "precision-observations.jsonl", folder / "precision-targets.jsonl"
     proof_path = folder / "observations-index.jsonl"
     raw_proofs, refined_records = {}, []
 
     def remember_proof(identity, label):
         if not isinstance(identity, str) or not re.fullmatch("[0-9a-f]{64}", identity):
-            raise ValueError("A v4 proof requires its immutable observation digest")
+            raise ValueError("A refined proof requires its immutable observation digest")
         validate_label(label)
-        if label["schemaVersion"] != 4:
+        if label["schemaVersion"] not in (4, 5):
             raise ValueError("A refinement evidence artifact contains another observation task")
         if identity in raw_proofs and raw_proofs[identity] != label:
             raise ValueError("An immutable observation identity has conflicting raw evidence")
         raw_proofs[identity] = label
 
     try:
-        with fixed_path.open("xb") as fixed_file, exploration_path.open("xb") as exploration_file, next_bag_path.open("xb") as next_bag_file, concentrated_path.open("xb") as concentrated_file:
+        with fixed_path.open("xb") as fixed_file, exploration_path.open("xb") as exploration_file, next_bag_path.open("xb") as next_bag_file, concentrated_path.open("xb") as concentrated_file, precision_path.open("xb") as precision_file:
             policy_files = {POLICY: fixed_file, EXPLORATION_POLICY: exploration_file, NEXT_BAG_POLICY: next_bag_file,
-                            CONCENTRATED_POLICY: concentrated_file}
+                            CONCENTRATED_POLICY: concentrated_file, PRECISION_POLICY: precision_file}
             for kind in kinds:
                 cursor, page_number, seen = "0", 0, set()
                 page_limit = 1 if kind == "models" else 16
@@ -352,7 +402,7 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
                                 validate_sample(record)
                             elif kind == "labels":
                                 validate_label(record)
-                                if record["schemaVersion"] == 4:
+                                if record["schemaVersion"] in (4, 5):
                                     remember_proof(record_id, record)
                             elif kind == "models":
                                 validate_model(record)
@@ -369,7 +419,7 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
                                 refined_records.append(record)
                             elif record.get("id") != record_id:
                                 raise ValueError("Export metadata identity mismatch")
-                            if kind == "traces" and record.get("kind") == "v4-refinement-evidence":
+                            if kind == "traces" and record.get("kind") in {"v4-refinement-evidence", "v5-refinement-evidence"}:
                                 payload = record.get("payload")
                                 if (not isinstance(payload, dict) or payload.get("artifactKey") != "observations/" + str(record.get("observationId")) + ".json"):
                                     raise ValueError("Refinement evidence trace has an incoherent artifact reference")
@@ -379,10 +429,12 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
                             stream_hash.update(data)
                             if kind == "labels":
                                 policy_counts[record["policy"]] += 1
-                                excluded = excluded_label_groups(record, exclusions)
-                                if excluded:
+                                excluded = excluded_label_groups(record, exclusions, actual_only=scoped_exclusions)
+                                excluded_inputs = excluded_label_inputs(record, input_exclusions, manifest.get("corpus"))
+                                if excluded or excluded_inputs:
                                     excluded_counts[record["policy"]] += 1
                                     applied_exclusions.update(excluded)
+                                    applied_input_exclusions.update(excluded_inputs)
                                 else:
                                     eligible_counts[record["policy"]] += 1
                                     selected = True
@@ -432,9 +484,11 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
             if identity not in raw_proofs:
                 raise ValueError("A refined target's original proof is missing from the complete snapshot")
             validate_refined_evidence(record, raw_proofs[identity])
-            excluded = excluded_label_groups(record, exclusions)
-            if excluded:
+            excluded = excluded_label_groups(record, exclusions, actual_only=scoped_exclusions)
+            excluded_inputs = excluded_label_inputs(record, input_exclusions, manifest.get("corpus"))
+            if excluded or excluded_inputs:
                 refined_excluded += 1; applied_exclusions.update(excluded)
+                applied_input_exclusions.update(excluded_inputs)
                 continue
             group, split = record["input"]["source"]["group"], record["input"]["source"]["split"]
             if group not in registry or registry[group]["split"] != split:
@@ -447,25 +501,29 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
             if previous is None or refined_rank(record) > refined_rank(previous[1]):
                 refined_best[key] = position, record
         selected_refined = [record for _, record in sorted(refined_best.values(), key=lambda item: item[0])]
-        with refined_path.open("xb") as stream:
+        with refined_path.open("xb") as stream, precision_refined_path.open("xb") as precise_stream:
             for record in selected_refined:
-                stream.write(record_bytes(record))
+                (precise_stream if record["config"]["observationVersion"] == 5 else stream).write(record_bytes(record))
         with proof_path.open("xb") as stream:
             for identity, label in raw_proofs.items():
                 stream.write(record_bytes({"id": identity, "label": label}))
-        for path in (fixed_path, exploration_path, next_bag_path, concentrated_path, refined_path, proof_path):
+        for path in (fixed_path, exploration_path, next_bag_path, concentrated_path, refined_path, precision_path, precision_refined_path, proof_path):
             digest_file = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest_file.update(chunk)
             file_hashes[path.name] = digest_file.hexdigest()
-        receipt = {"schemaVersion": 1, "snapshotId": identity, "manifestSha256": digest,
+        receipt = {"schemaVersion": 1, "snapshotId": export_identity, "manifestSha256": digest,
                    "counts": observed, "labelPolicies": policy_counts, "filesSha256": file_hashes,
                    "trainingSelection": {
                        "schemaVersion": 1, "corpus": manifest.get("corpus"),
                        "exclusionManifestPresent": "excludedTrainingGroups" in manifest,
                        "excludedTrainingGroupsDeclared": len(exclusions),
                        "excludedTrainingGroupsApplied": sorted(applied_exclusions),
+                       "excludedTrainingInputsDeclared": len(input_exclusions),
+                       "excludedTrainingInputsApplied": [{"group": g, "canonicalBoardId": b} for g, b in sorted(applied_input_exclusions)],
+                       "excludedTrainingInputsSha256": input_exclusion_hash,
+                       "inputExclusionHashAlgorithm": "sha256-utf8-json-sorted-group-board-and-keys-newline-v1",
                        "sourceGroupRegistryPresent": "trainingSourceGroups" in manifest,
                        "sourceGroupCount": len(registry),
                        "excludedTrainingGroupsSha256": exclusion_hash,
@@ -479,17 +537,19 @@ def download_snapshot(origin, token, opener, identity, destination, *, manifest_
                                  exploration_path.name: {"records": selected_counts[EXPLORATION_POLICY], "sha256": file_hashes[exploration_path.name]},
                                  next_bag_path.name: {"records": selected_counts[NEXT_BAG_POLICY], "sha256": file_hashes[next_bag_path.name]},
                                  concentrated_path.name: {"records": selected_counts[CONCENTRATED_POLICY], "sha256": file_hashes[concentrated_path.name]},
-                                 refined_path.name: {"records": len(selected_refined), "sha256": file_hashes[refined_path.name]},
+                                 refined_path.name: {"records": sum(r["config"]["observationVersion"] == 4 for r in selected_refined), "sha256": file_hashes[refined_path.name]},
+                                 precision_path.name: {"records": selected_counts[PRECISION_POLICY], "sha256": file_hashes[precision_path.name]},
+                                 precision_refined_path.name: {"records": sum(r["config"]["observationVersion"] == 5 for r in selected_refined), "sha256": file_hashes[precision_refined_path.name]},
                                  proof_path.name: {"records": len(raw_proofs), "sha256": file_hashes[proof_path.name]}},
-                       "rule": "Exclude labels whose measurement or source group/family/run is explicitly quarantined. Preserve historical source-component membership without excluding previously valid peers. For v3, choose the first remaining insertion-order proof per canonical board, policy and exact config; preserve its actual orientation. Keep v2 fixed, v2 exploration and v3 one-bag labels separate; raw evidence remains complete.",
+                       "rule": "Use current effective group blocks and exact (measurement group, canonical board) input blocks; historical exclusion/resolution events are audit-only. V3/v4/v5 eligibility follows the actual measurement owner; v2 retains historical source/family/run rules. V3 keeps its earliest eligible proof; v4/v5 choose the strongest replayed target within the same canonical board, exact policy and work scope. Raw evidence remains complete.",
                    },
                    "responseBytesVerified": downloaded_bytes, "complete": True,
-                   "scope": "Complete retained snapshot; raw proofs, source occurrences and received traces remain unchanged. Fit v2 with fixed-labels.jsonl, v3 with next-bag-fixed-labels.jsonl, or v4 with refined-targets.jsonl plus observations-index.jsonl. Never mix tasks or fit raw v4 observations. V4 winners are selected only after exclusions; historical replay attempts and validation rosters are retained."}
+                   "scope": "Complete retained snapshot; raw proofs, source occurrences and received traces remain unchanged. Fit v2 with fixed-labels.jsonl, v3 with next-bag-fixed-labels.jsonl, v4 with refined-targets.jsonl, or v5 with precision-targets.jsonl; refined tasks also require observations-index.jsonl. Never mix tasks or fit raw v4/v5 observations. Derived winners are selected only after exclusions; historical replay attempts and validation rosters are retained."}
         (folder / "download-receipt.json").write_bytes(record_bytes(receipt))
         # Only complete, verified snapshots can become the local latest pointer.
         temporary = destination / ("latest-" + str(uuid.uuid4()) + ".tmp")
-        temporary.write_bytes(record_bytes({"snapshotId": identity, "manifestSha256": digest,
-                                            "directory": identity, "complete": True}))
+        temporary.write_bytes(record_bytes({"snapshotId": export_identity, "manifestSha256": digest,
+                                            "directory": export_identity, "complete": True}))
         temporary.replace(destination / "latest.json")
         return receipt
     except Exception:
@@ -535,8 +595,8 @@ def main():
                           "task": tasks[0] if len(tasks) == 1 else None, "tasks": tasks}))
     elif a.kind == "model":
         value = validate_model(read_json(a.model))
-        if value["schemaVersion"] == 4:
-            raise ValueError("V4 uploads require the private Site's durable training/prepare and training/complete replay lease. Offline checkpoints cannot bypass source/ancestor eligibility checks through the generic model endpoint; retain this local artifact for review.")
+        if value["schemaVersion"] in (4, 5):
+            raise ValueError("V4/V5 uploads require the private Site's durable training/prepare and training/complete replay lease. Offline checkpoints cannot bypass source/ancestor eligibility checks through the generic model endpoint; retain this local artifact for review.")
         report = read_json(a.report)
         if (report.get("modelId") != value["modelId"] or report.get("datasetSha256") != value["datasetSha256"]
                 or report.get("task") != value["task"] or report.get("schemaVersion") != value["schemaVersion"]):

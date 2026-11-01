@@ -71,7 +71,14 @@
   $: selectedRoute = snapshot?.selectedCandidate ?? null;
   $: bestRoute = selectedRoute ?? recommendedRoute;
   $: bagCandidates = snapshot?.bestByBag ?? [];
-  $: depthGroup = bagCandidates.find((group) => group.bagCount === selectedDepth) ?? bagCandidates[bagCandidates.length - 1] ?? null;
+  $: deepestCandidateBag = bagCandidates.reduce((depth, group) => Math.max(depth, group.bagCount), 0);
+  $: depthLimit = Math.min(100, Math.max(Math.floor(displayedConfig.max_pieces / 7), deepestCandidateBag));
+  $: depthOptions = Array.from({ length: depthLimit }, (_, index) => ({
+    bagCount: index + 1, group: bagCandidates.find((group) => group.bagCount === index + 1)
+  }));
+  $: displayedDepth = selectedDepth > 0 && selectedDepth <= depthLimit ? selectedDepth :
+    deepestCandidateBag || (depthLimit > 0 ? 1 : 0);
+  $: depthGroup = bagCandidates.find((group) => group.bagCount === displayedDepth) ?? null;
   $: learningFocus = snapshot?.learningFocus;
   $: focusedBoard = view === 'current' && learningFocus?.enabled ? learningFocus.rows : null;
   $: foundationOnly = !!bestRoute && !bestRoute.complete && bestRoute.bagCount === 1;
@@ -214,6 +221,7 @@
     notice = '';
     elapsedMs = 0;
     snapshot = null;
+    selectedDepth = 0;
     view = 'best';
     frameIndex = -1;
     playing = false;
@@ -445,10 +453,10 @@
           {/if}
           <section class="depth-results" aria-label="가방 수별 최적과 차선 후보">
             <label for="candidate-depth">가방 수별 후보</label>
-            <select id="candidate-depth" aria-label="후보 가방 수" value={depthGroup?.bagCount ?? 0}
-              disabled={!depthGroup} onchange={(event) => selectedDepth = Number(event.currentTarget.value)}>
-              {#if !depthGroup}<option value={0}>후보 대기 중</option>{/if}
-              {#each bagCandidates as group (group.bagCount)}<option value={group.bagCount}>{group.bagCount}가방 · {group.best.spins}스핀</option>{/each}
+            <select id="candidate-depth" aria-label="후보 가방 수" value={displayedDepth}
+              disabled={depthLimit === 0} onchange={(event) => selectedDepth = Number(event.currentTarget.value)}>
+              {#if depthLimit === 0}<option value={0}>완전한 가방 후보 없음</option>{/if}
+              {#each depthOptions as option (option.bagCount)}<option value={option.bagCount}>{option.bagCount}가방 · {option.group ? `${option.group.best.spins}스핀` : '후보 없음'}</option>{/each}
             </select>
             {#if depthGroup}
               {#each [depthGroup.best, depthGroup.runnerUp] as item, rank}
@@ -462,7 +470,8 @@
                   </button>
                 {:else}<span class="depth-empty">차선 후보 대기 중</span>{/if}
               {/each}
-            {:else}<p>같은 깊이의 두 경로를 비교해요.</p>{/if}
+            {:else}<p>{displayedDepth > 0 ? `${displayedDepth}가방의 검증된 후보를 아직 찾지 못했어요.` : '탐색 상한에 완전한 가방이 포함되지 않아요.'}
+              {#if deepestCandidateBag > 0}확인된 최대 깊이는 {deepestCandidateBag}가방입니다.{/if}</p>{/if}
           </section>
         </div>
       </div>

@@ -3,6 +3,7 @@ export const MAX_OBSERVATION_BYTES = 512 * 1024;
 const REVISION = 'sha256:05af5a80cc12bc8316d3f98d8a7c51a92c1883fb831f5a476c9880c5d516cd9f';
 const NEXT_BAG_REVISION = 'sha256:fc94c1a31763439465ab676db88ed5ba746696885451a1848b39f8adf70788d4';
 const REFINED_REVISION = 'sha256:78bd36da629a393e140b433eee6eaa9f08ddcda80fd322a857d099a91b75acff';
+const PRECISION_REVISION = 'sha256:f0a00092a8b50034ede285d4afe519497b3f372cf25f13a1eef701f3df11a0dc';
 const RULES = 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
 type Obj = Record<string, unknown>;
 export class ObservationError extends Error {
@@ -79,21 +80,22 @@ function countOrNull(value: unknown, high: number): number | null { return value
 
 /** V3 has a one-bag target and a separate, replayed two-bag observation. */
 function validateNextBag(label: Obj, board: number[], refined = false): void {
+  const precision = label.schemaVersion === 5, horizon = precision ? 1 : 2;
   const target = obj(label.targets, ['foundSpin', 'observedSpins']), observed = int(target.observedSpins, 0, 6);
   requireValue(target.foundSpin === (observed > 0));
   const m = obj(label.measured, ['maxReachableObservedSpins', 'geometricWholeBagChains', 'productiveGeometricWholeBagChains', 'certifiedWholeBagChains', 'productiveCertifiedWholeBagChains', 'maxCertifiedObservedSpins', 'depths', 'workUsed', 'generationWork', 'verificationWork', 'geometricPlacementsConsidered', 'canonicalSuppliesChecked', 'quietPolicyRejections', 'supplyRejections', 'graphOverflows', 'nodeCapacityDrops', 'censored', 'stopReason', 'evidenceKind', 'distinctness', 'workUnit', 'lookahead', ...(refined ? ['dependencyWork'] : [])]);
-  const maximum = int(m.maxReachableObservedSpins, observed, 12), work = int(m.workUsed, 0, 131072);
+  const maximum = int(m.maxReachableObservedSpins, observed, horizon * 6), work = int(m.workUsed, 0, precision ? 524288 : 131072);
   requireValue(m.censored === true && int(m.generationWork, 0, work) + int(m.verificationWork, 0, work) + (refined ? int(m.dependencyWork, 0, work) : 0) === work);
   for (const key of ['geometricPlacementsConsidered', 'quietPolicyRejections', 'supplyRejections', 'graphOverflows', 'nodeCapacityDrops']) int(m[key]);
   requireValue(m.certifiedWholeBagChains === 0 && m.productiveCertifiedWholeBagChains === 0 && m.maxCertifiedObservedSpins === null
     && m.canonicalSuppliesChecked === 0 && m.quietPolicyRejections === 0 && m.supplyRejections === 0 && m.graphOverflows === 0
     && list(label.certifiedWitnesses, 0, 0).length === 0, 'Input reachability is not a P7 certificate');
-  requireValue((refined ? ['phase_quotas', 'bounded_refinement_complete'] : ['work_budget', 'bounded_frontier_exhausted', 'witness_capacity']).includes(String(m.stopReason)));
-  requireValue(m.evidenceKind === (refined ? 'refined input-reachable one-bag targets per supplied board and selected actual first-bag endpoint; no P7 or quiet-safe coverage claimed' : 'input-reachable prefixes and replayed whole-bag chains; no P7 or quiet-safe coverage claimed'));
-  requireValue(m.distinctness === (refined ? 'physical continuation states by board, actual spins and inherited debt within each origin; per-arm local maxima remain separate; not supply orders or success probability' : 'whole-bag continuation states include physical board, depth, actual spin count and inherited debt; one retained physical path per state; not supply orders or success probability'));
-  requireValue(m.workUnit === (refined ? 'one bounded GenerationJob.advance, one retained lock replay, or one origin-only component target query; replay budgets reserved; P7 verification disabled' : 'one bounded GenerationJob.advance, or one retained lock replay; seven replay units per whole-bag witness; forecast refinement and P7 verification disabled'));
+  requireValue((precision ? ['frontier_exhausted', 'generation_quota', 'spin_capacity_reached'] : refined ? ['phase_quotas', 'bounded_refinement_complete'] : ['work_budget', 'bounded_frontier_exhausted', 'witness_capacity']).includes(String(m.stopReason)));
+  requireValue(m.evidenceKind === (precision ? 'precise input-reachable one-bag maximum from one supplied board; no P7 or quiet-safe coverage claimed' : refined ? 'refined input-reachable one-bag targets per supplied board and selected actual first-bag endpoint; no P7 or quiet-safe coverage claimed' : 'input-reachable prefixes and replayed whole-bag chains; no P7 or quiet-safe coverage claimed'));
+  requireValue(m.distinctness === (precision ? 'oriented physical occupancy and remaining inventory with spin dominance; placement-order histories share future expansion; physical witnesses retain original orientation' : refined ? 'physical continuation states by board, actual spins and inherited debt within each origin; per-arm local maxima remain separate; not supply orders or success probability' : 'whole-bag continuation states include physical board, depth, actual spin count and inherited debt; one retained physical path per state; not supply orders or success probability'));
+  requireValue(m.workUnit === (precision ? 'one complete reachable-lock query for one unused piece on one physical state, one retained lock replay, or one origin-only component target query; no second inventory' : refined ? 'one bounded GenerationJob.advance, one retained lock replay, or one origin-only component target query; replay budgets reserved; P7 verification disabled' : 'one bounded GenerationJob.advance, or one retained lock replay; seven replay units per whole-bag witness; forecast refinement and P7 verification disabled'));
   const lookahead = obj(m.lookahead, ['targetHorizonBags', 'requestedBags', 'deepestAttemptedBag', 'deepestCompletedBag', 'deepestReachedPlacements', 'reachableWholeBagChains', 'witnessCapacity', 'capacityDrops', 'duplicateContinuations', 'bestTwoBagPath']);
-  requireValue(lookahead.targetHorizonBags === 1 && lookahead.requestedBags === 2 && lookahead.witnessCapacity === 32);
+  requireValue(lookahead.targetHorizonBags === 1 && lookahead.requestedBags === horizon && lookahead.witnessCapacity === 32);
   int(lookahead.capacityDrops); int(lookahead.duplicateContinuations);
   const rawWitnesses = list(label.reachableWholeBagWitnesses, 0, 32);
   requireValue(lookahead.reachableWholeBagChains === rawWitnesses.length && m.geometricWholeBagChains === rawWitnesses.length
@@ -101,7 +103,7 @@ function validateNextBag(label: Obj, board: number[], refined = false): void {
   const byId = new Map<number, {bags: number; rows: number[]; spins: number; parentId: number | null}>();
   for (const raw of rawWitnesses) {
     const w = obj(raw, ['id', 'parentId', 'bags', 'startRows', 'endRows', 'startSpins', 'endSpins', 'deletedRows', 'targets', 'representativeQueue', 'representativeInputs', 'frames', 'trust', 'wholeBag']);
-    const id = int(w.id, 1), bags = int(w.bags, 1, 2), parentId = w.parentId === null ? null : int(w.parentId, 1);
+    const id = int(w.id, 1), bags = int(w.bags, 1, horizon), parentId = w.parentId === null ? null : int(w.parentId, 1);
     const parent = parentId === null ? undefined : byId.get(parentId);
     requireValue(!byId.has(id) && (parentId === null || parent) && bags === (parent?.bags ?? 0) + 1
       && w.trust === 'input-reachable' && w.wholeBag === true);
@@ -124,8 +126,8 @@ function validateNextBag(label: Obj, board: number[], refined = false): void {
   }
   const records = [...byId.values()], deepest = records.length ? Math.max(...records.map(w => w.bags)) : 0;
   requireValue(m.productiveGeometricWholeBagChains === records.filter(w => w.spins > 0).length && lookahead.deepestCompletedBag === deepest);
-  int(lookahead.deepestAttemptedBag, Math.max(1, deepest), 2);
-  for (const [i, raw] of list(m.depths, 2, 2).entries()) {
+  int(lookahead.deepestAttemptedBag, Math.max(1, deepest), horizon);
+  for (const [i, raw] of list(m.depths, horizon, horizon).entries()) {
     const d = obj(raw, ['bags', 'geometricWholeBagChains', 'productiveGeometricWholeBagChains', 'certifiedWholeBagChains', 'productiveCertifiedWholeBagChains', 'maxGeometricWholeBagSpins', 'maxCertifiedSpins']);
     const group = records.filter(w => w.bags === i + 1);
     requireValue(d.bags === i + 1 && d.geometricWholeBagChains === group.length
@@ -139,7 +141,7 @@ function validateNextBag(label: Obj, board: number[], refined = false): void {
     const r = obj(raw, ['certifiedParentId', 'completedParentBags', 'additionalPlacements', 'observedSpins', 'targets', 'frames', ...(hasParent ? ['reachableParentId'] : [])]);
     const parentId = r.reachableParentId ?? null, parent = parentId === null ? undefined : byId.get(int(parentId, 1));
     requireValue(r.certifiedParentId === null && (parentId === null || parent));
-    const bags = int(r.completedParentBags, 0, firstBag ? 0 : 1), placements = int(r.additionalPlacements, 1, 7);
+    const bags = int(r.completedParentBags, 0, firstBag ? 0 : horizon - 1), placements = int(r.additionalPlacements, 1, 7);
     requireValue(bags === (parent?.bags ?? 0)); targets(r.targets, placements);
     const end = frames(r.frames, parent?.rows ?? board, parent?.spins ?? 0, bags * 7, placements, r.targets);
     requireValue(end.spins === r.observedSpins && end.spins <= maximum && (!firstBag || end.spins === observed));
@@ -201,12 +203,14 @@ function searchObservation(raw: unknown, start: number[], quota: number, attempt
 }
 
 function validateRefinement(label: Obj): Obj {
+  const precision = label.schemaVersion === 5;
   const r = refObject(label.refinement), m = refObject(label.measured), config = refObject(label.config);
-  exact(r, ["schemaVersion", "policy", "selectionSeed", "selectionScoreMin", "selectionScoreMax", "selectionBandCount", "candidatePoolCapacity", "candidatePoolSize", "candidatePoolDrops", "candidateDuplicates", "armLimit", "armQuota", "dependencyWorkBudget", "dependencyWorkUsed", "proofCapacity", "proofCapacityDrops", "root", "candidates", "arms"]);
-  const workBudget = int(config.workBudget, 1024, 4194304), maxNodes = int(config.maxNodes, 4, 4096), attemptsLimit = int(config.attemptsPerNode, 1, 64);
+  const workBudget = int(config.workBudget, 1024, 4194304), maxNodes = int(config.maxNodes, precision ? 1 : 4, 256), attemptsLimit = int(config.attemptsPerNode, 1, precision ? 1 : 16);
+  exact(r, ["schemaVersion", "policy", "selectionSeed", "selectionScoreMin", "selectionScoreMax", "selectionBandCount", "candidatePoolCapacity", "candidatePoolSize", "candidatePoolDrops", "candidateDuplicates", "armLimit", "armQuota", "dependencyWorkBudget", "dependencyWorkUsed", "proofCapacity", "proofCapacityDrops", "root", "candidates", "arms", ...(precision ? ["intraBag"] : [])]);
   const dependencyBudget = Math.min(4096, Math.floor(workBudget / 32));
-  const quota = Math.floor((workBudget - dependencyBudget) / 4);
-  if (r.schemaVersion !== 1 || r.policy !== "uniform-score-band-three-arm-equal-quota-v1" || r.armLimit !== 3 || r.armQuota !== quota
+  const quota = Math.floor((workBudget - dependencyBudget) / (precision ? 1 : 4));
+  if (r.schemaVersion !== (precision ? 2 : 1) || r.policy !== (precision ? "spin-first-single-bag-transpositions-v1" : "uniform-score-band-three-arm-equal-quota-v1")
+    || r.armLimit !== (precision ? 0 : 3) || r.armQuota !== (precision ? 0 : quota)
     || r.dependencyWorkBudget !== dependencyBudget || r.dependencyWorkUsed !== m.dependencyWork
     || r.proofCapacity !== Math.min(maxNodes, 32)) throw new ObservationError(400, "집중 관측의 버전·고정 할당량이 다릅니다.");
   int(r.selectionSeed, 0, 4294967295); int(r.dependencyWorkUsed, 0, dependencyBudget);
@@ -216,8 +220,9 @@ function validateRefinement(label: Obj): Obj {
     || r.selectionBandCount !== (r.selectionScoreMin === r.selectionScoreMax ? 1 : 4)
     || (!poolSize && (r.selectionScoreMin !== 0 || r.selectionScoreMax !== 0))) throw new ObservationError(400, "후보 점수 구간의 범위가 다릅니다.");
   for (const key of ["candidatePoolDrops", "candidateDuplicates", "proofCapacityDrops"]) int(r[key], 0, Number.MAX_SAFE_INTEGER);
-  const witnesses = label.reachableWholeBagWitnesses as Obj[], byId = new Map(witnesses.map(w => [Number(w.id), w]));
-  if (!Array.isArray(r.candidates) || r.candidates.length !== witnesses.length || !Array.isArray(r.arms) || r.arms.length > Math.min(3, poolSize)) throw new ObservationError(400, "집중 후보·하위 관측 개수가 다릅니다.");
+  const witnesses = (label.reachableWholeBagWitnesses as Obj[]), byId = new Map(witnesses.map(w => [Number(w.id), w]));
+  if (!Array.isArray(r.candidates) || r.candidates.length !== witnesses.length || !Array.isArray(r.arms) || r.arms.length > (precision ? 0 : Math.min(3, poolSize))) throw new ObservationError(400, "집중 후보·하위 관측 개수가 다릅니다.");
+  if (precision) validateIntraBag(r.intraBag, label);
   const root = searchObservation(r.root, rows(refObject(label.input).rows), quota, attemptsLimit);
   if (!refSame(refObject(r.root).targets, label.targets)
     || root.verification !== witnesses.filter(w => w.parentId === null).length * 7 + root.prefixVerification) throw new ObservationError(400, "루트의 한 가방 표지·입력 검증량이 다릅니다.");
@@ -251,12 +256,27 @@ function validateRefinement(label: Obj): Obj {
     if (!witness || seen.has(id) || typeof candidate.structuralQuality !== "number" || !Number.isFinite(candidate.structuralQuality)) throw new ObservationError(400, "후보의 현재 필드 진단이 다릅니다.");
     seen.add(id);
     if (candidate.dependency !== null) {
-      if (!selected.has(id) || witness.bags !== 1) throw new ObservationError(400, "의존성 진단은 선택한 첫 가방 후보에만 붙습니다.");
+      if ((!precision && !selected.has(id)) || witness.bags !== 1) throw new ObservationError(400, "의존성 진단은 선택한 첫 가방 후보에만 붙습니다.");
       dependencyUsed += componentDependency(candidate.dependency, witness);
     }
   }
+  if (precision && r.candidates.filter(candidate => refObject(candidate).dependency !== null).length > 3) throw new ObservationError(400, "한 가방 의존성 진단은 최대 세 후보입니다.");
   if (dependencyUsed !== r.dependencyWorkUsed || used + dependencyUsed !== m.workUsed || generation !== m.generationWork || verification !== m.verificationWork) throw new ObservationError(400, "집중 관측의 총 작업량이 다릅니다.");
   return label;
+}
+
+function validateIntraBag(raw: unknown, label: Obj) {
+  const s = refObject(raw), m = refObject(label.measured), r = refObject(label.refinement), lookahead = refObject(m.lookahead), config = refObject(label.config);
+  const maxNodes = int(config.maxNodes, 1, 256);
+  exact(s, ["schemaVersion", "policy", "expandedStates", "physicalTranspositions", "orderTranspositions", "dominatedStates", "spinBoundPruned", "frontierCapacity", "frontierDrops", "transpositionCapacity", "transpositionEvictions", "maximumPendingStates"]);
+  if (s.schemaVersion !== 1 || s.policy !== "oriented-occupancy-remaining-labels-spin-dominance-v1"
+    || s.frontierCapacity !== 126 * Number(config.beamWidth) * 5 + 1 || s.transpositionCapacity !== maxNodes * 256
+    || m.maxReachableObservedSpins !== refObject(label.targets).observedSpins || lookahead.requestedBags !== 1 || lookahead.deepestAttemptedBag !== 1
+    || lookahead.bestTwoBagPath !== null || !["frontier_exhausted", "generation_quota", "spin_capacity_reached"].includes(String(m.stopReason))) throw new ObservationError(400, "한 가방 정밀 탐색 범위 또는 중복 제거 정의가 다릅니다.");
+  for (const key of ["expandedStates", "physicalTranspositions", "orderTranspositions", "dominatedStates", "spinBoundPruned", "frontierDrops", "transpositionEvictions"]) int(s[key], 0, Number.MAX_SAFE_INTEGER);
+  int(s.maximumPendingStates, 0, Number(s.frontierCapacity));
+  if (Number(s.orderTranspositions) > Number(s.physicalTranspositions)
+    || r.candidatePoolCapacity !== maxNodes || refObject(r.root).attempts !== 1) throw new ObservationError(400, "한 가방 중복 통계와 지속 탐색 횟수가 다릅니다.");
 }
 
 function componentDependency(raw: unknown, witness: Obj) {
@@ -309,12 +329,13 @@ export function cleanObservation(value: unknown) {
     const parentSequence = parentObservationId.slice(`${runId}:observation-`.length);
     requireValue(/^[1-9]\d{0,6}$/.test(parentSequence) && Number(parentSequence) < sequence, 'Parent must precede child');
   }
-  const refined = (o.label as Obj)?.schemaVersion === 4;
+  const precision = (o.label as Obj)?.schemaVersion === 5;
+  const refined = precision || (o.label as Obj)?.schemaVersion === 4;
   const nextBag = refined || (o.label as Obj)?.schemaVersion === 3;
   const hasTargetWitness = nextBag && Object.hasOwn(o.label as Obj, 'targetWitness');
   const label = obj(o.label, ['schemaVersion', 'task', 'policy', 'input', 'config', 'targets', 'measured', 'certifiedWitnesses', 'reachableWitness',
     ...(nextBag ? ['targetHorizonBags', 'reachableWholeBagWitnesses', ...(hasTargetWitness ? ['targetWitness'] : [])] : []), ...(refined ? ['refinement'] : [])]);
-  requireValue(nextBag ? label.task === (refined ? 'naga-next-bag-spin-v4' : 'naga-next-bag-spin-v3') && label.policy === (refined ? 'concentrated-next-bag-spin-v4' : 'bounded-next-bag-spin-v3') && label.targetHorizonBags === 1
+  requireValue(nextBag ? label.task === (precision ? 'naga-next-bag-spin-v5' : refined ? 'naga-next-bag-spin-v4' : 'naga-next-bag-spin-v3') && label.policy === (precision ? 'precision-single-bag-spin-v5' : refined ? 'concentrated-next-bag-spin-v4' : 'bounded-next-bag-spin-v3') && label.targetHorizonBags === 1
     : label.schemaVersion === 2 && label.task === 'naga-spin-observations-v2' && label.policy === 'neyra-fixed-bag-continuation-v2');
   const input = obj(label.input, ['id', 'rows', 'source']), board = rows(input.rows);
   requireValue(board.some(Boolean), 'Empty first-bag fields are excluded');
@@ -328,8 +349,8 @@ export function cleanObservation(value: unknown) {
   requireValue(source.reference === (parentObservationId === null ? `neyra:run:${runId}/candidate:${rootCandidateId}` : `neyra:observation:${parentObservationId}/${link}:${parentWitnessId}`));
   requireValue(parentObservationId !== null || bagBoundary === rootBagBoundary);
   const config = obj(label.config, ['horizonBags', 'workBudget', 'beamWidth', 'profile', 'seed', 'maxNodes', 'attemptsPerNode', 'sourceRevision', ...(nextBag ? ['observationVersion'] : [])]);
-  const fixed: Obj = {horizonBags: 2, workBudget: 131072, beamWidth: 48, profile: 0, seed: 1, maxNodes: 96, attemptsPerNode: refined ? 16 : 6,
-    sourceRevision: refined ? REFINED_REVISION : nextBag ? NEXT_BAG_REVISION : REVISION, ...(nextBag ? {observationVersion: refined ? 4 : 3} : {})};
+  const fixed: Obj = {horizonBags: precision ? 1 : 2, workBudget: precision ? 524288 : 131072, beamWidth: 48, profile: 0, seed: 1, maxNodes: 96, attemptsPerNode: precision ? 1 : refined ? 16 : 6,
+    sourceRevision: precision ? PRECISION_REVISION : refined ? REFINED_REVISION : nextBag ? NEXT_BAG_REVISION : REVISION, ...(nextBag ? {observationVersion: precision ? 5 : refined ? 4 : 3} : {})};
   requireValue(Object.keys(fixed).every(key => config[key] === fixed[key]), 'Collector policy differs from fixed training policy');
   if (nextBag) {
     validateNextBag(label, board, refined);

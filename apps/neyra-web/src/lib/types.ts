@@ -141,7 +141,7 @@ export interface FocusedSelection {
 }
 
 export interface FocusedLabelConfig {
-  observationVersion?: 2 | 3 | 4;
+  observationVersion?: 2 | 3 | 4 | 5;
   horizonBags: number;
   workBudget: number;
   beamWidth: number;
@@ -169,10 +169,10 @@ export interface FocusedWitness {
 }
 
 export interface FocusedSpinLabel {
-  schemaVersion: 2 | 3 | 4;
-  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3' | 'naga-next-bag-spin-v4';
-  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3' | 'concentrated-next-bag-spin-v4';
-  /** Prediction horizon. Actual follow-up measurement still spans >=2 bags. */
+  schemaVersion: 2 | 3 | 4 | 5;
+  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3' | 'naga-next-bag-spin-v4' | 'naga-next-bag-spin-v5';
+  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3' | 'concentrated-next-bag-spin-v4' | 'precision-single-bag-spin-v5';
+  /** Prediction horizon; v5 concentrates all collection on that same bag. */
   targetHorizonBags?: 1;
   input: FocusedInput;
   config: FocusedLabelConfig;

@@ -556,6 +556,20 @@ fn candidate_rank(spins: u8, quality: f64, first_bag: bool, terminal: bool) -> f
     else { spin_rank(spins, quality) + f64::from(first_bag && terminal) }
 }
 
+const SPIN_PRIORITY_QUALITY_LIMIT: f64 = 0.45;
+
+/// Completed productive ordinary candidates compare actual spins before field quality.
+/// Two finite quality terms differ by less than one spin. Keep the historical
+/// observation collectors' ordering separate so their stored policy is stable.
+fn spin_priority_rank(spins: u8, quality: f64) -> f64 {
+    f64::from(spins) + SPIN_PRIORITY_QUALITY_LIMIT * quality / (120.0 + quality.abs())
+}
+
+fn candidate_priority_rank(spins: u8, quality: f64, first_bag: bool, terminal: bool) -> f64 {
+    if first_bag && !terminal { candidate_rank(spins, quality, first_bag, terminal) }
+    else { spin_priority_rank(spins, quality) + f64::from(first_bag && terminal) }
+}
+
 fn projected_poses(target: &TargetOperation, deleted: u32) -> Vec<Pose> {
     let mut cells = [(0_i8, 0_i8); 4];
     for (i, &(x, logical)) in target.cells.iter().enumerate() {
@@ -1894,6 +1908,7 @@ impl ContinuationProbe {
 
 struct RefinementJob {
     first_bag: bool,
+    spin_priority: bool,
     pending: Vec<SeedState>,
     current: Option<(SeedState, ContinuationProbe)>,
     complete: Vec<SeedState>,
@@ -1902,10 +1917,11 @@ struct RefinementJob {
 }
 
 impl RefinementJob {
-    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool) -> Self {
+    fn new(mut pending: Vec<SeedState>, profile: u8, minimum_success: u16, first_bag: bool, spin_priority: bool) -> Self {
         pending.reverse();
         Self {
             first_bag,
+            spin_priority,
             pending,
             current: None,
             complete: vec![],
@@ -1920,7 +1936,8 @@ impl RefinementJob {
             if probe.finished() {
                 seed.future = probe.best;
                 seed.quality = boundary_quality(&seed.board, &seed.debt, &seed.future);
-                seed.score = candidate_rank(seed.spins, seed.quality, self.first_bag, seed.spins >= goal);
+                let rank = if self.spin_priority { candidate_priority_rank } else { candidate_rank };
+                seed.score = rank(seed.spins, seed.quality, self.first_bag, seed.spins >= goal);
                 insert_seed(&mut self.complete, seed, 8);
             } else {
                 self.current = Some((seed, probe));
@@ -1994,6 +2011,8 @@ struct GenerationJob {
     /// Its bounded beam remains selective, but cross-field futility and quiet
     /// supply policy must not erase a real, input-reachable continuation.
     learning_only: bool,
+    /// Enabled only by ordinary search, never by historical label collection.
+    spin_priority: bool,
 }
 
 struct PrincipalMove {
@@ -2160,7 +2179,13 @@ impl GenerationJob {
             mino_selective_pruned: 0,
             mino_capacity_pruned: 0,
             learning_only: false,
+            spin_priority: false,
         }
+    }
+
+    fn prioritize_spins(mut self) -> Self {
+        self.spin_priority = true;
+        self
     }
 
     fn for_learning(mut self) -> Self {
@@ -2189,6 +2214,7 @@ impl GenerationJob {
             start_pieces: self.start_pieces, best_bag_spins: self.best_bag_spins,
             bag_alpha: self.bag_alpha, goal, pace_minimum: self.pace_minimum,
             hard_piece_cap: self.hard_piece_cap,
+            quality_limit: if self.spin_priority { SPIN_PRIORITY_QUALITY_LIMIT } else { 0.95 },
         };
         let state = &self.frontier[self.state_index];
         // The parent is unchanged while its remaining piece labels are visited.
@@ -2357,7 +2383,9 @@ impl GenerationJob {
             let (bucket, limit) = if used == ALL_PIECES {
                 (&self.complete, 12)
             } else { (&self.next_by_inventory[used as usize], per_inventory) };
-            if !self.learning_only && !complete && self.start_pieces != 0 && below_bucket_window(bucket, limit, spins) {
+            if !self.learning_only && !complete && self.start_pieces != 0
+                && below_bucket_window(bucket, limit, spins,
+                    if used == ALL_PIECES { bounds.quality_limit } else { 0.95 }) {
                 self.mino_capacity_pruned += 1;
                 continue;
             }
@@ -2429,7 +2457,13 @@ impl GenerationJob {
                 structural + setup_score(&self.start, state.targets.iter().chain(std::iter::once(&target))) * 0.25
             };
             // Jitter only orders proposals; it is not evidence of better terrain.
-            let score = candidate_rank(spins,
+            // An incomplete bag still needs preparation diversity. Protect an
+            // actually completed bag's spin maximum without forcing every
+            // intermediate prefix to spend that future field quality now.
+            let rank = if self.spin_priority && (used == ALL_PIECES || complete) {
+                candidate_priority_rank
+            } else { candidate_rank };
+            let score = rank(spins,
                 quality + rng.unit() * 2.0,
                 self.start_pieces == 0, complete);
             let (bucket, limit) = if used == ALL_PIECES {
@@ -2532,6 +2566,7 @@ impl GenerationJob {
                     self.profile,
                     self.continuation_minimum_success,
                     self.start_pieces == 0,
+                    self.spin_priority,
                 ));
                 false
             }
@@ -2889,6 +2924,7 @@ struct MinoBounds {
     goal: u8,
     pace_minimum: u8,
     hard_piece_cap: u16,
+    quality_limit: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2917,7 +2953,7 @@ fn mino_cut_with_potential(
     if bounds.start_pieces == 0 { return None; }
     if delta_lag(spins, bounds.best_bag_spins, more)
         || upper < bounds.pace_minimum
-        || (bounds.start_pieces != 0 && f64::from(upper) + 0.95 <= bounds.bag_alpha)
+        || (bounds.start_pieces != 0 && f64::from(upper) + bounds.quality_limit <= bounds.bag_alpha)
     { return Some(MinoCut::Selective); }
     None
 }
@@ -2937,11 +2973,11 @@ fn min_pace_spins(goal: u8, pieces: u16, budget: u16) -> u8 {
     low
 }
 
-/// The quality contribution is strictly below 0.95. This shortcut only skips
+/// The quality contribution is strictly below the active policy's limit. Only skip
 /// candidates that cannot enter this already full bounded proposal bucket.
-fn below_bucket_window(bucket: &[SeedState], limit: usize, spins: u8) -> bool {
+fn below_bucket_window(bucket: &[SeedState], limit: usize, spins: u8, quality_limit: f64) -> bool {
     bucket.len() >= limit && bucket.last().is_some_and(|worst| {
-        f64::from(spins) + 0.95 <= worst.score
+        f64::from(spins) + quality_limit <= worst.score
     })
 }
 
@@ -3869,13 +3905,13 @@ impl SearchSession {
             minimum,
             self.config.search_lane,
             self.config.search_lanes,
-        );
+        ).prioritize_spins();
         generation.best_bag_spins =
             self.selective_spin_reference((self.tree[parent].pieces as usize / 7) + 1);
         generation.bag_alpha = if parent != 0 && self.config.min_success_percent == 100.0 {
             self.best_quality_by_bag[(self.tree[parent].pieces as usize / 7) + 1]
                 .iter().enumerate().filter(|(_, quality)| quality.is_finite())
-                .map(|(spins, &quality)| spin_rank(spins as u8, quality))
+                .map(|(spins, &quality)| spin_priority_rank(spins as u8, quality))
                 .fold(f64::NEG_INFINITY, f64::max)
         } else { f64::NEG_INFINITY };
         generation.hard_piece_cap = self.cost_cap();
@@ -4139,7 +4175,7 @@ impl SearchSession {
                 bag_count: parent.counts.len() as u16 + 1,
                 budget_pieces: None,
                 cdf: vec![],
-                ranking_score: candidate_rank(job.plan.expected_spins, quality,
+                ranking_score: candidate_priority_rank(job.plan.expected_spins, quality,
                     job.plan.start_pieces == 0, job.plan.terminal),
                 field_quality: quality,
                 forecast_spins: job.plan.future.planned_spins,
@@ -4267,7 +4303,7 @@ impl SearchSession {
             bag_count: counts.len() as u16,
             budget_pieces: budget,
             cdf,
-            ranking_score: candidate_rank(last.spins, quality, parent.pieces == 0, job.plan.terminal),
+            ranking_score: candidate_priority_rank(last.spins, quality, parent.pieces == 0, job.plan.terminal),
             field_quality: quality,
             forecast_spins: job.plan.future.planned_spins,
             forecast_spins_by_bag: job.plan.future.displayed_bag_spins(),

@@ -8,6 +8,8 @@
 //! V4 refines a supplied field and a few quality-band sampled first-bag
 //! endpoints with equal reserved budgets. Each endpoint's local next-bag
 //! target and full-board input proof survive independently of output caps.
+//! V5 spends its budget inside one supplied inventory. Its physical-state
+//! transpositions and spin-first incumbent are separate from fixed-plan search.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -19,6 +21,8 @@ pub const NEXT_BAG_TASK: &str = "naga-next-bag-spin-v3";
 pub const NEXT_BAG_POLICY: &str = "bounded-next-bag-spin-v3";
 pub const REFINED_BAG_TASK: &str = "naga-next-bag-spin-v4";
 pub const REFINED_BAG_POLICY: &str = "concentrated-next-bag-spin-v4";
+pub const PRECISE_BAG_TASK: &str = "naga-next-bag-spin-v5";
+pub const PRECISE_BAG_POLICY: &str = "precision-single-bag-spin-v5";
 const REACHABLE_WITNESS_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -71,8 +75,8 @@ impl Default for LabelConfig {
 
 impl LabelConfig {
     fn validate(&self) -> Result<(), String> {
-        if !(2..=3).contains(&self.horizon_bags)
-            || self.observation_version.is_some_and(|version| !matches!(version, 2 | 3 | 4))
+        if !(if self.observation_version == Some(5) { 1..=1 } else { 2..=3 }).contains(&self.horizon_bags)
+            || self.observation_version.is_some_and(|version| !matches!(version, 2 | 3 | 4 | 5))
             || !(1..=4_194_304).contains(&self.work_budget)
             || !(4..=128).contains(&self.beam_width)
             || self.profile > 3 || !(1..=256).contains(&self.max_nodes)
@@ -87,6 +91,12 @@ impl LabelConfig {
             && (self.horizon_bags != 2 || self.max_nodes < 4 || self.work_budget < 1_024)
         {
             return Err("V4 concentrated observations require horizonBags 2, maxNodes at least 4 and workBudget at least 1024".into());
+        }
+        if self.observation_version == Some(5)
+            && (self.horizon_bags != 1 || self.attempts_per_node != 1
+                || self.max_nodes < 4 || self.work_budget < 1_024)
+        {
+            return Err("V5 precise observations require horizonBags 1, attemptsPerNode 1, maxNodes at least 4 and workBudget at least 1024".into());
         }
         Ok(())
     }
@@ -354,6 +364,367 @@ pub struct RefinementMeasurements {
     /// Every retained whole-bag witness has one current-board quality entry.
     pub candidates: Vec<RefinedCandidate>,
     pub arms: Vec<RefinedArmObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intra_bag: Option<IntraBagMeasurements>,
+}
+
+/// Only v5 uses physical continuation identity. A piece always starts from its
+/// spawn, there is no carry hold or P7 policy, and completed locks reset movement
+/// history. Oriented occupancy and remaining labels therefore determine legal
+/// futures. Fixed typed tilings remain separate in ordinary certified search.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntraBagMeasurements {
+    pub schema_version: u8,
+    pub policy: &'static str,
+    pub expanded_states: u64,
+    pub physical_transpositions: u64,
+    pub order_transpositions: u64,
+    pub dominated_states: u64,
+    pub spin_bound_pruned: u64,
+    pub frontier_capacity: usize,
+    pub frontier_drops: u64,
+    pub transposition_capacity: usize,
+    pub transposition_evictions: u64,
+    pub maximum_pending_states: usize,
+}
+
+fn precise_order(seed: &SeedState) -> u32 {
+    seed.targets.iter().enumerate().fold(0, |code, (index, target)| {
+        code | ((u32::from(target.piece as u8) + 1) << (3 * index))
+    })
+}
+
+fn precise_upper(seed: &SeedState) -> u8 {
+    seed.spins + (ALL_PIECES & !seed.used & !Piece::O.bit()).count_ones() as u8
+}
+
+fn precise_ordering(left: &SeedState, right: &SeedState) -> std::cmp::Ordering {
+    left.spins.cmp(&right.spins)
+        .then_with(|| left.quality.total_cmp(&right.quality))
+}
+
+/// One persistent inventory search. The frontier can be selective, but its
+/// incumbent observes every physical child before any heuristic capacity cut.
+/// Full-board equality here deliberately ignores prior typed target assignment:
+/// future piece entries depend on the actual occupancy and unused labels only.
+fn run_precise_phase(
+    parent: ReachableNode, config: &LabelConfig, generation_budget: u32,
+    cache: &mut PhysicsCache,
+) -> (RefinedPhase, IntraBagMeasurements) {
+    let mut phase = RefinedPhase {
+        parent, pool: vec![], best: None, best_complete: None, deepest: None,
+        generation_work: 0, attempts: 1, completed_candidates: 0, distinct_candidates: 0,
+        candidate_duplicates: 0, pool_drops: 0, capacity_drops: 0,
+        duplicates: 0, placements_considered: 0, stop_reason: "frontier_exhausted",
+    };
+    let mut stats = IntraBagMeasurements {
+        schema_version: 1, policy: "oriented-occupancy-remaining-labels-spin-dominance-v1",
+        expanded_states: 0, physical_transpositions: 0, order_transpositions: 0,
+        dominated_states: 0, spin_bound_pruned: 0,
+        frontier_capacity: 126 * config.beam_width * 5 + 1, frontier_drops: 0,
+        transposition_capacity: config.max_nodes * 256, transposition_evictions: 0,
+        maximum_pending_states: 1,
+    };
+    let mut frontier: [Vec<SeedState>; 128] = std::array::from_fn(|_| Vec::new());
+    // The primary beam must not silently turn a larger precision budget into
+    // the same short pass. Retain a bounded, randomized reserve of alternative
+    // prefixes and resume them inside this inventory when the primary drains.
+    let mut deferred: [Vec<SeedState>; 128] = std::array::from_fn(|_| Vec::new());
+    let mut deferred_arrivals = [0_u64; 128];
+    let board = phase.parent.node.board;
+    frontier[0].push(SeedState {
+        board, spins: 0, used: 0, deleted: 0, targets: vec![], target_key: [0; 7], frames: vec![],
+        score: board_score(&board), quality: board_score(&board), pursuit: None,
+        debt: [0; HEIGHT], future: Continuation::default(), first_mask: ALL_PIECES,
+    });
+    let mut pending = 1;
+    // FIFO replacement is safe: forgetting a completed expansion can only
+    // repeat work. Pending entries are checked exactly in their inventory bucket.
+    let mut expanded: HashMap<(Board, u8), (u8, u32, u64)> = HashMap::new();
+    let mut age = std::collections::VecDeque::new();
+    let mut generation = 0_u64;
+    let mut completed = HashSet::new();
+    let mut pool_random = Random(board_refinement_seed(&board, config.seed) as u64 ^ 0x7635_706f_6f6c);
+    let mut reserve_random = Random(config.seed ^ 0x7635_7265_7365_7276);
+    'search: loop {
+        let selected = frontier.iter().enumerate().filter_map(|(index, bucket)| {
+            bucket.first().map(|seed| (index, seed))
+        }).max_by(|left, right| {
+            precise_upper(left.1).cmp(&precise_upper(right.1))
+                .then_with(|| precise_ordering(left.1, right.1))
+                .then_with(|| right.0.cmp(&left.0))
+        }).map(|(index, _)| index);
+        let Some(index) = selected else {
+            let mut resumed = false;
+            for (bucket, reserve) in frontier.iter_mut().zip(&mut deferred) {
+                reserve.sort_by(|left, right| precise_ordering(right, left));
+                let count = reserve.len().min(config.beam_width);
+                bucket.extend(reserve.drain(..count));
+                resumed |= count != 0;
+            }
+            if resumed { continue; }
+            break;
+        };
+        if phase.generation_work >= generation_budget {
+            phase.stop_reason = "generation_quota";
+            break;
+        }
+        let state = frontier[index].remove(0);
+        pending -= 1;
+        if precise_upper(&state) < phase.best.as_ref().map_or(0, |best| best.spins) {
+            stats.spin_bound_pruned += 1;
+            continue;
+        }
+        let key = (state.board, state.used);
+        if let Some(&(spins, order, _)) = expanded.get(&key) {
+            if spins >= state.spins {
+                stats.physical_transpositions += 1;
+                stats.order_transpositions += u64::from(order != precise_order(&state));
+                stats.dominated_states += u64::from(spins > state.spins);
+                continue;
+            }
+        }
+        for piece in Piece::ALL {
+            if state.used & piece.bit() != 0 { continue; }
+            if phase.generation_work >= generation_budget {
+                phase.stop_reason = "generation_quota";
+                break 'search;
+            }
+            let placements = cache.proposals(state.board, piece, true);
+            phase.generation_work += 1;
+            for placement in placements.iter() {
+                phase.placements_considered += 1;
+                let Some(result) = state.board.apply(placement) else { continue; };
+                if result.lines > 1 || (result.lines == 1 && !result.spin) { continue; }
+                let Some(target) = normalize_target(placement.pose, state.deleted) else { continue; };
+                let Some(deleted) = deleted_after(state.deleted, result.cleared_rows) else { continue; };
+                let mut targets = state.targets.clone();
+                let mut target_key = state.target_key;
+                target_key[piece as usize] = target_code(&target);
+                targets.push(target);
+                let spins = state.spins + result.lines;
+                let mut frames = state.frames.clone();
+                frames.push(DisplayFrame {
+                    rows: result.board.rows, piece: piece_name(piece),
+                    placed_cells: result.cells.map(|(x, y)| (x as u8, y as u8)),
+                    spins, placed: 7 + targets.len() as u16,
+                    lines: result.lines, spin: result.spin,
+                });
+                let quality = board_score(&result.board);
+                let next = SeedState {
+                    board: result.board, spins, used: state.used | piece.bit(), deleted,
+                    targets, target_key, frames, score: quality, quality, pursuit: None,
+                    debt: [0; HEIGHT], future: Continuation::default(), first_mask: ALL_PIECES,
+                };
+                // Neither a low structural score nor a bounded frontier may
+                // erase a genuinely observed higher-spin prefix or endpoint.
+                record_refined_prefix(&mut phase, &next);
+                if next.used == ALL_PIECES {
+                    record_refined_candidates(&mut phase, vec![next], config.max_nodes,
+                        &mut completed, &mut pool_random);
+                    continue;
+                }
+                if precise_upper(&next) < phase.best.as_ref().map_or(0, |best| best.spins) {
+                    stats.spin_bound_pruned += 1;
+                    continue;
+                }
+                if let Some(&(prior_spins, prior_order, _)) = expanded.get(&(next.board, next.used)) {
+                    if prior_spins >= next.spins {
+                        stats.physical_transpositions += 1;
+                        stats.order_transpositions += u64::from(prior_order != precise_order(&next));
+                        stats.dominated_states += u64::from(prior_spins > next.spins);
+                        continue;
+                    }
+                }
+                let inventory = next.used as usize;
+                let reserve = &mut deferred[inventory];
+                if let Some(duplicate) = reserve.iter().position(|prior| prior.board == next.board) {
+                    stats.physical_transpositions += 1;
+                    stats.order_transpositions += u64::from(precise_order(&reserve[duplicate]) != precise_order(&next));
+                    if reserve[duplicate].spins >= next.spins {
+                        stats.dominated_states += u64::from(reserve[duplicate].spins > next.spins);
+                        continue;
+                    }
+                    reserve.remove(duplicate);
+                    pending -= 1;
+                }
+                let bucket = &mut frontier[inventory];
+                if let Some(duplicate) = bucket.iter().position(|prior| prior.board == next.board) {
+                    stats.physical_transpositions += 1;
+                    stats.order_transpositions += u64::from(precise_order(&bucket[duplicate]) != precise_order(&next));
+                    if bucket[duplicate].spins >= next.spins {
+                        stats.dominated_states += u64::from(bucket[duplicate].spins > next.spins);
+                        continue;
+                    }
+                    bucket.remove(duplicate);
+                    pending -= 1;
+                }
+                let at = bucket.iter().position(|prior| precise_ordering(&next, prior).is_gt())
+                    .unwrap_or(bucket.len());
+                bucket.insert(at, next);
+                pending += 1;
+                if bucket.len() > config.beam_width {
+                    let alternative = bucket.pop().unwrap();
+                    pending -= 1;
+                    deferred_arrivals[inventory] += 1;
+                    let capacity = config.beam_width * 4;
+                    if reserve.len() < capacity {
+                        reserve.push(alternative);
+                        pending += 1;
+                    } else {
+                        let replace = (reserve_random.unit() * deferred_arrivals[inventory] as f64) as usize;
+                        if replace < capacity { reserve[replace] = alternative; }
+                        stats.frontier_drops += 1;
+                    }
+                }
+                stats.maximum_pending_states = stats.maximum_pending_states.max(pending);
+            }
+        }
+        // Only a state whose unused-piece queries all completed enters the
+        // closed table. Evicted/queued prefixes never acquire closed ownership;
+        // an interrupted final expansion leaves no reusable rejection claim.
+        generation += 1;
+        expanded.insert(key, (state.spins, precise_order(&state), generation));
+        age.push_back((key, generation));
+        while expanded.len() > stats.transposition_capacity {
+            if let Some((old, stamp)) = age.pop_front() {
+                if expanded.get(&old).is_some_and(|entry| entry.2 == stamp) {
+                    expanded.remove(&old);
+                    stats.transposition_evictions += 1;
+                }
+            }
+        }
+        stats.expanded_states += 1;
+        if phase.best_complete.as_ref().is_some_and(|best| best.spins == 6) {
+            phase.stop_reason = "spin_capacity_reached";
+            break;
+        }
+    }
+    phase.distinct_candidates = completed.len() as u32;
+    phase.duplicates = stats.physical_transpositions;
+    phase.capacity_drops = stats.frontier_drops;
+    (phase, stats)
+}
+
+fn collect_precise_bag_label(input: BoardSample, config: LabelConfig) -> Result<BoardLabel, String> {
+    config.validate()?;
+    let board = Board { rows: input.rows };
+    if input.id.trim().is_empty() || input.source.bag_boundary < 2
+        || input.source.kind.trim().is_empty() || input.source.reference.trim().is_empty()
+        || input.source.family.trim().is_empty() || !board.is_valid() || board.cell_count() == 0
+        || board.rows.iter().any(|row| *row == 1023)
+    {
+        return Err("Precise labels require a named nonempty post-clear field after at least two completed bags".into());
+    }
+    for forbidden in ["referencePrior", "priorIsMeasuredOutcome", "currentBoardTeacher",
+        "terrainScore", "fieldQuality", "rankingScore", "shapePreference", "observedChoices", "boardEvaluation"]
+    {
+        if input.source.extra.contains_key(forbidden) {
+            return Err(format!("Evaluation metadata is not a spin-only learning input: {forbidden}"));
+        }
+    }
+    let dependency_budget = 4_096.min(config.work_budget / 32);
+    let root_quota = config.work_budget - dependency_budget;
+    let generation_budget = root_quota - 256.min(root_quota / 4);
+    let proof_capacity = config.max_nodes.min(REACHABLE_WITNESS_CAPACITY);
+    let selection_seed = board_refinement_seed(&board, config.seed);
+    let mut cache = PhysicsCache::default();
+    let parent = ReachableNode { node: node(board, 0, 0, [0; HEIGHT]), bags: 0, witness_id: None };
+    let (root, intra_bag) = run_precise_phase(parent, &config, generation_budget, &mut cache);
+    let (selected, selection_score_min, selection_score_max, selection_band_count) =
+        refined_arm_selection(&root.pool, selection_seed);
+    let mut root_seeds = Vec::<SeedState>::new();
+    let mut identities = HashSet::new();
+    if let Some(best) = &root.best_complete {
+        identities.insert(refined_identity(best));
+        root_seeds.push(best.clone());
+    }
+    for choice in &selected {
+        let candidate = &root.pool[choice.index];
+        if identities.insert(refined_identity(candidate)) { root_seeds.push(candidate.clone()); }
+    }
+    let mut remainder: Vec<&SeedState> = root.pool.iter().collect();
+    remainder.sort_by(|left, right| precise_ordering(right, left));
+    for candidate in remainder {
+        if root_seeds.len() >= proof_capacity { break; }
+        if identities.insert(refined_identity(candidate)) { root_seeds.push(candidate.clone()); }
+    }
+    root_seeds.truncate(proof_capacity);
+    let selected_identities: HashSet<_> = selected.iter()
+        .map(|choice| refined_identity(&root.pool[choice.index])).collect();
+    let diagnostic_count = root_seeds.iter().filter(|candidate| selected_identities.contains(&refined_identity(candidate))).count();
+    let per_diagnostic = if diagnostic_count == 0 { 0 } else { dependency_budget / diagnostic_count as u32 };
+    let mut witnesses = Vec::new();
+    let mut candidates = Vec::new();
+    let mut dependency_work = 0;
+    for (index, seed) in root_seeds.iter().enumerate() {
+        let witness = replay_reachable_bag(&root.parent, seed, index as u64 + 1, &mut cache)?;
+        let dependency = if selected_identities.contains(&refined_identity(seed)) {
+            let value = observe_component_dependencies(board, &witness.targets, per_diagnostic,
+                selection_seed.wrapping_add(witness.id as u32), &mut cache);
+            dependency_work += value.work_used;
+            Some(value)
+        } else { None };
+        candidates.push(RefinedCandidate { witness_id: witness.id, structural_quality: board_score(&seed.board), dependency });
+        witnesses.push(witness);
+    }
+    let root_observation = finish_refined_observation(&root, root_quota, witnesses.len() as u32 * 7, &mut cache)?;
+    let observed_spins = root_observation.targets.observed_spins;
+    if observed_spins > 6 { return Err("A precise root exceeded one inventory's spin capacity".into()); }
+    let target_witness = root_observation.target_witness.as_ref()
+        .map(|proof| reachable_from_refined(proof, None, 0, 0));
+    let reachable_witness = root_observation.deepest_witness.as_ref()
+        .map(|proof| reachable_from_refined(proof, None, 0, 0));
+    let reached = root_observation.deepest_reached_placements;
+    let proof_drops = u64::from(root.distinct_candidates).saturating_sub(witnesses.len() as u64);
+    let productive = witnesses.iter().filter(|witness| witness.end_spins > 0).count() as u32;
+    let max_whole = witnesses.iter().map(|witness| witness.end_spins).max();
+    let work_used = root_observation.work_used + dependency_work;
+    if work_used > config.work_budget { return Err("Precise collection exceeded its declared total work budget".into()); }
+    let measured = LabelMeasurements {
+        max_reachable_observed_spins: observed_spins,
+        geometric_whole_bag_chains: witnesses.len() as u32,
+        productive_geometric_whole_bag_chains: productive,
+        certified_whole_bag_chains: 0, productive_certified_whole_bag_chains: 0,
+        max_certified_observed_spins: None,
+        depths: vec![DepthObservation { bags: 1, geometric_whole_bag_chains: witnesses.len() as u32,
+            productive_geometric_whole_bag_chains: productive, max_geometric_whole_bag_spins: max_whole,
+            ..Default::default() }],
+        work_used, generation_work: root_observation.generation_work,
+        verification_work: root_observation.verification_work, dependency_work: Some(dependency_work),
+        geometric_placements_considered: root.placements_considered,
+        canonical_supplies_checked: 0, quiet_policy_rejections: 0, supply_rejections: 0,
+        graph_overflows: 0, node_capacity_drops: 0, censored: true,
+        stop_reason: root.stop_reason.into(),
+        evidence_kind: "precise input-reachable one-bag maximum from one supplied board; no P7 or quiet-safe coverage claimed",
+        distinctness: "oriented physical occupancy and remaining inventory with spin dominance; placement-order histories share future expansion; physical witnesses retain original orientation",
+        work_unit: "one complete reachable-lock query for one unused piece on one physical state, one retained lock replay, or one origin-only component target query; no second inventory",
+        lookahead: Some(LookaheadMeasurements {
+            target_horizon_bags: 1, requested_bags: 1, deepest_attempted_bag: 1,
+            deepest_completed_bag: u8::from(!witnesses.is_empty()), deepest_reached_placements: u16::from(reached),
+            reachable_whole_bag_chains: witnesses.len() as u32, witness_capacity: proof_capacity,
+            capacity_drops: root.capacity_drops + root.pool_drops + proof_drops,
+            duplicate_continuations: root.duplicates + root.candidate_duplicates,
+            best_two_bag_path: None,
+        }),
+    };
+    let refinement = RefinementMeasurements {
+        schema_version: 2, policy: "spin-first-single-bag-transpositions-v1", selection_seed,
+        selection_score_min, selection_score_max, selection_band_count,
+        candidate_pool_capacity: config.max_nodes, candidate_pool_size: root.pool.len(),
+        candidate_pool_drops: root.pool_drops, candidate_duplicates: root.candidate_duplicates,
+        arm_limit: 0, arm_quota: 0, dependency_work_budget: dependency_budget,
+        dependency_work_used: dependency_work, proof_capacity, proof_capacity_drops: proof_drops,
+        root: root_observation, candidates, arms: vec![], intra_bag: Some(intra_bag),
+    };
+    Ok(BoardLabel {
+        schema_version: 5, task: PRECISE_BAG_TASK, policy: PRECISE_BAG_POLICY,
+        input, config, targets: SpinTargets { found_spin: observed_spins > 0, observed_spins },
+        measured, certified_witnesses: vec![], reachable_witness,
+        target_horizon_bags: Some(1), target_witness,
+        reachable_whole_bag_witnesses: Some(witnesses), refinement: Some(refinement),
+    })
 }
 
 struct LabelNode {
@@ -410,6 +781,9 @@ fn chain_key(parent: &LabelNode, seed: &SeedState) -> Vec<u8> {
 /// observation is not proof that no continuation exists, including when the
 /// bounded frontier runs out before the budget does.
 pub fn collect_board_label(input: BoardSample, config: LabelConfig) -> Result<BoardLabel, String> {
+    if config.observation_version == Some(5) {
+        return collect_precise_bag_label(input, config);
+    }
     if config.observation_version == Some(4) {
         return collect_refined_bag_label(input, config);
     }
@@ -1459,7 +1833,7 @@ fn collect_refined_bag_label(input: BoardSample, config: LabelConfig) -> Result<
         arm_limit: REFINED_ARM_LIMIT, arm_quota: phase_quota,
         dependency_work_budget: dependency_budget, dependency_work_used: dependency_work,
         proof_capacity, proof_capacity_drops: proof_drops,
-        root: root_observation, candidates, arms,
+        root: root_observation, candidates, arms, intra_bag: None,
     };
     Ok(BoardLabel {
         schema_version: 4, task: REFINED_BAG_TASK, policy: REFINED_BAG_POLICY,

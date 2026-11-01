@@ -2,7 +2,7 @@ import type { FocusedLabelConfig } from './types';
 
 /** Refined observations keep a separate contract from the pinned public model. */
 export const NEXT_BAG_LABEL_CONFIG: Readonly<FocusedLabelConfig> = Object.freeze({
-  observationVersion: 4, horizonBags: 2, workBudget: 131072, beamWidth: 48,
-  profile: 0, seed: 1, maxNodes: 96, attemptsPerNode: 16,
-  sourceRevision: 'sha256:78bd36da629a393e140b433eee6eaa9f08ddcda80fd322a857d099a91b75acff'
+  observationVersion: 5, horizonBags: 1, workBudget: 524288, beamWidth: 48,
+  profile: 0, seed: 1, maxNodes: 96, attemptsPerNode: 1,
+  sourceRevision: 'sha256:f0a00092a8b50034ede285d4afe519497b3f372cf25f13a1eef701f3df11a0dc'
 });

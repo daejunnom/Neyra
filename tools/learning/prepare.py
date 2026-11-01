@@ -8,7 +8,8 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from spin_contract import TASK, NEXT_BAG_TASK, REFINED_TASK, TARGET_DERIVATION, canonical_rows, reject_constant, unique_keys, validate_sample
+from spin_contract import (TASK, NEXT_BAG_TASK, REFINED_TASK, TARGET_DERIVATION, PRECISION_TASK,
+                           PRECISION_TARGET_DERIVATION, canonical_rows, reject_constant, unique_keys, validate_sample)
 
 PROVENANCE = {"kind", "family", "reference", "bagBoundary", "group", "split",
               "seed", "runSeed", "profile", "worker", "runId", "verified", "qualified",
@@ -22,7 +23,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", type=Path, action="append", required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--observation-version", type=int, choices=(2, 3, 4), default=2,
+    p.add_argument("--observation-version", type=int, choices=(2, 3, 4, 5), default=2,
                    help="Declare the intended collector task; existing labels are never imported")
     a = p.parse_args()
     if a.output.resolve() in {x.resolve() for x in a.input}:
@@ -81,16 +82,16 @@ def main():
     a.output.parent.mkdir(parents=True, exist_ok=True)
     output = sorted(selected.values(), key=lambda x: x["id"])
     a.output.write_text("".join(json.dumps(x, ensure_ascii=False, separators=(",", ":")) + "\n" for x in output))
-    manifest = {"schemaVersion": a.observation_version, "task": REFINED_TASK if a.observation_version == 4 else NEXT_BAG_TASK if a.observation_version == 3 else TASK,
+    manifest = {"schemaVersion": a.observation_version, "task": PRECISION_TASK if a.observation_version == 5 else REFINED_TASK if a.observation_version == 4 else NEXT_BAG_TASK if a.observation_version == 3 else TASK,
                 "inputFiles": inputs, "boards": len(output), "droppedShallow": shallow,
                 "droppedDuplicateOrReflection": duplicate,
                 "splitCounts": {split: sum(r["source"]["split"] == split for r in output) for split in priority},
                 "sha256": hashlib.sha256(a.output.read_bytes()).hexdigest(),
                 "scope": "Only occupancy/provenance imported; all old evaluation targets and prior fields discarded. New labels for the declared task must be collected separately."}
-    if a.observation_version in (3, 4):
+    if a.observation_version in (3, 4, 5):
         manifest["targetHorizonBags"] = 1
-    if a.observation_version == 4:
-        manifest["targetDerivation"] = TARGET_DERIVATION
+    if a.observation_version in (4, 5):
+        manifest["targetDerivation"] = PRECISION_TARGET_DERIVATION if a.observation_version == 5 else TARGET_DERIVATION
     a.output.with_suffix(".manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(manifest, ensure_ascii=False))
 

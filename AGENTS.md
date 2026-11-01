@@ -52,13 +52,19 @@
   two one-bag heads. Give it distinct policy/derivation metadata and a reset
   output head; never reinterpret v2/v3 targets or add heuristic/dependency values
   as features or labels. Preserve raw evidence and exact source/weight hashes.
+  Active v5 also preserves those 33,442 parameters and two one-bag outputs.
+  Record its one-inventory precision policy and asymmetric count objective:
+  underestimating an observed count costs twice the same-size overestimate.
+  Keep both directions penalized, report deficit/excess and underestimate rate,
+  and select by held-out validation with the unchanged parent eligible.
   Keep history, inventory, forecasts and opener identity out of inference inputs.
   Inspect actual accessible source before using another engine's board features;
   never infer closed-source evaluation or copy private reference implementation.
   The portable Rust/WASM CNN uses no GPU connection or runtime ML dependency.
 - Learning observations begin at nonempty completed boundaries of at least two
-  bags and use two or three new inventories with a fixed declared work/node/
-  attempt budget. Prioritize deeper fields instead of empty first-bag or full
+  bags. Active v5 precisely explores one new inventory from a small selected
+  set of supplied nodes; bag depth is source provenance, not a priority or a
+  substitute for within-bag precision. Do not start empty first-bag or full
   completion searches. Keep input-reachable observations distinct from exact
   P7/quiet-safe chains. Limited search is censored: a miss is not impossibility,
   and the discovery head is not construction probability. Split whole opener
@@ -68,11 +74,12 @@
   reached depth, zero-spin endpoints, physical input witnesses and censored
   capacity/work limits. Do not apply peer score, completion pace, sibling
   futility or all-P7-parent gates in this learning-only path. Public certified
-  search keeps those separate rules. Reserve capacity for deeper continuation.
+  search keeps those separate rules. Preserve historical v2/v3 collection ranges;
+  they do not define the active v5 one-inventory policy.
   Commit reusable collection/training/storage tools and the selected runtime
   model, but keep datasets, new tests, one-time experiments and result reports
   outside this repository. Record dataset, labeling-source and model hashes.
-- New v4 learning collection concentrates on a supplied root and at most three
+- Historical v4 learning collection concentrates on a supplied root and at most three
   selected next-bag result boards under declared equal phase quotas. Keep the
   candidate search pool independent of serialized proof capacity. Preserve a
   randomized quality spectrum instead of trimming all low-score proposals;
@@ -80,9 +87,21 @@
   Do not mix score units from heuristic and CNN evaluators. Keep actual best
   prefixes separately, preserve zero-spin reachable boundaries and record
   selection seeds, consumed work, capacity losses and unfinished phases.
-  V4 currently measures exactly two inventories and predicts one; it must reject
+  V4 measures exactly two inventories and predicts one; it must reject
   a requested third inventory rather than claiming it was measured.
-- Only the v4 learning path may use touching-component order approximations.
+- Active v5 uses one persistent single-bag frontier with a declared 524,288 work
+  ceiling, beam 48, node cap 96 and one attempt. Reserve a small bounded share
+  for proof replay and contact diagnostics; do not split the main budget among
+  second-bag arms. A work unit is a full reachable-lock query for one unused
+  piece/state, a retained input replay or a component query; legacy advance-unit
+  counts are not CPU-time equivalents. Preserve the strongest actual spin
+  prefix before capacity trimming. Share future expansion only for identical
+  oriented occupancy plus remaining labels, with higher-spin dominance.
+  Record a state as fully expanded only after all its piece queries finish;
+  dropped or interrupted work cannot suppress an unsearched replacement.
+  Keep bounded deferred alternatives, transposition/capacity counters and
+  physical witnesses. Frontier exhaustion after drops is still censored.
+- Only the v4/v5 learning paths may use touching-component order approximations.
   Partition typed logical target cells by orthogonal contact, then test each
   component's internal orders against the origin with other current-bag minos
   absent. Sum the component counters; never multiply them into supply odds.
@@ -105,16 +124,17 @@
 - Capture public search traces only after explicit consent, using existing
   retained frames and worker totals. Do not retrospectively upload old traces.
   With consent on, use a verified boundary of at least two bags as an origin
-  for the v4 concentrated collector, then prioritize deeper replayed result
-  fields, including zero-spin boundaries. Existing retained boards may seed new jobs.
+  for the v5 single-bag collector. Select a nonempty evaluator score band and a
+  node within it uniformly, without prioritizing bag depth; keep evaluator units
+  separate. Replayed zero-spin boundaries remain eligible for later independent
+  one-bag jobs. Existing retained boards may seed new jobs.
   Use the selected worker pool, at most three active expensive collection jobs,
   a bounded global frontier, and parent delivery
   acknowledgement before dispatching descendants. Keep queued observations
   under backpressure rather than evicting parents. With consent off, discard
   new collector outputs, stop new collection/upload and resume ordinary search.
-  Per run, cap each shallow origin depth (bags two and three) at two broad roots
-  and four total jobs; then let ordinary search find deeper eligible origins.
-  Preserve these limits through consent toggles, and refund unstarted jobs when
+  Do not cap shallow origins merely to force later bags. Keep bounded per-run
+  dispatch history through consent toggles, and refund unstarted jobs when
   a worker completes before dispatch. Do not invent certified deeper fields.
   Keep heuristic scores and bounded path observations
   in separate untrusted trace records, never in the CNN's supervised targets.
@@ -149,6 +169,8 @@
   gain is not added to the original root label. Keep work scope, raw observation,
   witness and measurement-group references. Choose the strongest eligible
   representative only within the same canonical board, policy and work scope.
+  V5 has one actually attempted root and no arms; preserve its distinct task,
+  config and single-bag expansion work scope when deriving the same record kind.
   V3's earliest-eligible representative rule remains its historical contract.
   Private training uses bounded random replay, not a full-dataset fit for each
   arrival: at most 16 fresh and 48 eligible historical train rows, plus a stable
@@ -192,6 +214,19 @@
   follows the actual measurement group's durable assignment. Its own observation
   no later than exclusion also preserves that group's historical membership when
   another source owns the canonical alias.
+- Separate raw result retention from explicit supervised-input admission.
+  An output-only cross-split collision must block that exact group/board and
+  affected descendants, not unrelated inputs in the source run. Genuine admitted
+  root conflicts still quarantine the source. Preserve immutable exclusions and
+  splits; an owner-only recovery may append a resolution only after auditing
+  the original output-only trigger, all previously admitted/measured inputs and
+  the full affected branch. Pin the audit to current global anchor authority in
+  the atomic write, and derive received-parent admission context from verified
+  server evidence, never client metadata. A stale audit must fail without writes.
+  Apply effective group exclusions plus scoped input blocks to leasing, fitting,
+  replay completion and model ancestry. Export the effective filters and the
+  immutable historical exclusions/resolutions separately. Analysis receipts must
+  report post-materialization eligibility rather than a stale pre-child result.
 - CPU remains the default. Optional private GPU learning must finish an active
   unit before switching off and retry failed GPU work from retained CPU weights
   and optimizer state. Native training uses epoch boundaries; ORT inference
@@ -258,8 +293,11 @@
   apply first-bag peer-spin, same-depth spin-gap or efficiency cuts. Retain real
   spins, exact certificates, necessary material/cost bounds and terminal priority;
   this exception does not ban first-bag spins or suppress small-goal completion.
-- After the first bag, within the same bag depth and probability resource, search ranking must preserve the bounded spin contract: field quality
-  can reverse a one-spin difference, never a two-spin difference. Keep composite
+- After the first bag, within the same bag depth and probability resource,
+  completed-bag and terminal proposals use S + 0.45Q/(120+abs(Q)), so field
+  quality cannot reverse one actual spin. Incomplete ordinary prefixes retain
+  the historical 0.95 coefficient to preserve preparation diversity; v2-v4
+  collectors also retain their original ordering. Keep composite
   forecast/terrain quality separate from the actual-spin rank; apply that rank
   normalization once and add no bonuses afterwards.
   Normalize scheduling quality in spin units before dividing by productive

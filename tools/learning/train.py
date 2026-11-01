@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from spin_contract import (ARCHITECTURE, MAX_FILE_BYTES, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, TASK, NEXT_BAG_TASK,
                            REFINED_TASK, REFINED_TARGET_POLICY, TARGET_DERIVATION, WEIGHTS_HASH_ALGORITHM,
+                           PRECISION_TASK, PRECISION_TARGET_DERIVATION, PRECISION_TRAINING_OBJECTIVE,
                            canonical_rows, read_jsonl, reject_constant, unique_keys,
                            validate_model, weights_hash, read_proofs, refined_selection_key, validate_refined_evidence)
 
@@ -50,7 +51,7 @@ def encode(rows):
 
 
 def record_model_version(record):
-    return 4 if record.get("kind") == "refined-next-bag-target" else record["schemaVersion"]
+    return (5 if record["task"] == PRECISION_TASK else 4) if record.get("kind") == "refined-next-bag-target" else record["schemaVersion"]
 
 
 def tensor_data(records, *, require_test=True):
@@ -74,13 +75,13 @@ def read_data(path, proofs=None, *, tensorize=True):
         raise ValueError("No freshly measured spin labels")
     groups, families, measurement_groups, boards, selections, protocols = {}, {}, {}, {}, set(), set()
     for record in records:
-        refined = record_model_version(record) == 4 and record.get("kind") == "refined-next-bag-target"
+        refined = record_model_version(record) in (4, 5) and record.get("kind") == "refined-next-bag-target"
         if record["policy"] not in {POLICY, NEXT_BAG_POLICY, REFINED_TARGET_POLICY}:
-            raise ValueError("Raw v4 and exploration observations cannot be fitted directly; use measured, evidence-linked derived targets")
+            raise ValueError("Raw v4/v5 and exploration observations cannot be fitted directly; use measured, evidence-linked derived targets")
         if refined:
             identity = record["evidence"]["observationId"]
             if proofs is None or identity not in proofs:
-                raise ValueError("V4 fitting requires --proofs with every selected target's complete original observation")
+                raise ValueError("Refined fitting requires --proofs with every selected target's complete original observation")
             validate_refined_evidence(record, proofs[identity])
         source = record["input"]["source"]
         split = source.get("split")
@@ -103,7 +104,7 @@ def read_data(path, proofs=None, *, tensorize=True):
                                  sort_keys=True, separators=(",", ":")))
     if len(protocols) != 1:
         raise ValueError("One model must use one fixed labeling policy")
-    return records, tensor_data(records, require_test=record_model_version(records[0]) != 4) if tensorize else None
+    return records, tensor_data(records, require_test=record_model_version(records[0]) not in (4, 5)) if tensorize else None
 
 
 def bounded_refined_replay(records, seed, previous_selection=None):
@@ -116,7 +117,7 @@ def bounded_refined_replay(records, seed, previous_selection=None):
     """
     train = [r for r in records if r["input"]["source"]["split"] == "train"]
     if len(train) < 4:
-        raise ValueError("V4 replay requires at least four eligible train targets and an independent validation split")
+        raise ValueError("Refined replay requires at least four eligible train targets and an independent validation split")
     fresh = train[-16:]
     replay_pool = train[:-len(fresh)] if fresh else []
     replay = random.Random(seed).sample(replay_pool, min(48, len(replay_pool)))
@@ -188,28 +189,38 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
     return {"modelId": checkpoint["modelId"], "weightsSha256": checkpoint["weightsSha256"],
             "datasetSha256": checkpoint["datasetSha256"],
             "trainingDatasetLineage": lineage,
-            **({"datasetSelection": checkpoint.get("datasetSelection", {})} if checkpoint["schemaVersion"] == 4 else {}),
+            **({"datasetSelection": checkpoint.get("datasetSelection", {})} if checkpoint["schemaVersion"] in (4, 5) else {}),
             "splitAudit": "Historical and new family/group/board assignments agree; only train rows receive gradients."}
 
 
-def criterion(pred, target):
+def criterion(pred, target, *, precision=False):
     found = nn.functional.binary_cross_entropy_with_logits(pred[:, 0], target[:, 0])
     count = nn.functional.smooth_l1_loss(pred[:, 1], target[:, 1])
+    if precision:
+        # Counts already use the shared /6 normalization. The additional
+        # one-sided term doubles the count loss/gradient only for underestimates.
+        deficit = torch.relu(target[:, 1] - pred[:, 1])
+        count = count + nn.functional.smooth_l1_loss(deficit, torch.zeros_like(deficit))
     return 0.25 * found + count
 
 
-def metrics(pred, target, horizon):
+def metrics(pred, target, horizon, *, precision=False):
     probability = pred[:, 0].sigmoid()
     count = (pred[:, 1] * 6).clamp(0, horizon * 6)
     truth = target[:, 1] * 6
-    return {
+    result = {
         "foundSpinBrier": (probability - target[:, 0]).square().mean().item(),
         "foundSpinLogLoss": nn.functional.binary_cross_entropy_with_logits(pred[:, 0], target[:, 0]).item(),
         "observedSpinsMAE": (count - truth).abs().mean().item(),
         "observedSpinsRMSE": (count - truth).square().mean().sqrt().item(),
-        "selectionLoss": criterion(pred, target).item(),
+        "selectionLoss": criterion(pred, target, precision=precision).item(),
         "foundSpinPrevalence": target[:, 0].mean().item(),
     }
+    if precision:
+        result.update({"observedSpinsMeanDeficit": (truth - count).clamp_min(0).mean().item(),
+                       "observedSpinsMeanExcess": (count - truth).clamp_min(0).mean().item(),
+                       "observedSpinsUnderestimateRate": (count < truth).float().mean().item()})
+    return result
 
 
 def cpu_snapshot(value):
@@ -234,11 +245,12 @@ class EpochRuntime:
     blocks further GPU attempts until an OFF then ON request is observed.
     """
 
-    def __init__(self, model, optimizer, *, gpu=False, control=None):
+    def __init__(self, model, optimizer, *, gpu=False, control=None, precision=False):
         self.model, self.optimizer = model, optimizer
         self.device = "cpu"
         self.requested_gpu = gpu
         self.control = control
+        self.precision = precision
         self.blocked = False
         self.fallback = None
         self.control_error = None
@@ -283,7 +295,7 @@ class EpochRuntime:
         self.model.train()
         for batch in permutation.split(8):
             self.optimizer.zero_grad(set_to_none=True)
-            loss = criterion(self.model(train_x[batch].to(self.device)), train_y[batch].to(self.device))
+            loss = criterion(self.model(train_x[batch].to(self.device)), train_y[batch].to(self.device), precision=self.precision)
             if not torch.isfinite(loss).item():
                 raise ValueError("Training produced a nonfinite loss")
             loss.backward()
@@ -291,7 +303,7 @@ class EpochRuntime:
             self.optimizer.step()
         self.model.eval()
         with torch.inference_mode():
-            validation = criterion(self.model(val_x.to(self.device)), val_y.to(self.device)).item()
+            validation = criterion(self.model(val_x.to(self.device)), val_y.to(self.device), precision=self.precision).item()
         if not math.isfinite(validation):
             raise ValueError("Training produced a nonfinite validation loss")
         if self.device == "cuda":
@@ -346,7 +358,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", type=Path, required=True)
     p.add_argument("--proofs", type=Path, action="append", default=[],
-                   help="V4 only: full immutable observations-index.jsonl exports; repeat for historical proofs")
+                   help="V4/V5: full immutable observations-index.jsonl exports; repeat for historical proofs")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--model-output", type=Path, required=True)
     p.add_argument("--epochs", type=int, default=300)
@@ -388,7 +400,10 @@ def main():
     model = BoardCNN().to(device="cpu")
     assert sum(x.numel() for x in model.parameters()) == ARCHITECTURE["parameters"]
     initial = initialize_from_checkpoint(model, a.initial_model, a.initial_labels, records, a.history_labels, proofs) if a.initial_model else None
-    refined = record_model_version(records[0]) == 4
+    version = record_model_version(records[0])
+    precision = version == 5
+    refined = version in (4, 5)
+    derivation = PRECISION_TARGET_DERIVATION if precision else TARGET_DERIVATION
     replay_selection = None
     if refined:
         data, replay_selection = bounded_refined_replay(records, a.seed, initial.get("datasetSelection") if initial else None)
@@ -396,7 +411,7 @@ def main():
     else:
         data = tensor_data(records)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    compute = EpochRuntime(model, optimizer, gpu=a.gpu, control=a.gpu_control)
+    compute = EpochRuntime(model, optimizer, gpu=a.gpu, control=a.gpu_control, precision=precision)
     best_loss, best_epoch, best_state, history = math.inf, 0, None, []
     started = time.monotonic()
     train_x, train_y, _ = data["train"]
@@ -404,7 +419,7 @@ def main():
     if initial:
         model.eval()
         with torch.inference_mode():
-            best_loss = criterion(model(val_x), val_y).item()
+            best_loss = criterion(model(val_x), val_y, precision=precision).item()
         best_epoch, best_state = 0, copy.deepcopy(model.state_dict())
         initial["validationLoss"] = best_loss
     for epoch in range(1, a.epochs + 1):
@@ -431,8 +446,8 @@ def main():
     with torch.inference_mode():
         for split, (x, y, chosen) in data.items():
             pred = model(x)
-            evaluation[split] = {"count": len(x), "cnn": metrics(pred, y, horizon),
-                                 "trainingMeanBaseline": metrics(baseline.expand_as(y), y, horizon)}
+            evaluation[split] = {"count": len(x), "cnn": metrics(pred, y, horizon, precision=precision),
+                                 "trainingMeanBaseline": metrics(baseline.expand_as(y), y, horizon, precision=precision)}
             for r, output, target in zip(chosen, pred.tolist(), y.tolist()):
                 predictions.append({"id": r["input"]["id"], "split": split,
                                     **({"recordId": r["id"], "observationId": r["evidence"]["observationId"]} if refined else {}),
@@ -442,10 +457,10 @@ def main():
     weight_hash = weights_hash(weights)
     dataset_hash = hashlib.sha256(a.labels.read_bytes()).hexdigest()
     runtime = {
-        "schemaVersion": 4 if refined else 3 if next_bag else 2, "task": REFINED_TASK if refined else NEXT_BAG_TASK if next_bag else TASK,
+        "schemaVersion": version, "task": PRECISION_TASK if precision else REFINED_TASK if refined else NEXT_BAG_TASK if next_bag else TASK,
         # A retained epoch-zero checkpoint can be evaluated against a new
         # dataset without overwriting the original immutable model artifact.
-        "modelId": ("naga-next-bag-v4-" if refined else "naga-next-bag-v3-" if next_bag else "naga-spin-v2-") + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
+        "modelId": ("naga-next-bag-v5-" if precision else "naga-next-bag-v4-" if refined else "naga-next-bag-v3-" if next_bag else "naga-spin-v2-") + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
         # The artifact device describes portable inference, not the training host.
         "architecture": ARCHITECTURE, "trained": True, "device": "cpu",
         "datasetSha256": dataset_hash, "weightsSha256": weight_hash,
@@ -460,8 +475,10 @@ def main():
     if next_bag:
         runtime["targetHorizonBags"] = 1
     if refined:
-        runtime["targetDerivation"] = TARGET_DERIVATION
+        runtime["targetDerivation"] = derivation
         runtime["datasetSelection"] = replay_selection
+    if precision:
+        runtime["trainingObjective"] = PRECISION_TRAINING_OBJECTIVE
     if initial:
         runtime["trainingDatasetLineage"] = sorted(set(initial["trainingDatasetLineage"]) | {dataset_hash})
     validate_model(runtime)
@@ -477,12 +494,14 @@ def main():
         "torch": torch.__version__, "seed": a.seed, "threads": a.threads,
         "initialization": "Compatible same-task checkpoint; policy and historical splits audited" if initial else "Fresh random weights; no legacy checkpoint or score supervision",
         "initialCheckpoint": initial,
-        **({"datasetSelection": replay_selection, "targetDerivation": TARGET_DERIVATION} if refined else {}),
+        **({"datasetSelection": replay_selection, "targetDerivation": derivation} if refined else {}),
+        **({"trainingObjective": PRECISION_TRAINING_OBJECTIVE} if precision else {}),
         "epochsRun": len(history), "selectedEpoch": best_epoch,
         "selection": "Validation loss only; held-out test evaluated once after fitting.",
         "seconds": time.monotonic() - started, "optimizer": "AdamW",
         "lr": 0.001, "weightDecay": 0.01, "batchSize": 8,
-        "loss": "0.25 * BCEWithLogits(foundSpin) + SmoothL1(observedSpins / 6, beta=1)",
+        "loss": ("0.25 * BCEWithLogits(foundSpin) + SmoothL1(predictedSpins / 6, observedSpins / 6, beta=1) + SmoothL1(relu((observedSpins - predictedSpins) / 6), 0, beta=1)" if precision
+                 else "0.25 * BCEWithLogits(foundSpin) + SmoothL1(observedSpins / 6, beta=1)"),
         "promotion": "Private candidate only; no deployed model is replaced. Warm-start retains epoch zero if validation does not improve.",
         "history": history,
     }
@@ -502,8 +521,10 @@ def main():
     if next_bag:
         report["targetHorizonBags"] = 1
     if refined:
-        report["targetDerivation"] = TARGET_DERIVATION
+        report["targetDerivation"] = derivation
         report["datasetSelection"] = replay_selection
+    if precision:
+        report["trainingObjective"] = PRECISION_TRAINING_OBJECTIVE
     (a.output / "training-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     (a.output / "predictions.json").write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n")
     (a.output / "model-card.json").write_text(json.dumps({

@@ -126,7 +126,7 @@ function certifiedChain(label: FocusedSpinLabel, last: FocusedWitness,
 
 export function focusedDescendants(observation: FocusedObservation): FocusedOrigin[] {
   const label = observation.label;
-  if (label.schemaVersion === 3 || label.schemaVersion === 4) return reachableDescendants(observation);
+  if (label.schemaVersion >= 3) return reachableDescendants(observation);
   if (label.policy !== 'neyra-fixed-bag-continuation-v2' || label.schemaVersion !== 2 ||
       label.config.horizonBags < 2 || label.config.horizonBags > 3 || !label.certifiedWitnesses.length) return [];
   const byId = new Map(label.certifiedWitnesses.map(witness => [witness.id, witness]));
@@ -167,6 +167,7 @@ function reachableChain(label: FocusedSpinLabel, last: FocusedReachableWitness,
     const witness = chain[index];
     if (witness.trust !== 'input-reachable' || witness.wholeBag !== true || witness.bags !== index + 1 ||
       !sameRows(witness.startRows, previous) || witness.startSpins !== spins || !physicalRows(witness.endRows) ||
+      ['checked', 'success', 'quietSafeSupplies', 'firstBagSymmetryAssumed'].some(key => key in witness) ||
       witness.frames.length !== 7 || witness.targets.length !== 7 || witness.representativeQueue.length !== 7 ||
       witness.representativeInputs.length !== 7 || new Set(witness.representativeQueue).size !== 7 ||
       !Number.isInteger(witness.deletedRows) || witness.deletedRows < 0 || witness.deletedRows > 0xffffffff) return false;
@@ -194,7 +195,7 @@ function reachableChain(label: FocusedSpinLabel, last: FocusedReachableWitness,
 /** Versioned observation shape, physical frame continuity and honest horizons.
  * This does not turn a client-reported input path into a P7 certificate. */
 export function validNextBagLabel(label: FocusedSpinLabel): boolean {
-  if (label.schemaVersion === 4) return validRefinedNextBagLabel(label);
+  if (label.schemaVersion >= 4) return validRefinedNextBagLabel(label);
   try {
     const witnesses = label.reachableWholeBagWitnesses, measured = label.measured;
     const config = label.config, lookahead = measured.lookahead;
@@ -225,6 +226,7 @@ export function validNextBagLabel(label: FocusedSpinLabel): boolean {
       !integer(measured.maxReachableObservedSpins, label.targets.observedSpins, config.horizonBags * 6)) return false;
     const byId = new Map(witnesses.map(witness => [witness.id, witness]));
     if (byId.size !== witnesses.length || witnesses.some(witness => !integer(witness.id, 1, Number.MAX_SAFE_INTEGER) ||
+      ['checked', 'success', 'quietSafeSupplies', 'firstBagSymmetryAssumed'].some(key => key in witness) ||
       !reachableChain(label, witness, byId))) return false;
     const depths = measured.depths;
     if (!Array.isArray(depths) || depths.length !== config.horizonBags || depths.some((depth, index) => {
@@ -286,7 +288,7 @@ function refinedPrefix(value: unknown, start: number[]) {
 }
 
 function refinedPhase(value: unknown, start: number[], quota: number, attempts: number,
-  retained: number) {
+  retained: number, precision = false) {
   if (!record(value) || value.allocatedWork !== quota || value.censored !== true ||
     !integer(value.workUsed, 1, quota) || !integer(value.generationWork, 1, value.workUsed) ||
     !integer(value.verificationWork, 0, value.workUsed) ||
@@ -297,7 +299,8 @@ function refinedPhase(value: unknown, start: number[], quota: number, attempts: 
     value.distinctWholeBagCandidates < retained || !record(value.targets) ||
     !integer(value.targets.observedSpins, 0, 6) ||
     value.targets.foundSpin !== (value.targets.observedSpins > 0) ||
-    !['generation_quota', 'attempt_limit'].includes(String(value.stopReason))) return null;
+    !(precision ? ['frontier_exhausted', 'generation_quota', 'spin_capacity_reached']
+      : ['generation_quota', 'attempt_limit']).includes(String(value.stopReason))) return null;
   const target = value.targetWitness === null ? null : refinedPrefix(value.targetWitness, start);
   const deepest = value.deepestWitness === null ? null : refinedPrefix(value.deepestWitness, start);
   if ((value.targetWitness !== null && !target) || (value.deepestWitness !== null && !deepest) ||
@@ -311,48 +314,60 @@ function refinedPhase(value: unknown, start: number[], quota: number, attempts: 
     deepest: value.deepestReachedPlacements };
 }
 
-/** V4 is a separate collection contract. Legacy observations keep their
+/** V4/V5 are separate collection contracts. Legacy observations keep their
  * original targets, evidence counts and horizon semantics. */
 function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
   try {
     const config = label.config, measured = label.measured, refinement = label.refinement;
+    const precision = label.schemaVersion === 5;
     const witnesses = label.reachableWholeBagWitnesses;
-    if (label.task !== 'naga-next-bag-spin-v4' || label.policy !== 'concentrated-next-bag-spin-v4' ||
-      label.targetHorizonBags !== 1 || config.observationVersion !== 4 || config.horizonBags !== 2 ||
+    if (label.task !== (precision ? 'naga-next-bag-spin-v5' : 'naga-next-bag-spin-v4') || label.policy !== (precision ? 'precision-single-bag-spin-v5' : 'concentrated-next-bag-spin-v4') ||
+      label.targetHorizonBags !== 1 || config.observationVersion !== (precision ? 5 : 4) || config.horizonBags !== (precision ? 1 : 2) ||
       !integer(config.workBudget, 1024, 4194304) || !integer(config.beamWidth, 4, 128) ||
       !integer(config.profile, 0, 3) || !integer(config.seed, 0, Number.MAX_SAFE_INTEGER) ||
-      !integer(config.maxNodes, 4, 256) || !integer(config.attemptsPerNode, 1, 16) ||
+      !integer(config.maxNodes, precision ? 1 : 4, 256) || !integer(config.attemptsPerNode, 1, precision ? 1 : 16) ||
       typeof config.sourceRevision !== 'string' || !config.sourceRevision ||
       !rows(label.input.rows) || !integer(label.input.source.bagBoundary, 2, 510) ||
       !Array.isArray(witnesses) || witnesses.length > Math.min(config.maxNodes, 32) ||
       !Array.isArray(label.certifiedWitnesses) || label.certifiedWitnesses.length ||
       !integer(label.targets.observedSpins, 0, 6) || label.targets.foundSpin !== (label.targets.observedSpins > 0) ||
-      !record(refinement) || refinement.schemaVersion !== 1 ||
-      refinement.policy !== 'uniform-score-band-three-arm-equal-quota-v1' ||
+      !record(refinement) || refinement.schemaVersion !== (precision ? 2 : 1) ||
+      refinement.policy !== (precision ? 'spin-first-single-bag-transpositions-v1' : 'uniform-score-band-three-arm-equal-quota-v1') ||
       !integer(refinement.selectionSeed, 0, 0xffffffff) ||
       typeof refinement.selectionScoreMin !== 'number' || !Number.isFinite(refinement.selectionScoreMin) ||
       typeof refinement.selectionScoreMax !== 'number' || !Number.isFinite(refinement.selectionScoreMax) ||
       refinement.selectionScoreMin > refinement.selectionScoreMax ||
-      !integer(refinement.selectionBandCount, 1, 4) || refinement.armLimit !== 3 ||
+      !integer(refinement.selectionBandCount, 1, 4) || refinement.armLimit !== (precision ? 0 : 3) ||
       refinement.candidatePoolCapacity !== config.maxNodes ||
       !integer(refinement.candidatePoolSize, 0, config.maxNodes) ||
       !integer(refinement.candidatePoolDrops, 0, Number.MAX_SAFE_INTEGER) ||
       !integer(refinement.candidateDuplicates, 0, Number.MAX_SAFE_INTEGER) ||
       !integer(refinement.proofCapacityDrops, 0, Number.MAX_SAFE_INTEGER) ||
       refinement.proofCapacity !== Math.min(config.maxNodes, 32) ||
-      !integer(refinement.armQuota, 1, config.workBudget) ||
+      !integer(refinement.armQuota, precision ? 0 : 1, config.workBudget) ||
       !integer(refinement.dependencyWorkBudget, 0, config.workBudget) ||
       refinement.dependencyWorkBudget !== Math.min(4096, Math.floor(config.workBudget / 32)) ||
-      refinement.armQuota !== Math.floor((config.workBudget - refinement.dependencyWorkBudget) / 4) ||
+      refinement.armQuota !== (precision ? 0 : Math.floor((config.workBudget - refinement.dependencyWorkBudget) / 4)) ||
       !integer(refinement.dependencyWorkUsed, 0, refinement.dependencyWorkBudget) ||
       !Array.isArray(refinement.candidates) || refinement.candidates.length !== witnesses.length ||
-      !Array.isArray(refinement.arms) || refinement.arms.length > 3 ||
+      !Array.isArray(refinement.arms) || refinement.arms.length > (precision ? 0 : 3) ||
       measured.censored !== true || !integer(measured.workUsed, 1, config.workBudget)) return false;
+    if (precision) {
+      const stats = refinement.intraBag;
+      if (!record(stats) || stats.schemaVersion !== 1 || stats.policy !== 'oriented-occupancy-remaining-labels-spin-dominance-v1' ||
+        stats.frontierCapacity !== 126 * config.beamWidth * 5 + 1 || stats.transpositionCapacity !== config.maxNodes * 256 ||
+        !integer(stats.maximumPendingStates, 0, stats.frontierCapacity as number) ||
+        ['expandedStates', 'physicalTranspositions', 'orderTranspositions', 'dominatedStates', 'spinBoundPruned',
+          'frontierDrops', 'transpositionEvictions'].some(key => !integer(stats[key], 0, Number.MAX_SAFE_INTEGER)) ||
+        Number(stats.orderTranspositions) > Number(stats.physicalTranspositions) ||
+        !['frontier_exhausted', 'generation_quota', 'spin_capacity_reached'].includes(String(measured.stopReason))) return false;
+    }
     const byId = new Map(witnesses.map(witness => [witness.id, witness]));
     if (byId.size !== witnesses.length || witnesses.some(witness => !integer(witness.id, 1, Number.MAX_SAFE_INTEGER) ||
       !reachableChain(label, witness, byId))) return false;
-    const root = refinedPhase(refinement.root, label.input.rows, refinement.armQuota, config.attemptsPerNode,
-      witnesses.filter(witness => witness.bags === 1).length);
+    const rootQuota = precision ? config.workBudget - refinement.dependencyWorkBudget : refinement.armQuota;
+    const root = refinedPhase(refinement.root, label.input.rows, rootQuota, config.attemptsPerNode,
+      witnesses.filter(witness => witness.bags === 1).length, precision);
     if (!root || root.spins !== label.targets.observedSpins ||
       witnesses.some(witness => witness.bags === 1 && witness.endSpins > root.spins)) return false;
     let totalWork = root.work + refinement.dependencyWorkUsed, generation = root.generation;
@@ -389,7 +404,8 @@ function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
       candidateIds.add(candidate.witnessId);
       const dependency = candidate.dependency;
       if (dependency === null) { if (selected.has(candidate.witnessId)) return false; continue; }
-      if (!selected.has(candidate.witnessId) || !record(dependency) || dependency.schemaVersion !== 1 ||
+      if ((!precision && !selected.has(candidate.witnessId)) || !record(dependency) || dependency.schemaVersion !== 1 ||
+        ['probability', 'successRate', 'quietSafeSupplies'].some(key => key in dependency) ||
         dependency.policy !== 'touching-components-origin-only-v1' ||
         dependency.connectivity !== 'orthogonal-logical-target-cells' ||
         dependency.maxOrdersPerComponent !== 64 ||
@@ -414,8 +430,9 @@ function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
         dependency.successfulOrders !== success || dependency.workUsed !== work) return false;
       dependencyWork += work;
     }
+    if (precision && refinement.candidates.filter(candidate => record(candidate) && candidate.dependency !== null).length > 3) return false;
     const lookahead = measured.lookahead;
-    if (!record(lookahead) || lookahead.targetHorizonBags !== 1 || lookahead.requestedBags !== 2 ||
+    if (!record(lookahead) || lookahead.targetHorizonBags !== 1 || lookahead.requestedBags !== config.horizonBags ||
       lookahead.deepestAttemptedBag !== (selected.size ? 2 : 1) ||
       lookahead.deepestReachedPlacements !== deepest ||
       lookahead.deepestCompletedBag !== Math.max(0, ...witnesses.map(witness => witness.bags)) ||
@@ -426,7 +443,7 @@ function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
         'quietPolicyRejections', 'supplyRejections', 'graphOverflows'].some(key => measured[key] !== 0) ||
       measured.maxCertifiedObservedSpins !== null) return false;
     const depths = measured.depths;
-    if (!Array.isArray(depths) || depths.length !== 2 || depths.some((depth, index) => {
+    if (!Array.isArray(depths) || depths.length !== config.horizonBags || depths.some((depth, index) => {
       const at = witnesses.filter(witness => witness.bags === index + 1);
       return !record(depth) || depth.bags !== index + 1 || depth.geometricWholeBagChains !== at.length ||
         depth.productiveGeometricWholeBagChains !== at.filter(witness => witness.endSpins > 0).length ||
@@ -437,7 +454,7 @@ function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
     for (const [value, target] of [[label.targetWitness, true], [label.reachableWitness, false]] as const) {
       if (value === null || value === undefined) { if (target ? root.deepest !== 0 : deepest !== 0) return false; continue; }
       if (!record(value) || value.certifiedParentId !== null ||
-        !integer(value.completedParentBags, 0, 1) || !integer(value.additionalPlacements, 1, 7)) return false;
+        !integer(value.completedParentBags, 0, precision ? 0 : 1) || !integer(value.additionalPlacements, 1, 7)) return false;
       const parent = value.reachableParentId === null || value.reachableParentId === undefined
         ? null : byId.get(value.reachableParentId as number);
       if ((value.completedParentBags === 0) !== (parent === null) ||
@@ -496,20 +513,16 @@ function reachableDescendants(observation: FocusedObservation): FocusedOrigin[] 
 }
 
 function compareOrigins(a: FocusedOrigin, b: FocusedOrigin): number {
-  return b.input.source.bagBoundary - a.input.source.bagBoundary ||
-    Number(b.parentObservationId !== null) - Number(a.parentObservationId !== null) ||
-    b.gain - a.gain || a.input.id.localeCompare(b.input.id);
+  return a.input.id.localeCompare(b.input.id);
 }
 
-/** Shared, bounded frontier gives descendants priority over more shallow roots. */
+/** A bounded score-stratified frontier; bag depth does not imply precision. */
 export class FocusedFrontier {
   private pending: FocusedOrigin[] = [];
   private pendingByKey = new Map<string, FocusedOrigin>();
   // Only dispatched origins consume history. An offered board trimmed from the
   // bounded frontier has not been observed and must remain eligible later.
   private seen = new Set<string>();
-  private shallowJobs = new Map<number, number>();
-  private shallowRoots = new Map<number, number>();
   private seed = 1;
   private randomState = 1;
   private draws = 0;
@@ -531,7 +544,7 @@ export class FocusedFrontier {
   get length() { return this.pending.length; }
 
   add(origin: FocusedOrigin) {
-    if (this.seen.size >= 4096 || !rows(origin.input.rows) || !this.eligible(origin)) return;
+    if (this.seen.size >= 4096 || !rows(origin.input.rows)) return;
     const key = focusedBoardKey(origin.input.rows);
     if (this.seen.has(key)) return;
     const previous = this.pendingByKey.get(key);
@@ -542,27 +555,17 @@ export class FocusedFrontier {
     this.pendingByKey.set(key, origin);
     this.pending.push(origin);
     if (this.pending.length > 128) {
-      // Keep deep coverage without using a top-score cut to erase low-quality
-      // strata before they can be measured. Replacement within a depth is random.
-      const shallowest = Math.min(...this.pending.map(item => item.input.source.bagBoundary));
-      const replaceable = this.pending.filter(item => item.input.source.bagBoundary === shallowest);
-      const removed = replaceable[Math.floor(this.random() * replaceable.length)];
+      // Bounded random replacement preserves score and depth diversity without
+      // silently promoting a later bag over a more thoroughly measured origin.
+      const removed = this.pending[Math.floor(this.random() * this.pending.length)];
       this.pending.splice(this.pending.indexOf(removed), 1);
       this.pendingByKey.delete(focusedBoardKey(removed.input.rows));
     }
   }
 
-  private eligible(origin: FocusedOrigin): boolean {
-    const depth = origin.input.source.bagBoundary;
-    if (depth !== 2 && depth !== 3) return true;
-    return (this.shallowJobs.get(depth) ?? 0) < 4 &&
-      (origin.parentObservationId !== null || (this.shallowRoots.get(depth) ?? 0) < 2);
-  }
-
   take() {
     if (!this.pending.length) return null;
-    const depth = Math.max(...this.pending.map(item => item.input.source.bagBoundary));
-    const pool = this.pending.filter(item => item.input.source.bagBoundary === depth);
+    const pool = this.pending;
     // Scores from different evaluators have different units. Select a homogeneous
     // score pool before drawing a quality stratum, then a node within that stratum.
     const kind = (item: FocusedOrigin) => item.evaluation && Number.isFinite(item.evaluation.score)
@@ -597,30 +600,12 @@ export class FocusedFrontier {
     const key = focusedBoardKey(origin.input.rows);
     this.pendingByKey.delete(key);
     this.seen.add(key);
-    if (depth === 2 || depth === 3) {
-      this.shallowJobs.set(depth, (this.shallowJobs.get(depth) ?? 0) + 1);
-      if (origin.parentObservationId === null) this.shallowRoots.set(depth, (this.shallowRoots.get(depth) ?? 0) + 1);
-      // Wide shallow sibling sets must not consume the whole observation quota.
-      // Exhausting this small allowance lets the preserved search seek deeper roots.
-      this.pending = this.pending.filter((entry) => {
-        if (this.eligible(entry)) return true;
-        this.pendingByKey.delete(focusedBoardKey(entry.input.rows));
-        return false;
-      });
-    }
     return origin;
   }
 
   /** A final broad-search snapshot can precede its completed acknowledgement.
    * Return a job assigned in that gap; it has consumed no collector work. */
   release(origin: FocusedOrigin) {
-    const depth = origin.input.source.bagBoundary;
-    if (depth === 2 || depth === 3) {
-      this.shallowJobs.set(depth, Math.max(0, (this.shallowJobs.get(depth) ?? 0) - 1));
-      if (origin.parentObservationId === null) {
-        this.shallowRoots.set(depth, Math.max(0, (this.shallowRoots.get(depth) ?? 0) - 1));
-      }
-    }
     this.seen.delete(focusedBoardKey(origin.input.rows));
     this.add(origin);
   }
@@ -628,7 +613,6 @@ export class FocusedFrontier {
   clear(resetBudget = true) {
     this.pending = [];
     this.pendingByKey.clear();
-    this.seen.clear();
-    if (resetBudget) { this.shallowJobs.clear(); this.shallowRoots.clear(); }
+    if (resetBudget) this.seen.clear();
   }
 }

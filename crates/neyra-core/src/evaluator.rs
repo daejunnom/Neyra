@@ -112,18 +112,22 @@ impl SpinModel {
             }
         }
         let mut hidden = [0.0; 32];
+        let hidden_bias = &w["hidden.bias"];
+        let hidden_weight = &w["hidden.weight"];
         for (out, value) in hidden.iter_mut().enumerate() {
-            let mut sum = w["hidden.bias"][out];
+            let mut sum = hidden_bias[out];
             for (i, input) in pooled.iter().enumerate() {
-                sum += input * w["hidden.weight"][out * 384 + i];
+                sum += input * hidden_weight[out * 384 + i];
             }
             *value = sum.max(0.0);
         }
         let mut output = [0.0; 2];
+        let output_bias = &w["output.bias"];
+        let output_weight = &w["output.weight"];
         for (out, value) in output.iter_mut().enumerate() {
-            let mut sum = w["output.bias"][out];
+            let mut sum = output_bias[out];
             for (i, input) in hidden.iter().enumerate() {
-                sum += input * w["output.weight"][out * 32 + i];
+                sum += input * output_weight[out * 32 + i];
             }
             *value = sum;
         }
@@ -131,16 +135,22 @@ impl SpinModel {
     }
 
     pub fn evaluate(&self, board: &Board) -> Option<BoardEvaluation> {
+        self.evaluate_with_raw(board).map(|(_, evaluation)| evaluation)
+    }
+
+    /// Produce raw and interpreted outputs with one forward pass. Native
+    /// collection/validation clients often need both representations together.
+    pub fn evaluate_with_raw(&self, board: &Board) -> Option<([f32; 2], BoardEvaluation)> {
         let raw = self.raw_prediction(board)?;
         let logit = f64::from(raw[0]).clamp(-80.0, 80.0);
-        Some(BoardEvaluation {
+        Some((raw, BoardEvaluation {
             schema_version: 2, task: MODEL_TASK, model_id: self.model_id.clone(),
             found_spin_likelihood: 1.0 / (1.0 + (-logit).exp()),
             observed_spins: (f64::from(raw[1]) * 6.0).clamp(0.0, f64::from(self.horizon_bags) * 6.0),
             horizon_bags: self.horizon_bags, work_budget: self.work_budget,
             experimental: true,
             scope: "Current occupancy only. Predictions of censored follow-up spin observations; not construction probability, exhaustive feasibility, or a heuristic-score blend.",
-        })
+        }))
     }
 }
 
@@ -196,4 +206,8 @@ pub fn raw_prediction(board: &Board) -> Option<[f32; 2]> {
 
 pub fn evaluate(board: &Board) -> Option<BoardEvaluation> {
     model()?.evaluate(board)
+}
+
+pub fn evaluate_with_raw(board: &Board) -> Option<([f32; 2], BoardEvaluation)> {
+    model()?.evaluate_with_raw(board)
 }

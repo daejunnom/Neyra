@@ -21,8 +21,8 @@ It runs new continuation collection only when no received observations remain.
   its fixed work budget. Certified result boards enter a bounded global frontier
   ordered by depth, so origins can advance beyond the initial 2-to-4 window.
   The existing selected worker pool performs this work; no extra worker pool is
-  created for public collection. Ordinary broad search resumes when no focused
-  work remains or sharing is turned off.
+  created for public collection. Workers without an assigned collection job
+  continue ordinary broad search, including while parent delivery is pending.
 - At origin bags two and three, each depth admits at most two broad roots and
   four total jobs per run, including certified descendants. These limits survive
   consent toggles. When those shallow opportunities are exhausted, ordinary
@@ -37,6 +37,11 @@ It runs new continuation collection only when no received observations remain.
   relay. Retries retain FIFO observations; saturation pauses allocation instead
   of dropping a parent. Each observation is at most 512 KiB, sent alone in a v4
   envelope. Existing v3 trace batches remain compatible and separately bounded.
+- Frontier deduplication distinguishes queued proposals from dispatched jobs.
+  Evicting an unstarted proposal does not mark it as explored; a better or deeper
+  representative can replace a queued duplicate. Successful observation uploads
+  drain the FIFO immediately, while failures retain bounded retry backoff.
+  Queued wire payloads are immutable serialized values with measured UTF-8 size.
 - The endpoint checks exact policy, source identity, work accounting, witness
   links and physical lock/line transitions. These are structural checks, not a
   fresh SRS/P7 execution. Received evidence remains **client-reported**.
@@ -69,16 +74,41 @@ the corpus before canonical occupancy hashing. The corpus activation endpoint
 first previews actual retained public records, then requires that preview digest
 when applying the migration. It does not manufacture sources for old examples.
 
-Each session remains bounded. Two candidate workers train from the same retained
-parent with different seeds, sharing the total epoch budget. Validation selects
-between candidates and the unchanged parent. Test labels do not choose a winner.
-Model records retain worker/backend details and training dataset provenance.
+The CPU thread setting defaults to the browser's reported hardware concurrency
+and accepts a manual limit up to 128. A reusable worker pool runs received
+analysis and eligible fallback jobs in parallel. Analysis claims are batched up
+to eight and fallback claims up to the selected capacity; an atomic claim keeps
+one job from being assigned twice. Received work retains priority. Independent
+workers retain separate engine instances and memories. Models and training data
+are installed once per worker
+for a cycle, and the validated Rust evaluator is reused for each unchanged model.
+TensorFlow is loaded only when a worker receives an actual training request;
+received analysis and fallback collection do not load the training runtime.
+
+Training uses at most 20 attempted epochs per cycle, divided among CPU candidates
+up to the selected thread count. Each candidate has at most ten epochs; a single
+worker therefore retains the ten-epoch cap. GPU learning permits at most two
+concurrent candidates. Every candidate starts from the same retained parent with
+a different seed. Validation selects between candidates and the unchanged parent;
+test labels do not choose a winner. Model records retain the actual worker,
+backend, epoch allocation and training dataset provenance. A session continues
+while work is available, in bounded units, and can be paused between units.
 
 Sites D1 stores boards, source groups, fixed splits, observation indices, model
 indices, training runs, search traces and decision records. R2 stores the full
 observation witnesses, models and immutable export manifests.
 A same-origin authenticated API supports collection, model uploads and complete
 dataset exports.
+Results may commit only while their matching lease is current. Accepting received
+evidence and its training observation is transactional; late results cannot undo
+quarantine or clear a replacement worker's lease. Occupancy deduplication returns
+the immutable stored winner while preserving distinct received evidence records.
+If parent storage succeeds but certified child storage is interrupted, a missing
+completion marker schedules idempotent repair from the persisted proof. Duplicate
+receipts and bounded fallback preparation repair those exact fields; they do not
+rerun search or replace the original lineage with a later submission.
+Exports capture exclusions with their database bounds and overlap at most four
+artifact reads without changing page order, cursors or content hashes.
 The Site's existing service credential also permits agent uploads and readback;
 it must never be copied into public code, command arguments, files or logs.
 
@@ -97,6 +127,9 @@ error, without resetting unrelated collector failures or active leases.
 
 The model has **33,442 parameters**, including **21,056** in the convolutional
 extractor. Input is a `1 × 24 × 10` occupancy tensor, bottom row first.
+The WASM `SpinEvaluator` owns one validated immutable checkpoint and can evaluate
+many boards before disposal. Its raw prediction and summary share one forward
+pass. The native evaluator also emits both results from that single pass.
 The lexicographically smaller board/reflection is used for geometric invariance;
 this does not claim identical mirrored physical supply coverage.
 

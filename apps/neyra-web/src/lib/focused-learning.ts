@@ -37,8 +37,8 @@ export function focusedRoot(field: TrainingField): FocusedOrigin | null {
 }
 
 /** Read exact native evidence before using a result field as another origin. */
-function certifiedChain(label: FocusedSpinLabel, last: FocusedWitness): boolean {
-  const byId = new Map(label.certifiedWitnesses.map(witness => [witness.id, witness]));
+function certifiedChain(label: FocusedSpinLabel, last: FocusedWitness,
+  byId: ReadonlyMap<number, FocusedWitness>): boolean {
   const chain: FocusedWitness[] = [];
   const seen = new Set<number>();
   let current: FocusedWitness | undefined = last;
@@ -76,11 +76,13 @@ function certifiedChain(label: FocusedSpinLabel, last: FocusedWitness): boolean 
 export function focusedDescendants(observation: FocusedObservation): FocusedOrigin[] {
   const label = observation.label;
   if (label.policy !== 'neyra-fixed-bag-continuation-v2' || label.schemaVersion !== 2 ||
-      label.config.horizonBags < 2 || label.config.horizonBags > 3) return [];
+      label.config.horizonBags < 2 || label.config.horizonBags > 3 || !label.certifiedWitnesses.length) return [];
+  const byId = new Map(label.certifiedWitnesses.map(witness => [witness.id, witness]));
+  if (byId.size !== label.certifiedWitnesses.length) return [];
   const result: FocusedOrigin[] = [];
   for (const witness of label.certifiedWitnesses) {
     const depth = label.input.source.bagBoundary + witness.bags;
-    if (depth > 510 || !certifiedChain(label, witness)) continue;
+    if (depth > 510 || !certifiedChain(label, witness, byId)) continue;
     result.push({ input: {
       id: `${observation.id}:certificate-${witness.id}`, rows: [...witness.endRows],
       source: { ...label.input.source, bagBoundary: depth,
@@ -92,9 +94,18 @@ export function focusedDescendants(observation: FocusedObservation): FocusedOrig
     b.gain - a.gain || a.input.id.localeCompare(b.input.id));
 }
 
+function compareOrigins(a: FocusedOrigin, b: FocusedOrigin): number {
+  return b.input.source.bagBoundary - a.input.source.bagBoundary ||
+    Number(b.parentObservationId !== null) - Number(a.parentObservationId !== null) ||
+    b.gain - a.gain || a.input.id.localeCompare(b.input.id);
+}
+
 /** Shared, bounded frontier gives descendants priority over more shallow roots. */
 export class FocusedFrontier {
   private pending: FocusedOrigin[] = [];
+  private pendingByKey = new Map<string, FocusedOrigin>();
+  // Only dispatched origins consume history. An offered board trimmed from the
+  // bounded frontier has not been observed and must remain eligible later.
   private seen = new Set<string>();
   private shallowJobs = new Map<number, number>();
   private shallowRoots = new Map<number, number>();
@@ -105,12 +116,18 @@ export class FocusedFrontier {
     if (this.seen.size >= 4096 || !rows(origin.input.rows) || !this.eligible(origin)) return;
     const key = focusedBoardKey(origin.input.rows);
     if (this.seen.has(key)) return;
-    this.seen.add(key);
+    const previous = this.pendingByKey.get(key);
+    if (previous) {
+      if (compareOrigins(origin, previous) >= 0) return;
+      this.pending.splice(this.pending.indexOf(previous), 1);
+    }
+    this.pendingByKey.set(key, origin);
     this.pending.push(origin);
-    this.pending.sort((a, b) => b.input.source.bagBoundary - a.input.source.bagBoundary ||
-      Number(b.parentObservationId !== null) - Number(a.parentObservationId !== null) ||
-      b.gain - a.gain || a.input.id.localeCompare(b.input.id));
-    if (this.pending.length > 128) this.pending.length = 128;
+    this.pending.sort(compareOrigins);
+    if (this.pending.length > 128) {
+      const removed = this.pending.pop()!;
+      this.pendingByKey.delete(focusedBoardKey(removed.input.rows));
+    }
   }
 
   private eligible(origin: FocusedOrigin): boolean {
@@ -123,13 +140,20 @@ export class FocusedFrontier {
   take() {
     const origin = this.pending.shift();
     if (!origin) return null;
+    const key = focusedBoardKey(origin.input.rows);
+    this.pendingByKey.delete(key);
+    this.seen.add(key);
     const depth = origin.input.source.bagBoundary;
     if (depth === 2 || depth === 3) {
       this.shallowJobs.set(depth, (this.shallowJobs.get(depth) ?? 0) + 1);
       if (origin.parentObservationId === null) this.shallowRoots.set(depth, (this.shallowRoots.get(depth) ?? 0) + 1);
       // Wide shallow sibling sets must not consume the whole observation quota.
       // Exhausting this small allowance lets the preserved search seek deeper roots.
-      this.pending = this.pending.filter((entry) => this.eligible(entry));
+      this.pending = this.pending.filter((entry) => {
+        if (this.eligible(entry)) return true;
+        this.pendingByKey.delete(focusedBoardKey(entry.input.rows));
+        return false;
+      });
     }
     return origin;
   }
@@ -144,15 +168,13 @@ export class FocusedFrontier {
         this.shallowRoots.set(depth, Math.max(0, (this.shallowRoots.get(depth) ?? 0) - 1));
       }
     }
-    this.pending.push(origin);
-    this.pending.sort((a, b) => b.input.source.bagBoundary - a.input.source.bagBoundary ||
-      Number(b.parentObservationId !== null) - Number(a.parentObservationId !== null) ||
-      b.gain - a.gain || a.input.id.localeCompare(b.input.id));
-    if (this.pending.length > 128) this.pending.length = 128;
+    this.seen.delete(focusedBoardKey(origin.input.rows));
+    this.add(origin);
   }
 
   clear(resetBudget = true) {
     this.pending = [];
+    this.pendingByKey.clear();
     this.seen.clear();
     if (resetBudget) { this.shallowJobs.clear(); this.shallowRoots.clear(); }
   }

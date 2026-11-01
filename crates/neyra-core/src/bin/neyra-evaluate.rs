@@ -35,10 +35,14 @@ fn run() -> Result<(), String> {
             return Err(format!("Line {}: row exceeds ten columns", line_index + 1));
         }
         let board = neyra_core::physics::Board { rows };
+        let prediction = model.as_ref().map_or_else(
+            || neyra_core::evaluator::evaluate_with_raw(&board),
+            |model| model.evaluate_with_raw(&board),
+        );
         let result = serde_json::json!({
             "id": input.get("id"),
-            "rawOutput": model.as_ref().map_or_else(|| neyra_core::evaluator::raw_prediction(&board), |model| model.raw_prediction(&board)),
-            "boardEvaluation": model.as_ref().map_or_else(|| neyra_core::evaluator::evaluate(&board), |model| model.evaluate(&board)),
+            "rawOutput": prediction.as_ref().map(|(raw, _)| raw),
+            "boardEvaluation": prediction.as_ref().map(|(_, evaluation)| evaluation),
         });
         writeln!(output, "{result}").map_err(|e| e.to_string())?;
     }

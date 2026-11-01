@@ -223,9 +223,12 @@ scope.onmessage = async ({ data }) => {
     learningEnabled = data.learningEnabled === true;
     runId = data.runId;
     const requestedId = runId;
+    const mayInitialize = () => runId === requestedId && requested !== 'cancelled';
     try {
       const module = await wasm(data.assetBase, data.assetVersion);
-      if (runId !== requestedId) return;
+      // An explicit cancel while the module is loading must not allocate a
+      // new engine afterwards. Already initialized archives remain available.
+      if (!mayInitialize()) return;
       loadedModule = module;
       // Pause/cancel can arrive while the async module is loading.
       // Public Pages always runs the established search. A stale saved config

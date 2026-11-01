@@ -173,12 +173,15 @@ pub fn clearing_only_finish(language: &ClearOnlyLanguage, queue: &[u8; 7]) -> Su
 pub fn permutation(mut rank: usize) -> [u8; 7] {
     const FACT: [usize; 7] = [720, 120, 24, 6, 2, 1, 1];
     assert!(rank < P7_COUNT);
-    let mut available = vec![0, 1, 2, 3, 4, 5, 6];
+    // Only seven labels are ever removed. Keep this fixed scratch space on
+    // the stack instead of allocating a Vec for every supply/prefix query.
+    let mut available = [0, 1, 2, 3, 4, 5, 6];
     let mut result = [0; 7];
     for i in 0..7 {
         let index = rank / FACT[i];
         rank %= FACT[i];
-        result[i] = available.remove(index);
+        result[i] = available[index];
+        available.copy_within(index + 1..7 - i, index);
     }
     result
 }

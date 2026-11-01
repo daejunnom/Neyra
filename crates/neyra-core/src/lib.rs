@@ -34,6 +34,34 @@ pub fn evaluate_board_model(rows_json: &str, model_json: &str) -> Result<String,
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// One validated immutable downloaded model, reusable inside a learning worker.
+/// JavaScript owns this handle and must call its generated `free()` method when
+/// replacing the model. No global model selection or search state is changed.
+#[wasm_bindgen]
+pub struct SpinEvaluator {
+    model: evaluator::SpinModel,
+}
+
+#[wasm_bindgen]
+impl SpinEvaluator {
+    #[wasm_bindgen(constructor)]
+    pub fn new(model_json: &str) -> Result<SpinEvaluator, JsValue> {
+        let model = evaluator::SpinModel::from_json(model_json)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(Self { model })
+    }
+
+    pub fn evaluate(&self, rows_json: &str) -> Result<String, JsValue> {
+        let rows: [u16; physics::HEIGHT] = serde_json::from_str(rows_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid board: {e}")))?;
+        if rows.iter().any(|&row| row > physics::FULL_ROW) {
+            return Err(JsValue::from_str("Board cells exceed ten columns"));
+        }
+        serde_json::to_string(&self.model.evaluate(&physics::Board { rows }))
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}
+
 /// CPU training clients can bootstrap from these versioned embedded weights.
 #[wasm_bindgen]
 pub fn spin_model_json() -> String { evaluator::model_json().into() }

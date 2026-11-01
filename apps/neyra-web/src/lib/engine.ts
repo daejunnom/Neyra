@@ -484,11 +484,12 @@ export class SearchClient {
       occupied++;
       slot.worker.postMessage({ type: 'observe', runId: this.runId, observationId: id, input: origin.input } satisfies EngineCommand);
     }
-    const focusing = occupied > 0 || this.focusedFrontier.length > 0;
     for (const slot of available) {
-      if (slot.focusedJob || slot.focusedWaiting === focusing) continue;
-      slot.focusedWaiting = focusing;
-      slot.worker.postMessage({ type: focusing ? 'observation-wait' : 'observation-idle', runId: this.runId } satisfies EngineCommand);
+      if (slot.focusedJob || !slot.focusedWaiting) continue;
+      // Receipt/backpressure limits only collection. Spare workers can keep
+      // discovering deeper certified roots instead of idling on the network.
+      slot.focusedWaiting = false;
+      slot.worker.postMessage({ type: 'observation-idle', runId: this.runId } satisfies EngineCommand);
     }
   }
 

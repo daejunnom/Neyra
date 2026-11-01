@@ -89,6 +89,22 @@
   in separate untrusted trace records, never in the CNN's supervised targets.
   Reject old default-on ingress envelopes. Deduplicate trace identity separately
   from training occupancy so different runs of a known board retain evidence.
+- Keep queued frontier keys separate from dispatched-job history. Evicted or
+  unstarted proposals must remain eligible; admission limits still apply.
+  Unassigned public workers continue broad search during focused collection
+  and acknowledgement backpressure. Immutable wire payloads may be shared,
+  but consent generations and parent acknowledgements must remain independent.
+- Private parallel claims are atomic and lease-qualified. Received acceptance
+  and its label insertion must commit together; late work cannot bypass
+  quarantine or release another worker's lease. Reuse exact validated model
+  weights within each worker, with private engine instances and memory.
+  Private CPU capacity follows the selected hardware thread count up to 128;
+  candidate training shares at most 20 attempted epochs per cycle, at most ten
+  per candidate and two concurrent GPU candidates. Preserve the parent as a
+  validation candidate and record actual allocation and backend metadata.
+  Load the training runtime only for training work. Interrupted certified child
+  admission must be repairable from the immutable parent proof, with a bounded
+  repair batch after received-work priority checks; do not rerun collection.
 - Preserve the released v2 checkpoint and fixed-policy collector. Private seeded
   exploration changes proposal ordering only, within the same declared budget;
   store its seed, ordinal and distinct policy. Its certified child boards may

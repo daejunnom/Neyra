@@ -10,8 +10,8 @@ export interface ContributionState {
   dropped: number;
 }
 
-type Pending = { field: TrainingContribution; key: string; order: number };
-type PendingObservation = { observation: FocusedObservation; key: string };
+type Pending = { serialized: string; bytes: number; bagBoundary: number; key: string; order: number };
+type PendingObservation = { id: string; body: string; key: string };
 export type ObservationDelivery = { id: string; status: 'acknowledged' | 'rejected' };
 type Batch = { entries: Pending[]; observation?: PendingObservation; body: string };
 type PublicIngestion = { url: string; anonKey: string };
@@ -41,6 +41,14 @@ export const MAX_PENDING_OBSERVATIONS = 8;
 const MAX_OBSERVATION_BYTES = 512 * 1024;
 const MAX_ATTEMPTS = 6;
 const FLUSH_DELAY = 3000;
+const encoder = new TextEncoder();
+const envelopePrefix = (schemaVersion: number, key: string) =>
+  `${JSON.stringify({ schemaVersion, consent: { version: 2,
+    scope: 'verified-search-process', decision: 'allow' } }).slice(0, -1)},"${key}":[`;
+const TRACE_PREFIX = envelopePrefix(3, 'fields');
+const OBSERVATION_PREFIX = envelopePrefix(4, 'observations');
+const ENVELOPE_SUFFIX = ']}';
+const TRACE_ENVELOPE_BYTES = encoder.encode(TRACE_PREFIX + ENVELOPE_SUFFIX).byteLength;
 
 /** This guard catches accidental privileged-key configuration. The server is
  * still responsible for verifying the JWT, payload and storage permissions. */
@@ -109,17 +117,19 @@ export class ContributionClient {
     const key = `${field.id}:${field.source.bagBoundary}:${field.rows.join(',')}`;
     if (this.seen.has(key)) return;
     const serialized = JSON.stringify(field);
-    if (!field.trace || new TextEncoder().encode(serialized).byteLength > MAX_FIELD_BYTES) {
+    const bytes = encoder.encode(serialized).byteLength;
+    if (!field.trace || bytes > MAX_FIELD_BYTES) {
       this.dropped++;
       this.publish();
       return;
     }
-    const copy = JSON.parse(serialized) as TrainingContribution;
-    const entry = { field: copy, key, order: this.order++ };
+    // The immutable wire representation owns the queued snapshot. Avoid a
+    // second full object graph and repeat serialization on every HTTP retry.
+    const entry = { serialized, bytes, bagBoundary: field.source.bagBoundary, key, order: this.order++ };
     this.seen.set(key, true);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
     this.queue.push(entry);
-    this.queue.sort((a, b) => b.field.source.bagBoundary - a.field.source.bagBoundary || a.order - b.order);
+    this.queue.sort((a, b) => b.bagBoundary - a.bagBoundary || a.order - b.order);
     if (this.queue.length > MAX_QUEUE) {
       const index = this.queue.findLastIndex((item) => !this.inFlightKeys.has(item.key));
       const [evicted] = this.queue.splice(index, 1);
@@ -139,12 +149,12 @@ export class ContributionClient {
     const key = `observation:${observation.id}`;
     if (this.seen.has(key)) return false;
     const serialized = JSON.stringify(observation);
-    if (new TextEncoder().encode(serialized).byteLength > MAX_OBSERVATION_BYTES) {
+    if (encoder.encode(serialized).byteLength > MAX_OBSERVATION_BYTES) {
       this.dropped++;
       this.publish();
       return false;
     }
-    this.observations.push({ observation: JSON.parse(serialized) as FocusedObservation, key });
+    this.observations.push({ id: observation.id, body: OBSERVATION_PREFIX + serialized + ENVELOPE_SUFFIX, key });
     this.seen.set(key, true);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
     this.schedule(0);
@@ -176,7 +186,13 @@ export class ContributionClient {
 
   private schedule(delay = FLUSH_DELAY) {
     if (this.disposed || !this.enabled || !this.configured || (!this.queue.length && !this.observations.length) ||
-        this.inFlight || this.timer || this.phase === 'paused') return;
+        this.inFlight || this.phase === 'paused') return;
+    if (this.timer) {
+      // New observations can overtake a trace batching delay, but never an
+      // automatic failure backoff or the server's Retry-After interval.
+      if (delay !== 0 || this.phase !== 'ready') return;
+      clearTimeout(this.timer);
+    }
     this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, delay);
   }
 
@@ -184,21 +200,16 @@ export class ContributionClient {
     // A single observation leaves enough room for all bounded proof frames.
     // Parents are sent before the coordinator admits their descendants.
     const observation = this.observations[0];
-    if (observation) return { entries: [], observation, body: JSON.stringify({ schemaVersion: 4,
-      consent: { version: 2, scope: 'verified-search-process', decision: 'allow' },
-      observations: [observation.observation] }) };
+    if (observation) return { entries: [], observation, body: observation.body };
     const entries: Pending[] = [];
-    const encoder = new TextEncoder();
-    let body = '';
+    let bytes = TRACE_ENVELOPE_BYTES;
     for (const entry of this.queue.slice(0, MAX_BATCH)) {
-      const trial = JSON.stringify({ schemaVersion: 3,
-        consent: { version: 2, scope: 'verified-search-process', decision: 'allow' },
-        fields: [...entries, entry].map((item) => item.field) });
-      if (encoder.encode(trial).byteLength > MAX_BODY_BYTES) break;
+      const nextBytes = bytes + entry.bytes + (entries.length ? 1 : 0);
+      if (nextBytes > MAX_BODY_BYTES) break;
       entries.push(entry);
-      body = trial;
+      bytes = nextBytes;
     }
-    return { entries, body };
+    return { entries, body: entries.length ? TRACE_PREFIX + entries.map(entry => entry.serialized).join(',') + ENVELOPE_SUFFIX : '' };
   }
 
   private remove(entries: Pending[]) {
@@ -211,7 +222,7 @@ export class ContributionClient {
       const entry = batch.observation;
       this.observations = this.observations.filter((pending) => pending.key !== entry.key);
       // Delivery callbacks cannot turn a successful HTTP receipt into a retry.
-      try { this.delivered({ id: entry.observation.id, status }); } catch { /* Consumer is optional. */ }
+      try { this.delivered({ id: entry.id, status }); } catch { /* Consumer is optional. */ }
     } else this.remove(batch.entries);
   }
 
@@ -283,7 +294,7 @@ export class ContributionClient {
       this.inFlight = null;
       this.inFlightKeys.clear();
       if (!this.disposed) {
-        this.schedule(retryDelay ?? FLUSH_DELAY);
+        this.schedule(retryDelay ?? (this.observations.length ? 0 : FLUSH_DELAY));
         this.publish();
       }
     }

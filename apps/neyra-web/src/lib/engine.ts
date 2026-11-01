@@ -72,21 +72,27 @@ function sameForecast(a: Candidate, b: Candidate): boolean {
     aBags.length === bBags.length && aBags.every((spins, bag) => spins === bBags[bag]);
 }
 
-/** Compare actual spin efficiency after charging spent construction probability. */
+/** Compare foundations by future field quality, then productive routes by risk-adjusted efficiency. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
   const aProbability = probabilityFactor(a);
   const bProbability = probabilityFactor(b);
+  if (a.bagCount === 1 && b.bagCount > 1) return false;
+  if (b.bagCount === 1 && a.bagCount > 1) return true;
+  if (a.bagCount === 1 && b.bagCount === 1) {
+    if (fieldQuality(a) !== fieldQuality(b)) return fieldQuality(a) > fieldQuality(b);
+    const aStart = Number.isFinite(a.firstBagProbability) ? Math.max(0, Math.min(1, a.firstBagProbability!)) : 0;
+    const bStart = Number.isFinite(b.firstBagProbability) ? Math.max(0, Math.min(1, b.firstBagProbability!)) : 0;
+    if (aStart !== bStart) return aStart > bStart;
+    if (aProbability !== bProbability) return aProbability > bProbability;
+    if (a.spins !== b.spins) return a.spins > b.spins;
+    return a.placed < b.placed;
+  }
   const aRate = a.spins * aProbability * countedPieces(b);
   const bRate = b.spins * bProbability * countedPieces(a);
   if (aRate !== bRate) return aRate > bRate;
   if (aProbability !== bProbability) return aProbability > bProbability;
   if (a.bagCount !== b.bagCount) return a.bagCount > b.bagCount;
   if (a.spins !== b.spins) return a.spins > b.spins;
-  if (a.bagCount === 1 && b.bagCount === 1) {
-    const aStart = Number.isFinite(a.firstBagProbability) ? a.firstBagProbability! : 0;
-    const bStart = Number.isFinite(b.firstBagProbability) ? b.firstBagProbability! : 0;
-    if (aStart !== bStart) return aStart > bStart;
-  }
   if (fieldQuality(a) !== fieldQuality(b)) return fieldQuality(a) > fieldQuality(b);
   return a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability);
 }

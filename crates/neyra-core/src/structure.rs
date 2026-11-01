@@ -21,6 +21,23 @@ const UNEXPLAINED_HOLE_COST: f64 = 0.5;
 // Prepared roofs may justify some local surface damage, but never acquire the
 // value of an executed spin or cancel the board's hole/access obligations.
 const PREPARED_ROOF_LIMIT: f64 = 6.0;
+// A turning side wall can prepare a roof without already choosing a finisher.
+// It remains a small shape preference, separate from witnessed goal readiness.
+const CURLED_ROOF_COLUMN_REWARD: f64 = 0.5;
+const CURLED_ROOF_PREFERENCE_LIMIT: f64 = 2.0;
+// Repeated identical outlines need new preparation before they offer a turn.
+// Inspect a bounded local band; neither more sky nor an arbitrarily tall wall
+// creates additional preference beyond these limits.
+const WORKSPACE_SHAPE_LEVELS: usize = 5;
+const STRAIGHT_WORKSPACE_WINDOW_COST: f64 = 3.0;
+const STRAIGHT_WORKSPACE_LIMIT: f64 = 8.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StraightWorkspace {
+    columns: u16,
+    first_row: u8,
+    rows: u8,
+}
 
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
     mask.iter().map(|row| row.count_ones() as u16).sum()
@@ -90,6 +107,9 @@ pub(crate) struct BoardFacts {
     lower_slits: [u16; 3],
     workspace_reward: f64,
     bank_reward: f64,
+    curled_roof_reward: f64,
+    straight_workspaces: [StraightWorkspace; 16],
+    straight_workspace_count: usize,
 }
 
 impl BoardFacts {
@@ -137,6 +157,9 @@ impl BoardFacts {
             lower_slits: [0; 3],
             workspace_reward: 0.0,
             bank_reward: 0.0,
+            curled_roof_reward: 0.0,
+            straight_workspaces: [StraightWorkspace::default(); 16],
+            straight_workspace_count: 0,
         };
         for x in 0..WIDTH {
             let bit = 1 << x;
@@ -161,8 +184,135 @@ impl BoardFacts {
             .sum();
         facts.find_components(board);
         facts.find_working_air(board);
+        facts.find_workspace_shape(board);
         facts.summarize_cavity_costs(board);
         facts
+    }
+
+    /// Follow actual empty row intervals from the selected accessible pocket.
+    /// At most five levels and one coherent path contribute roof potential;
+    /// alternative branches never donate their lip columns to one another.
+    /// A lip must grow from the previous occupied side wall, so a floating
+    /// middle island and a completely closed lid do not earn this preference.
+    fn find_workspace_shape(&mut self, board: &Board) {
+        if self.workspace_columns == 0
+            || self.workspace_row > self.lower_floor.saturating_add(2)
+        {
+            return;
+        }
+        let start = self.workspace_row as usize;
+        let top = (start + WORKSPACE_SHAPE_LEVELS).min(self.height as usize);
+        let weight = lower_weight(start.saturating_sub(self.lower_floor as usize));
+        // A width<=6 interval can overlap at most two disjoint >=2-cell
+        // successors. Five levels therefore need at most 31 path entries.
+        let mut pending = [(0_u8, 0_u16, 0_u16, 0_u8, 0_u8); 64];
+        let mut count = 0;
+        let mut gaps = FULL_ROW & !board.rows[start];
+        while gaps != 0 {
+            let left = gaps.trailing_zeros() as usize;
+            let width = (gaps >> left).trailing_ones() as usize;
+            let columns = ((1_u16 << width) - 1) << left;
+            gaps &= !columns;
+            let connected = columns & self.workspace_columns & self.body_air[start];
+            if left > 0 && left + width < WIDTH && (2..=6).contains(&width)
+                && connected & (connected << 1) != 0
+            {
+                pending[count] = (start as u8, columns, 0, start as u8, 1);
+                count += 1;
+            }
+        }
+        while count != 0 {
+            count -= 1;
+            let (row, columns, lips, straight_start, straight_rows) = pending[count];
+            self.curled_roof_reward = self.curled_roof_reward.max(
+                (lips.count_ones() as f64 * CURLED_ROOF_COLUMN_REWARD)
+                    .min(CURLED_ROOF_PREFERENCE_LIMIT) * weight,
+            );
+            if straight_rows >= 3 {
+                if let Some(prior) = self.straight_workspaces[..self.straight_workspace_count]
+                    .iter_mut().find(|segment| segment.columns == columns
+                        && segment.first_row == straight_start)
+                {
+                    prior.rows = prior.rows.max(straight_rows);
+                } else {
+                    // At most three bounded >=2-cell intervals per row,
+                    // over the fixed five-row band: 16 slots cover all of them.
+                    debug_assert!(self.straight_workspace_count < self.straight_workspaces.len());
+                    self.straight_workspaces[self.straight_workspace_count] = StraightWorkspace {
+                        columns, first_row: straight_start, rows: straight_rows,
+                    };
+                    self.straight_workspace_count += 1;
+                }
+            }
+            let y = row as usize;
+            if y + 1 >= top { continue; }
+            let left = columns.trailing_zeros() as usize;
+            let right = (u16::BITS - columns.leading_zeros()) as usize;
+            let occupied = board.rows[y + 1];
+            let mut above = FULL_ROW & !occupied;
+            while above != 0 {
+                let next_left = above.trailing_zeros() as usize;
+                let width = (above >> next_left).trailing_ones() as usize;
+                let next_right = next_left + width;
+                let next = ((1_u16 << width) - 1) << next_left;
+                above &= !next;
+                let shared = columns & next & self.body_air[y] & self.body_air[y + 1];
+                if next_left == 0 || next_right == WIDTH || !(2..=6).contains(&width)
+                    || shared & (shared << 1) == 0
+                {
+                    continue;
+                }
+                let mut added = 0;
+                if right - left >= 3 {
+                    if next_left > left {
+                        let attached = ((1_u16 << next_left) - 1)
+                            & !((1_u16 << (left - 1)) - 1);
+                        if occupied & attached == attached {
+                            added |= columns & attached;
+                        }
+                    }
+                    if next_right < right {
+                        let attached = ((1_u16 << (right + 1)) - 1)
+                            & !((1_u16 << next_right) - 1);
+                        if occupied & attached == attached {
+                            added |= columns & attached;
+                        }
+                    }
+                }
+                let (first, rows) = if next == columns {
+                    (straight_start, straight_rows + 1)
+                } else { (row + 1, 1) };
+                debug_assert!(count < pending.len());
+                pending[count] = (row + 1, next, lips | added, first, rows);
+                count += 1;
+            }
+        }
+    }
+
+    /// Three identical rows form one straight window; another unchanged row
+    /// adds one window. Charge the worst connected segment rather than adding
+    /// alternative pockets. A current exact Single may explain only one window
+    /// of the segment containing its clearing footprint, not another segment.
+    fn straight_workspace_cost(&self, witness: Option<&SingleGoal>) -> f64 {
+        let reflected = self.is_symmetric_board && witness.is_some_and(|goal| {
+            self.active_workspace(Some(goal)) != self.workspace_columns
+        });
+        self.straight_workspaces[..self.straight_workspace_count].iter()
+            .map(|segment| {
+                let columns = if reflected {
+                    segment.columns.reverse_bits() >> (u16::BITS as usize - WIDTH)
+                } else { segment.columns };
+                let explained = witness.is_some_and(|goal| {
+                    goal.clear_row >= segment.first_row
+                        && goal.clear_row < segment.first_row + segment.rows
+                        && goal.required_empty[goal.clear_row as usize] & columns != 0
+                });
+                let windows = segment.rows.saturating_sub(2)
+                    .saturating_sub(u8::from(explained));
+                (f64::from(windows) * STRAIGHT_WORKSPACE_WINDOW_COST)
+                    .min(STRAIGHT_WORKSPACE_LIMIT)
+            })
+            .fold(0.0, f64::max)
     }
 
     /// Flood a two-by-two clearance stencil, not a point and not a mino.
@@ -812,7 +962,8 @@ impl BoardFacts {
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
             + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35
-            + self.lower_gap_cost(if witnessed { goal } else { None });
+            + self.lower_gap_cost(if witnessed { goal } else { None })
+            + self.straight_workspace_cost(if witnessed { goal } else { None });
         let usable_goal =
             goal.filter(|g| witnessed || self.goal_access_cost(&g.required_empty) == 0);
         let workspace = self.active_workspace(usable_goal);
@@ -878,6 +1029,7 @@ impl BoardFacts {
             - directional
             + self.workspace_reward
             + self.bank_reward
+            + self.curled_roof_reward
             + usable_goal.map_or(0.0, |goal| {
                 if witnessed && goal.clear_row > self.lower_floor.saturating_add(2) {
                     // A real higher spin can work above inherited residue.

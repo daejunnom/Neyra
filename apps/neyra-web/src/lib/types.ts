@@ -2,6 +2,8 @@ export interface SearchConfig {
   min_success_percent: number;
   /** Minimum success of each bag after the independently filtered opening. */
   bag_min_success_percent: number;
+  /** Later bags below this actual spin count require 100%; zero disables the restriction. */
+  risk_min_spins_per_bag: number;
   ignore_first_bag_probability: boolean;
   /** Independent setup filter. Zero leaves the first-bag chance unrestricted. */
   first_bag_min_success_percent: number;
@@ -117,6 +119,7 @@ export type EngineCommand =
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
   bag_min_success_percent: 100,
+  risk_min_spins_per_bag: 3,
   ignore_first_bag_probability: true,
   first_bag_min_success_percent: 80,
   piece_goal: 119,

@@ -47,6 +47,13 @@
   increase after probability has already been consumed.
   Independent worker profiles must keep separate certificates.
   Combining their displayed results does not combine their P7 success sets.
+- From bag two, permit a non-100% construction certificate only when that
+  fixed plan executes at least `risk_min_spins_per_bag` Spin Singles in the bag.
+  Default this configurable integer to 3; allow 0 through 6, with 0 disabling
+  the extra condition. Below it, require all 5,040 supplies, including the
+  terminal cost CDF. Use actual plan gain, never forecast or alternate-path
+  spins. Preserve explicit saved zero values. The first bag keeps its separate
+  construction floor and exclusion setting.
 - Each fixed plan must be quiet-safe for all 5,040 model supplies, regardless
   of either probability floor: every supply needs a legal strategy that reaches
   success or a forced clearing-supply blockage without a failed quiet placement.
@@ -61,11 +68,22 @@
   full logical rows only when those rows match the representative deleted-row
   mask. Use that fact for necessary first-supply checks; uncertainty and genuine
   terminal prefixes must bypass this gate. Preserve first-bag reflection.
+  A completed nonterminal zero-clear tiling whose full logical union proves
+  every target quiet may also use a necessary two-prefix geometry check before
+  expensive refinement. Check both spawns and one coherent orientation for
+  each ordered first/next pair; uncertainty bypasses it. Geometry cannot replace
+  actual input reachability or certify quiet coverage.
 - Keep proposal ordering distinct from proven bounds. An open passage or an
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
-- Within the same bag depth and probability resource, search ranking must preserve the bounded spin contract: field quality
+- Treat every nonterminal first bag as a foundation, including mixed rounds
+  and prefixes that incidentally clear. Compare its workspace, side banks,
+  preparation and dependency quality without an actual-spin rank bonus. Do not
+  apply first-bag peer-spin, same-depth spin-gap or efficiency cuts. Retain real
+  spins, exact certificates, necessary material/cost bounds and terminal priority;
+  this exception does not ban first-bag spins or suppress small-goal completion.
+- After the first bag, within the same bag depth and probability resource, search ranking must preserve the bounded spin contract: field quality
   can reverse a one-spin difference, never a two-spin difference. Keep composite
   forecast/terrain quality separate from the actual-spin rank; apply that rank
   normalization once and add no bonuses afterwards.
@@ -73,7 +91,11 @@
   locks, so its influence does not grow with bag depth. Explicit exploration
   age/attempt preferences remain scheduling choices, not field evidence.
   Temporary scheduling cooldowns must not change the archived best route.
-- The displayed partial record uses spins*countedProbability/max(7, placed),
+- The displayed partial record first prefers certified paths of at least two
+  bags over one-bag foundations. Compare two foundations by finite raw field
+  quality, first-bag probability, counted probability, actual spins, then fewer
+  locks. Missing quality remains unknown. Display foundation quality as its main
+  metric. For two later paths, use spins*countedProbability/max(7, placed),
   then higher counted probability, more bags and more total spins.
   This is a selection score, not an expected completion-time certificate.
   Scheduling uses R=spins*7/L + 0.2*quality/(120+abs(quality))*7/L,
@@ -81,13 +103,20 @@
   shift=0.2*7/L. Keep quality and its risk shift on the same depth scale.
   At probability one, return this R expression exactly. Pending plans
   use their verified parent's probability, never invented future coverage.
-  For two one-bag records with equal spins, higher first-bag
-  construction probability precedes raw field quality. Otherwise use raw field
-  quality, fewer locks and higher effective probability for remaining ties.
+  Use raw field quality, fewer locks and higher effective probability for
+  remaining later-path ties. First-bag scheduling sets productive spins to zero;
+  it does not remove actual spins from certificates or later-path efficiency.
   Include the setup bag in every public efficiency value; only internal
   scheduling may exclude it. Keep the total-spin maximum as separate progress.
   Reset only for a new run; compare records identically in Rust and TypeScript.
   Same-ID quality improvements must replace old fields and archived exports.
+- Under a relaxed overall floor, compare verified probability-resource use
+  with uniform logarithmic consumption to a fixed selected horizon. Add
+  `24*clamp(pacedFraction-spentFraction,-1,1)` only to temporary scheduling
+  quality. Ahead of pace is positive; early overspending is negative. Pending
+  plans use their verified parent's counts. Horizon widening must not refill
+  the resource, and 100% disables this adjustment. Export the projection and
+  its meaning without changing stored field quality, probability, or admission.
 - First-bag probability exclusion defaults on and is conditional on a
   constructible first bag. Preserve its separate chance and explicit saved
   settings; zero successful starts never qualify. The independent first-bag
@@ -188,8 +217,12 @@
   not a spin witness and cannot excuse inaccessible cavities. Reduce ordinary
   smoothness preference while preserving deep one-column repair dependencies
   and excess towers above a useful roof.
-  Root prefixes with no actual spin keep foundation-dependency weighting in
-  mixed rounds too; this changes ordering, not their permission to clear.
+  Every root prefix keeps foundation-dependency weighting in mixed rounds too.
+  Use `k*setup_score + weight*structural`, with weights .06 for locks 1–3,
+  then .12/.18/.24/.30 for locks 4–7, and k=1 or .35 for a relaxed setup round.
+  Use at most two points of ordering jitter. A first-bag pursuit may refer to a
+  next-bag finisher already spent in this inventory if its footprint remains
+  preserved; actual clears release it. This is ordering, not permission to clear.
 - Keep the af8 preparation gradient: the selected low workspace uses full
   width/depth preference and weaker-side occupancy density, plus a concrete
   prepared-roof reward capped at 6. Do not multiply these positive preferences
@@ -205,12 +238,36 @@
   may the goal-relative active-roof formula replace the ordinary roof reward,
   still capped at 6. Keep old low-roof behavior and inherited cells, raw debt
   and probability resources; a higher workspace never resets the board.
+- Add bounded curl potential and straight-wall cost around the selected low
+  workspace, within two rows of the inherited lower floor. Follow at most five
+  rows of actual empty intervals, width 2–6, between occupied sidewalls. Adjacent
+  rows must share at least two adjacent body-clearance cells. Keep coherent
+  paths separate; alternative branches must not donate lip columns to each other.
+  Curl potential is max_paths(L(level)*min(2,0.5*distinctAttachedLipColumns)),
+  with L=1/.6/.3 at levels 0/1/2. Count inward steps only from a gap at least
+  three cells wide, with occupied cells continuously attaching the new lip to
+  the previous sidewall. This small goal-free potential is separate from the
+  concrete prepared-roof reward. Floating islands, closed lids, repeated lip
+  columns and height outside the five-row band add no curl preference.
+- Add the worst connected straight segment's cost to terrain defects D:
+  min(8,3*max(rows-2-explained,0)). An unchanged gap over 3/4/5 rows costs
+  3/6/8; a lateral shift or changed width ends that segment. Do not sum costs
+  from alternative segments or apply the curl's level weight to this cost.
+  Only an exact immediate spin witness whose clearing footprint uses that
+  segment may set explained=1; every other segment keeps its charge. A curl
+  above a straight segment earns its own potential but does not explain a
+  straight window. Preserve one-column notches and edge I spaces outside this
+  2–6-cell rule. Terrain gains curl potential minus straight cost. These terms
+  do not change access exemptions, raw hole/debt masks, repayment, actual spins,
+  input reachability or P7 probability.
 
 - Continuation forecasts span two bag inventories and seek six coherent
   Spin Singles. Open the second inventory only after all seven first-bag labels
   have been placed and at least two actual forecast spins have occurred.
   Reset the bag-local start board, deleted rows and supply mask at that real
-  boundary. Keep at most three distinct typed paths; never sum alternatives'
+  boundary. Keep at most six distinct typed paths and six preparation recipes;
+  interleave finisher types and target positions before repeating one slot.
+  Never sum alternatives'
   spins, debt payments or supply success. First-bag gain/debt/obstruction remains
   separate from the total. With first/second gains g1/g2, first-bag quiet count q,
   paid initially charged cells p and terrain change dT, use
@@ -225,6 +282,19 @@
   checks sharing the cap. Stop deeper expansion at six spins.
   Forecasts are move-ordering hints, not P7 certificates or mandatory prefixes.
   Public progress counts executed verified bags. A missing forecast is unknown.
+- Continuation preparation may use up to three actual zero-line placements,
+  retaining both preserved goals and fresh alternatives. Allow one bounded
+  goal-free bank/cavity preparation after a spin or at the initial continuation
+  state; reserve an available ordinary placement inside the working cavity as
+  well as a general bank candidate. Every target-specific support must preserve
+  its goal. Keep input checks, inventory use and existing work caps; readiness
+  credit still requires at most two preparations. Diversify final paths by
+  finisher and target, and keep at most one independently replayed recipe pair.
+- Reserve one phase of every fourth exploration cycle for the deepest eligible
+  certified boundary of at least two bags. Retain stale, age, material, pace and
+  quality gates and verify waiting plans first. Protect a bounded set of untried
+  deep leaves during full-tree replacement, in addition to fresh foundations.
+  This schedules real continuations; it is not completion evidence or extra spins.
 
 - Retain forecast count, two-bag distribution and placement count in full,
   compact and exported summaries. Preserve the fixed plan's supply proof,

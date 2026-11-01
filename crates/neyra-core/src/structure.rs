@@ -9,77 +9,18 @@ use crate::physics::{Board, Piece, Pose, FULL_ROW, HEIGHT, WIDTH};
 
 pub(crate) type CellMask = [u16; HEIGHT];
 
-fn reflected_row(row: u16) -> u16 {
-    (row.reverse_bits() >> (u16::BITS as usize - WIDTH)) & FULL_ROW
-}
-
-fn reflection_order(board: &Board) -> std::cmp::Ordering {
-    for &row in &board.rows {
-        let order = row.cmp(&reflected_row(row));
-        if !order.is_eq() { return order; }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Shared geometric ordering only; this does not reflect or certify kicks.
-pub(crate) fn canonical_reflection(board: &Board, inventory: u8, profile: u8) -> bool {
-    let order = reflection_order(board);
-    if !order.is_eq() {
-        return order.is_gt();
-    }
-    let reflected_inventory = Piece::ALL.into_iter().fold(0_u8, |mask, piece| {
-        let reflected = match piece {
-            Piece::J => Piece::L,
-            Piece::L => Piece::J,
-            Piece::S => Piece::Z,
-            Piece::Z => Piece::S,
-            _ => piece,
-        };
-        mask | if inventory & piece.bit() != 0 { reflected.bit() } else { 0 }
-    });
-    if inventory != reflected_inventory {
-        return inventory > reflected_inventory;
-    }
-    profile % 4 == 2
-}
-
-pub(crate) fn canonical_pose_key(pose: Pose, reflected: bool) -> (u8, [(u8, u8); 4], u8) {
-    let piece = if reflected {
-        match pose.piece {
-            Piece::J => Piece::L,
-            Piece::L => Piece::J,
-            Piece::S => Piece::Z,
-            Piece::Z => Piece::S,
-            piece => piece,
-        }
-    } else { pose.piece };
-    let mut cells = pose.cells().map(|(x, y)| {
-        ((if reflected { WIDTH as i8 - 1 - x } else { x }) as u8, y as u8)
-    });
-    cells.sort_unstable();
-    let rotation = if reflected { (4 - (pose.rotation & 3)) & 3 } else { pose.rotation & 3 };
-    (piece as u8, cells, rotation)
-}
-
 // A smooth skyline is a weak convenience, not evidence of a usable spin
-// sequence. A central open channel is workspace; roofed storage cavities
-// still need a concrete single plan even when a clearance stencil reaches them.
+// sequence. Accessible side cavities are work space, while inaccessible
+// cavities, severe one-column debt and excess towers keep their own costs.
+const OUTWARD_BANK_LIMIT: f64 = 4.0;
 const SKYLINE_PREFERENCE_LIMIT: f64 = 2.0;
 const BANK_DENSITY_LIMIT: f64 = 8.0;
-// An immediate spin witness can explain its exact pocket. Mere geometric
-// access, including access from the central channel, cannot explain a hole.
+// Only cavities outside the central body's local service area incur this
+// burden. An actual spin witness can additionally explain its own cells.
 const UNEXPLAINED_HOLE_COST: f64 = 0.5;
 // Prepared roofs may justify some local surface damage, but never acquire the
 // value of an executed spin or cancel the board's hole/access obligations.
 const PREPARED_ROOF_LIMIT: f64 = 6.0;
-const UNPROVEN_STRUCTURE_LIMIT: f64 = 6.0;
-const STRAIGHT_CHANNEL_COST: f64 = 2.5;
-const STRAIGHT_CHANNEL_LIMIT: f64 = 5.0;
-// Two sky-open side lanes around a central island are not a second usable
-// workspace. Keep this local and bounded; a real sequence can still use both.
-const SEPARATED_CHANNEL_COST: f64 = 2.0;
-const SEPARATED_MASS_COST: f64 = 0.35;
-const SEPARATED_CHANNEL_LIMIT: f64 = 8.0;
 
 pub(crate) fn mask_count(mask: &CellMask) -> u16 {
     mask.iter().map(|row| row.count_ones() as u16).sum()
@@ -128,24 +69,19 @@ pub(crate) struct BoardFacts {
     /// Occupied cells on rows tied to those low-clearance obligations.
     /// Clears and kicks can recover them; never use this as a proven bound.
     pub obstructed_mass: u16,
-    /// One opening, or symmetric alternatives for proposal ordering. These
-    /// alternatives are never simultaneous workspace or debt exemptions.
+    /// A connected working opening chosen from the board, never fixed columns.
     pub workspace_columns: u16,
     pub workspace_width: u8,
     pub workspace_depth: u8,
+    is_symmetric_board: bool,
     body_air: CellMask,
     service_air: CellMask,
-    open_core: CellMask,
+    central_air: CellMask,
     charged_hole_count: u16,
     charged_cover_depth: u16,
     charged_buried_splits: u16,
     charged_surface_splits: u16,
-    primary_workspace: u16,
-    reflection_symmetric: bool,
-    reflection_preferred: bool,
-    straight_windows: CellMask,
-    straight_cost: f64,
-    separated_channel_cost: f64,
+    cavity_roof_tops: [u8; WIDTH],
     obstructed_cells: CellMask,
     workspace_roof_top: u8,
     workspace_row: u8,
@@ -158,7 +94,6 @@ pub(crate) struct BoardFacts {
 
 impl BoardFacts {
     pub(crate) fn new(board: &Board) -> Self {
-        let reflection = reflection_order(board);
         let mut facts = Self {
             holes: [0; HEIGHT],
             hole_count: 0,
@@ -179,19 +114,17 @@ impl BoardFacts {
             workspace_columns: 0,
             workspace_width: 0,
             workspace_depth: 0,
+            is_symmetric_board: board.rows.iter().all(|&row| {
+                row == row.reverse_bits() >> (u16::BITS as usize - WIDTH)
+            }),
             body_air: [0; HEIGHT],
             service_air: [0; HEIGHT],
-            open_core: [0; HEIGHT],
+            central_air: [0; HEIGHT],
             charged_hole_count: 0,
             charged_cover_depth: 0,
             charged_buried_splits: 0,
             charged_surface_splits: 0,
-            primary_workspace: 0,
-            reflection_symmetric: reflection.is_eq(),
-            reflection_preferred: reflection.is_gt(),
-            straight_windows: [0; HEIGHT],
-            straight_cost: 0.0,
-            separated_channel_cost: 0.0,
+            cavity_roof_tops: [0; WIDTH],
             obstructed_cells: [0; HEIGHT],
             workspace_roof_top: 0,
             workspace_row: 0,
@@ -323,7 +256,6 @@ impl BoardFacts {
             let level = y.saturating_sub(self.lower_floor as usize);
             if y >= self.lower_floor as usize && level < 3 {
                 let mut gaps = free[y];
-                let (mut channels, mut previous_end, mut separating_mass) = (0_u16, 0, 0_u16);
                 while gaps != 0 {
                     let left = gaps.trailing_zeros();
                     let width = (gaps >> left).trailing_ones();
@@ -335,27 +267,15 @@ impl BoardFacts {
                             self.lower_slits[level] |= run;
                         }
                     }
-                    let body = run & self.body_air[y];
-                    if body & (body << 1) != 0 {
-                        // Include edge-open lanes: an isolated central stack
-                        // must not escape this cost because neither lane has
-                        // two banks. Only occupied rows near the low work area
-                        // contribute, so empty sky and total tower height do not.
-                        if channels != 0 {
-                            let between = ((1_u16 << left) - 1)
-                                & !((1_u16 << previous_end) - 1);
-                            separating_mass |= between & board.rows[y];
-                        }
-                        channels += 1;
-                        previous_end = left + width;
-                    }
                 }
-                self.separated_channel_cost += lower_weight(level)
-                    * (channels.saturating_sub(1) as f64 * SEPARATED_CHANNEL_COST
-                        + separating_mass.count_ones().min(4) as f64 * SEPARATED_MASS_COST);
             }
         }
-        self.separated_channel_cost = self.separated_channel_cost.min(SEPARATED_CHANNEL_LIMIT);
+        // Equal workspaces follow a canonical board orientation, not the
+        // first physical x-run. This does not merge separate openings.
+        let reflection_preferred = board.rows.iter().find_map(|&row| {
+            let reflected = row.reverse_bits() >> (u16::BITS as usize - WIDTH);
+            (row != reflected).then_some(row > reflected)
+        }).unwrap_or(false);
         let mut best = f64::NEG_INFINITY;
         for y in 0..self.height as usize {
             let mut air = self.body_air[y];
@@ -382,8 +302,8 @@ impl BoardFacts {
                             && ((run & connected) & ((run & connected) << 1)) != 0
                             && two_banks(board.rows[above], run)
                         {
-                            // Keep every connected branch. Following only
-                            // the first x-run made reflected fields disagree.
+                            // Every connected branch contributes; reflection must not
+                            // select a different first branch.
                             next |= run;
                         }
                     }
@@ -397,47 +317,36 @@ impl BoardFacts {
                 // usable low working pocket. Reward only body-clearance
                 // connected openings near the lowest unfinished row.
                 let level = y.saturating_sub(self.lower_floor as usize);
-                let air = opening_width_reward(width as u8) + (depth - 1) as f64 * 0.6;
-                // Width and depth are weak preparation cues even with one
-                // immediate spin. They must not compete with actual throughput.
-                // Preserve the existing narrow-opening cost without scaling it.
-                let reward = lower_weight(level) * if air > 0.0 { air * 0.25 } else { air };
+                let reward = lower_weight(level)
+                    * (opening_width_reward(width as u8) + (depth - 1) as f64 * 0.6);
                 // Count the density of each bank, not its absolute mass or
                 // height. A solid pair of banks beside usable low air earns
                 // more than isolated blocks around the same opening. The
                 // weaker side limits this small bonus without demanding
                 // equal bank widths, heights, or a fixed central column.
-                // Blend occupancy with the run attached to the outer wall:
-                // an interior island is not equivalent to an outer side bank.
-                // The occupancy half preserves value for ordinary roof pockets.
                 let bank_reward = if width >= 3 && level < 3 {
                     let right = left + width;
                     let left_cells = (board.rows[y] & ((1_u16 << left) - 1)).count_ones();
                     let right_cells = (board.rows[y] & (FULL_ROW << right)).count_ones();
-                    let left_edge = board.rows[y].trailing_ones().min(left as u32);
-                    let right_edge = reflected_row(board.rows[y]).trailing_ones()
-                        .min((WIDTH - right) as u32);
-                    let density = ((left_cells + left_edge) as f64 / (2 * left) as f64)
-                        .min((right_cells + right_edge) as f64 / (2 * (WIDTH - right)) as f64);
+                    let density = (left_cells as f64 / left as f64)
+                        .min(right_cells as f64 / (WIDTH - right) as f64);
                     lower_weight(level) * density * BANK_DENSITY_LIMIT
                 } else {
                     0.0
                 };
                 let value = reward + bank_reward - level as f64 * 0.4;
-                let canonical_left = if self.reflection_preferred { WIDTH - left - width } else { left };
-                let old_left = if self.primary_workspace == 0 { WIDTH }
-                    else if self.reflection_preferred {
-                        reflected_row(self.primary_workspace).trailing_zeros() as usize
-                    } else { self.primary_workspace.trailing_zeros() as usize };
-                let tie = (y, (2 * left + width - 1).abs_diff(WIDTH - 1), canonical_left);
-                let old_tie = (self.workspace_row as usize,
-                    if self.primary_workspace == 0 { WIDTH * 2 } else {
-                        (2 * self.primary_workspace.trailing_zeros() as usize
-                            + self.workspace_width as usize - 1).abs_diff(WIDTH - 1)
-                    }, old_left);
+                let canonical_left = if reflection_preferred {
+                    WIDTH - left - width
+                } else { left };
+                let old_left = if self.workspace_columns == 0 { WIDTH }
+                    else if reflection_preferred {
+                        WIDTH - self.workspace_columns.trailing_zeros() as usize
+                            - self.workspace_width as usize
+                    } else { self.workspace_columns.trailing_zeros() as usize };
+                let tie = (y, canonical_left);
+                let old_tie = (self.workspace_row as usize, old_left);
                 if value > best || (value == best && tie < old_tie) {
                     best = value;
-                    self.primary_workspace = columns;
                     self.workspace_columns = columns;
                     self.workspace_width = width as u8;
                     self.workspace_depth = depth as u8;
@@ -448,111 +357,105 @@ impl BoardFacts {
                 }
             }
         }
-        // A self-reflecting field may have two equally good openings. Keep
-        // their real cell masks for proposal ordering, not their bounding
-        // interval. Evaluation chooses one; neutral history uses their overlap.
-        if self.reflection_symmetric {
-            self.workspace_columns |= reflected_row(self.workspace_columns);
+        self.find_central_air(&free, &slots, &mut queue);
+        // Two equal, disconnected openings on a self-reflecting board are
+        // alternatives. Only their shared core may relax unowned cavity or
+        // history debt; an arbitrary first x-run must not waive one side.
+        if self.is_symmetric_board {
+            for row in &mut self.central_air {
+                *row &= row.reverse_bits() >> (u16::BITS as usize - WIDTH);
+            }
         }
-        self.find_open_core(board);
     }
 
-    /// Follow the central core through the existing body-air rows. A wider
-    /// side bay does not widen this core or erase storage holes. No second
-    /// flood is needed, and a roofed cell is never exempt without a witness.
-    fn find_open_core(&mut self, board: &Board) {
-        if self.primary_workspace == 0
+    /// Reuse the clearance slots and queue for a local component rooted in
+    /// the selected low workspace. Global sky access alone does not make an
+    /// unrelated side shaft part of the central working cavity. The top is
+    /// only four rows above the workspace, so a high mouth cannot wash away
+    /// a blocked bottom. This is still a stencil, not exact mino reachability.
+    fn find_central_air(
+        &mut self,
+        free: &CellMask,
+        slots: &CellMask,
+        queue: &mut [u8; WIDTH * HEIGHT],
+    ) {
+        if self.workspace_columns == 0
             || self.workspace_row > self.lower_floor.saturating_add(2)
         {
             return;
         }
         let start = self.workspace_row as usize;
-        let top = (start + 4).min(self.height as usize);
-        let mut core_rows = [0_u16; HEIGHT];
-        core_rows[start] = self.primary_workspace;
-        for y in (0..start).rev() {
-            core_rows[y] = corridor_window(self.body_air[y], core_rows[y + 1],
-                self.workspace_width, self.reflection_preferred);
-            if core_rows[y] == 0 || !two_banks(board.rows[y], core_rows[y]) {
-                core_rows[y] = 0;
-                break;
-            }
-        }
-        for y in start + 1..top {
-            core_rows[y] = corridor_window(self.body_air[y], core_rows[y - 1],
-                self.workspace_width, self.reflection_preferred);
-            if core_rows[y] == 0 || !two_banks(board.rows[y], core_rows[y]) {
-                core_rows[y] = 0;
-                break;
-            }
-        }
-        let mut outlines = [0_u16; HEIGHT];
-        for y in 0..top {
-            let core = core_rows[y];
-            if core == 0 { continue; }
-            self.open_core[y] = core & !self.holes[y];
-            let mut free = FULL_ROW & !board.rows[y];
-            while free != 0 {
-                let left = free.trailing_zeros();
-                let width = (free >> left).trailing_ones();
-                let run = ((1_u16 << width) - 1) << left;
-                free &= !run;
-                if run & core == core && two_banks(board.rows[y], run) {
-                    outlines[y] = run;
-                    break;
+        let top = (start + 4).min(HEIGHT);
+        let pairs = self.workspace_columns & (self.workspace_columns >> 1);
+        let mut reached = [0_u16; HEIGHT];
+        let (mut read, mut len) = (0, 0);
+        for row in [start.checked_sub(1), Some(start)].into_iter().flatten() {
+            if row + 1 < top {
+                reached[row] = slots[row] & pairs;
+                if reached[row] != 0 {
+                    queue[len] = row as u8;
+                    len += 1;
                 }
             }
-            if self.reflection_symmetric {
-                // Alternative left/right openings are not proof that both
-                // are useful. Only their common open core is unambiguous.
-                self.open_core[y] &= reflected_row(self.open_core[y]);
+        }
+        while read < len {
+            let y = queue[read] as usize;
+            read += 1;
+            let mut row = reached[y];
+            loop {
+                let expanded = row | ((row << 1 | row >> 1) & slots[y]);
+                if row == expanded {
+                    break;
+                }
+                row = expanded;
+            }
+            reached[y] = row;
+            for next in [y.checked_sub(1), (y + 2 < top).then_some(y + 1)]
+                .into_iter()
+                .flatten()
+            {
+                let added = row & slots[next] & !reached[next];
+                if added != 0 {
+                    reached[next] |= added;
+                    queue[len] = next as u8;
+                    len += 1;
+                }
             }
         }
-        for y in self.lower_floor as usize..top.saturating_sub(2) {
-            let run = outlines[y];
-            if run != 0 && run == outlines[y + 1] && run == outlines[y + 2] {
-                self.straight_windows[y] = run | if self.reflection_symmetric {
-                    reflected_row(run)
-                } else { 0 };
-                self.straight_cost += STRAIGHT_CHANNEL_COST
-                    * lower_weight(y - self.lower_floor as usize);
-            }
+        for (y, &row) in reached.iter().enumerate().take(top - 1) {
+            let cells = row | row << 1;
+            self.central_air[y] |= cells;
+            self.central_air[y + 1] |= cells;
+        }
+        for (y, row) in self.central_air.iter_mut().enumerate().take(top) {
+            // One lateral tip can sit under a roof alongside the body. Do
+            // not propagate down one-cell shafts or through a long slit.
+            *row = (*row | *row << 1 | *row >> 1) & free[y] & !self.sealed[y];
         }
     }
 
-    /// Raw cell history remains intact. Only the open central core is neutral;
-    /// roofed storage holes remain obligations even when body-clearance exists.
+    /// Raw cell history remains intact. Accessible working cavities have no
+    /// current debt cost, but opening their roof never counts as filling them.
     pub(crate) fn penalized_debt(&self, cells: &CellMask) -> CellMask {
-        std::array::from_fn(|y| cells[y] & !self.open_core[y] & FULL_ROW)
-    }
-
-    /// Select one actual opening for terrain/roof evaluation. On a symmetric
-    /// board choose the alternative matching this goal; a mirrored goal gets
-    /// the mirrored choice. The public alternative mask is only an ordering
-    /// hint and must not protect both banks at once.
-    fn active_workspace(&self, goal: Option<&SingleGoal>) -> u16 {
-        let primary = self.primary_workspace;
-        if !self.reflection_symmetric { return primary; }
-        let reflected = reflected_row(primary);
-        if primary == reflected { return primary; }
-        let Some(goal) = goal else { return primary; };
-        let columns = goal.working_columns();
-        let overlap = (columns & primary).count_ones();
-        let other_overlap = (columns & reflected).count_ones();
-        if overlap != other_overlap {
-            return if other_overlap > overlap { reflected } else { primary };
-        }
-        for &row in &goal.required_empty {
-            let order = row.cmp(&reflected_row(row));
-            if !order.is_eq() { return if order.is_gt() { reflected } else { primary }; }
-        }
-        primary
+        std::array::from_fn(|y| cells[y] & !self.central_air[y] & FULL_ROW)
     }
 
     fn summarize_cavity_costs(&mut self, board: &Board) {
         self.charged_hole_count = self.hole_count;
         self.charged_cover_depth = self.cover_depth;
+        let mut relieved_columns = 0_u16;
         for (y, &row) in board.rows.iter().enumerate().take(self.height as usize) {
+            let relieved = self.holes[y] & self.central_air[y];
+            self.charged_hole_count -= relieved.count_ones() as u16;
+            relieved_columns |= relieved;
+            if y + 1 < HEIGHT {
+                let mut roofs = relieved & board.rows[y + 1];
+                while roofs != 0 {
+                    let x = roofs.trailing_zeros() as usize;
+                    roofs &= roofs - 1;
+                    self.cavity_roof_tops[x] = y as u8 + 2;
+                }
+            }
             if row == 0 {
                 continue;
             }
@@ -562,7 +465,7 @@ impl BoardFacts {
             self.split_gaps += runs.saturating_sub(1);
             // Outside the local workspace an uncovered row has only the
             // ordinary surface splits; no gap-by-gap classification is needed.
-            if self.open_core[y] == 0 && self.holes[y] == 0 {
+            if self.central_air[y] == 0 && self.holes[y] == 0 {
                 self.charged_surface_splits += runs.saturating_sub(1);
                 continue;
             }
@@ -574,7 +477,7 @@ impl BoardFacts {
                 let run = ((1_u16 << width) - 1) << left;
                 remaining &= !run;
                 buried += u16::from(run & self.holes[y] != 0);
-                let unserved = run & !self.open_core[y];
+                let unserved = run & !self.central_air[y];
                 charged += u16::from(unserved != 0);
                 charged_buried += u16::from(unserved & self.holes[y] != 0);
             }
@@ -583,50 +486,21 @@ impl BoardFacts {
             self.charged_buried_splits += buried_splits;
             self.charged_surface_splits += charged.saturating_sub(1) - buried_splits;
         }
-    }
-
-    fn straight_channel_cost(&self, witness: Option<&SingleGoal>) -> f64 {
-        let mut explained = 0.0_f64;
-        if let Some(goal) = witness {
-            let row = goal.clear_row as usize;
-            for y in row.saturating_sub(2)..=row.min(HEIGHT - 1) {
-                if self.straight_windows[y] & goal.required_empty[row] != 0 {
-                    explained = explained.max(STRAIGHT_CHANNEL_COST
-                        * lower_weight(y.saturating_sub(self.lower_floor as usize)));
+        // Only columns with an exempt cavity need another cover scan. This
+        // preserves raw cover facts and avoids a second complete board pass.
+        while relieved_columns != 0 {
+            let x = relieved_columns.trailing_zeros() as usize;
+            relieved_columns &= relieved_columns - 1;
+            let bit = 1 << x;
+            let mut above = 0;
+            for y in (0..self.heights[x] as usize).rev() {
+                if board.rows[y] & bit != 0 {
+                    above += 1;
+                } else if self.central_air[y] & bit != 0 {
+                    self.charged_cover_depth -= above;
                 }
             }
         }
-        (self.straight_cost - explained).max(0.0).min(STRAIGHT_CHANNEL_LIMIT)
-    }
-
-    /// Only a first spin replayed on this very board may claim these cells.
-    /// No alternative goal, support placement or later clear is merged here.
-    fn witness_relief(&self, goal: &SingleGoal) -> (u16, u16, u16, u16, [u8; WIDTH]) {
-        let (mut holes, mut cover, mut buried, mut surface) = (0, 0, 0, 0);
-        let mut roofs = [0; WIDTH];
-        for y in 0..HEIGHT {
-            let owned = goal.required_empty[y];
-            if owned == 0 { continue; }
-            let row = self.occupied_row(y);
-            let base = row_split_costs(row, self.holes[y], self.open_core[y]);
-            let explained = row_split_costs(row, self.holes[y], self.open_core[y] | owned);
-            buried += base.0.saturating_sub(explained.0);
-            surface += base.1.saturating_sub(explained.1);
-            let mut cells = owned & self.holes[y];
-            holes += cells.count_ones() as u16;
-            while cells != 0 {
-                let x = cells.trailing_zeros() as usize;
-                cells &= cells - 1;
-                let bit = 1 << x;
-                cover += (y + 1..self.heights[x] as usize)
-                    .filter(|&above| self.holes[above] & bit == 0).count() as u16;
-                if y + 1 < HEIGHT && y + 1 < self.heights[x] as usize
-                    && self.holes[y + 1] & bit == 0 {
-                    roofs[x] = roofs[x].max(y as u8 + 2);
-                }
-            }
-        }
-        (holes, cover, buried, surface, roofs)
     }
 
     fn goal_access_cost(&self, goal: &CellMask) -> u16 {
@@ -639,7 +513,7 @@ impl BoardFacts {
         (0..3)
             .map(|level| {
                 let y = self.lower_floor as usize + level;
-                let protected = self.open_core.get(y).copied().unwrap_or(0) | witnessed_goal
+                let protected = self.central_air.get(y).copied().unwrap_or(0) | witnessed_goal
                     .filter(|_| y < HEIGHT)
                     .map_or(0, |goal| goal.required_empty[y]);
                 let narrow = self.lower_narrow[level] & !protected;
@@ -661,6 +535,46 @@ impl BoardFacts {
                 0
             }
         })
+    }
+
+    /// Select one actual workspace for this concrete goal. On a symmetric
+    /// board the other opening is an alternative, never simultaneous space.
+    /// Geometric goal orientation resolves equal overlap without any physical
+    /// movement or probability claim. Raw debt uses the shared core separately.
+    fn active_workspace(&self, goal: Option<&SingleGoal>) -> u16 {
+        let primary = self.workspace_columns;
+        if !self.is_symmetric_board { return primary; }
+        let reflected = primary.reverse_bits() >> (u16::BITS as usize - WIDTH);
+        if primary == reflected { return primary; }
+        let Some(goal) = goal else { return primary; };
+        let columns = goal.working_columns();
+        let overlap = (columns & primary).count_ones();
+        let other_overlap = (columns & reflected).count_ones();
+        if overlap != other_overlap {
+            return if other_overlap > overlap { reflected } else { primary };
+        }
+        let working = working_region(goal).map_or(columns, |region| region.0);
+        let overlap = (working & primary).count_ones();
+        let other_overlap = (working & reflected).count_ones();
+        if overlap != other_overlap {
+            return if other_overlap > overlap { reflected } else { primary };
+        }
+        if columns != 0 {
+            let center = |mask: u16| {
+                mask.trailing_zeros() + (u16::BITS - mask.leading_zeros()) - 1
+            };
+            let target = center(columns);
+            let distance = center(primary).abs_diff(target);
+            let other_distance = center(reflected).abs_diff(target);
+            if distance != other_distance {
+                return if other_distance < distance { reflected } else { primary };
+            }
+        }
+        for &row in &goal.required_empty {
+            let mirror = row.reverse_bits() >> (u16::BITS as usize - WIDTH);
+            if row != mirror { return if row > mirror { reflected } else { primary }; }
+        }
+        primary
     }
 
     /// A currently present overhang is useful only in the context of a low,
@@ -718,6 +632,67 @@ impl BoardFacts {
             * low
     }
 
+    fn active_roof_reward(&self, goal: &SingleGoal, witnessed: bool) -> f64 {
+        let row = goal.clear_row as usize;
+        if row >= HEIGHT {
+            return 0.0;
+        }
+        let cells = goal.pose.cells();
+        let mut contacts = 0;
+        let mut columns = 0_u16;
+        let mut floor = HEIGHT;
+        let mut top = 0;
+        for &(x, y) in &cells {
+            if x < 0 || x >= WIDTH as i8 || y < 0 || y >= HEIGHT as i8 {
+                return 0.0;
+            }
+            let (x, y) = (x as usize, y as usize);
+            let bit = 1 << x;
+            columns |= bit;
+            floor = floor.min(y);
+            top = top.max(y);
+            if y < self.heights[x] as usize && self.holes[y] & bit == 0 {
+                return 0.0;
+            }
+            // Count only the actual layer immediately above the finisher.
+            // Extra height over this blocker cannot increase roof readiness.
+            if y + 1 < HEIGHT
+                && y + 1 < self.heights[x] as usize
+                && self.holes[y + 1] & bit == 0
+            {
+                contacts += 1;
+            }
+        }
+        if contacts == 0 {
+            return 0.0;
+        }
+        // A real immediate witness may justify a narrow kick entry. A merely
+        // prepared goal still needs local body air; sky far above the goal is
+        // insufficient. The caller separately checks its full service access.
+        let local_body = (floor.saturating_sub(1)..=(top + 1).min(HEIGHT - 1))
+            .any(|y| self.body_air[y] & columns != 0);
+        if !witnessed && !local_body {
+            return 0.0;
+        }
+        let required = goal.required_filled[row];
+        let needed = required.count_ones();
+        let present = (required & self.occupied_row(row)).count_ones();
+        if needed == 0 || present * 2 < needed {
+            return 0.0;
+        }
+        let readiness = present as f64 / needed as f64;
+        let local = match row.saturating_sub(floor) {
+            0 => 1.0,
+            1 => 0.75,
+            _ => 0.5,
+        };
+        let bank = bank_density(self.occupied_row(row), columns) * BANK_DENSITY_LIMIT;
+        (2.0 + f64::from(contacts.min(2)) * 1.5 + bank * 0.1875)
+            .min(PREPARED_ROOF_LIMIT)
+            * readiness
+            * local
+    }
+
     // Flood only buried cells. Any adjacent empty non-hole cell has an open
     // vertical path to the ceiling, so a second whole-board air flood is unneeded.
     fn find_components(&mut self, board: &Board) {
@@ -772,7 +747,7 @@ impl BoardFacts {
 
     pub(crate) fn unplanned_holes(&self, owned: &CellMask) -> u16 {
         (0..HEIGHT)
-            .map(|y| (self.holes[y] & !self.open_core[y] & !owned[y]).count_ones() as u16)
+            .map(|y| (self.holes[y] & !self.central_air[y] & !owned[y]).count_ones() as u16)
             .sum()
     }
 
@@ -797,9 +772,6 @@ impl BoardFacts {
     }
 
     fn terrain_score_inner(&self, goal: Option<&SingleGoal>, witnessed: bool) -> f64 {
-        let witnessed = witnessed && goal.is_some();
-        let (explained_holes, explained_cover, explained_buried, explained_surface, roof_tops) =
-            if witnessed { self.witness_relief(goal.unwrap()) } else { (0, 0, 0, 0, [0; WIDTH]) };
         let witnessed_access = if witnessed {
             goal.map_or(0, |g| self.goal_access_cost(&g.required_empty))
         } else {
@@ -817,19 +789,30 @@ impl BoardFacts {
         } else {
             self.charged_hole_count
         };
-        let defects = self.charged_hole_count.saturating_sub(explained_holes) as f64 * 2.0
+        // A reachable body stencil is only a preparation hint. Keep a
+        // residual cost for its roofed cells; the old baseline exempted
+        // these cells entirely from geometry, debt and pursuit together.
+        // Charge the geometric obligation once rather than each history.
+        let connected = (0..HEIGHT).map(|y| {
+            let owned = if witnessed { goal.map_or(0, |g| g.required_empty[y]) } else { 0 };
+            (self.holes[y] & self.central_air[y] & !owned).count_ones() as u16
+        }).sum::<u16>();
+        let connected_cover = self.cover_depth.saturating_sub(self.charged_cover_depth);
+        let connected_splits = self.buried_split_gaps.saturating_sub(self.charged_buried_splits);
+        let residual = f64::from(connected) * 0.5
+            + f64::from(connected_cover) * 0.05
+            + f64::from(connected_splits) * 0.5;
+        let defects = residual + self.charged_hole_count as f64 * 2.0
             + unexplained_holes as f64 * UNEXPLAINED_HOLE_COST
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
-            + self.charged_cover_depth.saturating_sub(explained_cover) as f64 * 0.25
-            + self.charged_buried_splits.saturating_sub(explained_buried) as f64 * 2.0
+            + self.charged_cover_depth as f64 * 0.25
+            + self.charged_buried_splits as f64 * 2.0
             + (self.height as f64).powi(2) * 0.06
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
             + self.obstructed_mass.saturating_sub(witnessed_mass) as f64 * 0.35
-            + self.lower_gap_cost(if witnessed { goal } else { None })
-            + self.straight_channel_cost(if witnessed { goal } else { None })
-            + self.separated_channel_cost;
+            + self.lower_gap_cost(if witnessed { goal } else { None });
         let usable_goal =
             goal.filter(|g| witnessed || self.goal_access_cost(&g.required_empty) == 0);
         let workspace = self.active_workspace(usable_goal);
@@ -838,10 +821,9 @@ impl BoardFacts {
                 & FULL_ROW,
             self.workspace_roof_top,
         ));
-        let surface_fragmentation = self.charged_surface_splits
-            .saturating_sub(explained_surface) as f64 * 0.0625;
+        let surface_fragmentation = self.charged_surface_splits as f64 * 0.0625;
         let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
-            let (_, _, repair_pressure) = self.bank_skyline(0, 0, &roof_tops);
+            let (_, _, repair_pressure) = self.bank_skyline(0, 0);
             return -defects
                 - (self.roughness as f64 * 0.0125 + surface_fragmentation)
                     .min(SKYLINE_PREFERENCE_LIMIT)
@@ -862,13 +844,29 @@ impl BoardFacts {
         } else {
             footprint
         };
-        let (linear, squared, repair_pressure) = self.bank_skyline(working, repair_protected, &roof_tops);
-        let rim_pressure = usable_goal.map_or(0, |_| self.roof_rim_pressure(footprint, roof_top, &roof_tops));
+        // Use the actual selected opening when it belongs to this goal's
+        // active band, otherwise the concrete footprint. The expanded kick
+        // rim must not hide inward bank steps immediately beside the opening.
+        let direction_workspace = if usable_goal.is_none_or(|goal| {
+            workspace & footprint != 0
+                && self.workspace_row.abs_diff(goal.clear_row) <= 2
+        }) {
+            workspace
+        } else {
+            footprint
+        };
+        // Apply the directional tie-break only around a present input-witnessed
+        // spin. Unfinished first-bag foundations keep their original ordering.
+        let directional = if witnessed && usable_goal.is_some() {
+            self.outward_bank_cost(direction_workspace)
+        } else { 0.0 };
+        let (linear, squared, repair_pressure) = self.bank_skyline(working, repair_protected);
+        let rim_pressure = usable_goal.map_or(0, |_| self.roof_rim_pressure(footprint, roof_top));
         let excess = self.heights.iter().enumerate().fold(0_u16, |sum, (x, h)| {
             // The rim can be a tall legitimate bank alongside a low pocket.
             // Only towers over the final mino's own columns are capped here.
             let above = if footprint & (1 << x) != 0 {
-                h.saturating_sub(roof_top.max(roof_tops[x])) as u16
+                h.saturating_sub(roof_top.max(self.cavity_roof_tops[x])) as u16
             } else {
                 0
             };
@@ -876,21 +874,40 @@ impl BoardFacts {
         });
         let skyline = (linear as f64 * 0.02 + squared as f64 * 0.003 + surface_fragmentation)
             .min(SKYLINE_PREFERENCE_LIMIT);
-        let roof = usable_goal.map_or(0.0, |goal| self.prepared_roof_reward(goal));
-        // A spin in a different pocket does not unlock the full preference
-        // for this workspace. Its exact footprint/roof relief still applies.
-        let witnessed_workspace = witnessed && goal.is_some_and(|g| {
-            g.required_empty[self.workspace_row as usize] & workspace != 0
-        });
-        let preference = if witnessed_workspace {
-            self.workspace_reward + self.bank_reward + roof
-        } else {
-            self.workspace_reward.min(0.0)
-                + (self.workspace_reward.max(0.0) * 0.2 + self.bank_reward * 0.5 + roof / 6.0)
-                    .min(UNPROVEN_STRUCTURE_LIMIT)
-        };
         -defects - skyline - repair_pressure - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
-            + preference
+            - directional
+            + self.workspace_reward
+            + self.bank_reward
+            + usable_goal.map_or(0.0, |goal| {
+                if witnessed && goal.clear_row > self.lower_floor.saturating_add(2) {
+                    // A real higher spin can work above inherited residue.
+                    // The residue and raw debt are retained without a reset.
+                    self.active_roof_reward(goal, true)
+                } else { self.prepared_roof_reward(goal) }
+            })
+    }
+
+    fn outward_bank_cost(&self, workspace: u16) -> f64 {
+        if workspace == 0 {
+            return 0.0;
+        }
+        let left = workspace.trailing_zeros() as usize;
+        let right = (u16::BITS - workspace.leading_zeros()) as usize;
+        let mut linear = 0_u16;
+        let mut severe = 0_u16;
+        let mut add = |rise: u8| {
+            let rise = u16::from(rise);
+            linear += rise;
+            let excess = rise.saturating_sub(1).min(4);
+            severe += excess * excess;
+        };
+        for x in 1..left {
+            add(self.heights[x].saturating_sub(self.heights[x - 1]));
+        }
+        for x in right..WIDTH - 1 {
+            add(self.heights[x].saturating_sub(self.heights[x + 1]));
+        }
+        (linear as f64 * 0.15 + severe as f64 * 0.10).min(OUTWARD_BANK_LIMIT)
     }
 
     /// Ordinary bank steps only affect the capped skyline preference. Large
@@ -900,7 +917,7 @@ impl BoardFacts {
     /// Reuse the nine bank edges. Normal skyline texture may use the generous
     /// pocket rim; severe bank defects only inherit that rim from a usable
     /// goal. In either case the movable central opening itself is protected.
-    fn bank_skyline(&self, working: u16, repair_protected: u16, roof_tops: &[u8; WIDTH]) -> (u16, u16, f64) {
+    fn bank_skyline(&self, working: u16, repair_protected: u16) -> (u16, u16, f64) {
         let mut linear = 0_u16;
         let mut squared = 0_u16;
         let mut cliffs = 0_u16;
@@ -915,7 +932,7 @@ impl BoardFacts {
                 (x + 1, x)
             };
             let change = self.heights[higher]
-                .saturating_sub(self.heights[lower].max(roof_tops[higher])) as u16;
+                .saturating_sub(self.heights[lower].max(self.cavity_roof_tops[higher])) as u16;
             if working & (3 << x) == 0 {
                 linear += change;
                 squared += change * change;
@@ -948,7 +965,7 @@ impl BoardFacts {
     /// It may not conceal an isolated spike far above both that roof and the
     /// outer bank. Only the excess above both is charged, never the low pocket
     /// beside a tall bank. There are at most two rim-to-bank edges to inspect.
-    fn roof_rim_pressure(&self, footprint: u16, roof_top: u8, roof_tops: &[u8; WIDTH]) -> u16 {
+    fn roof_rim_pressure(&self, footprint: u16, roof_top: u8) -> u16 {
         let left = footprint.trailing_zeros() as usize;
         let right = (u16::BITS - footprint.leading_zeros()) as usize;
         let neighbours = [
@@ -963,7 +980,7 @@ impl BoardFacts {
                 return pressure;
             };
             let rise = self.heights[rim].saturating_sub(
-                roof_top.max(self.heights[bank]).max(roof_tops[rim]),
+                roof_top.max(self.heights[bank]).max(self.cavity_roof_tops[rim]),
             );
             pressure + repair_severity(rise.saturating_sub(3) as u16)
         })
@@ -978,51 +995,18 @@ fn repair_severity(excess: u16) -> u16 {
     local * local + excess.saturating_sub(4) * 8
 }
 
-fn corridor_window(air: u16, previous: u16, width: u8, reflected: bool) -> u16 {
-    if previous == 0 { return 0; }
-    let previous_center = previous.trailing_zeros() as usize
-        + (u16::BITS - 1 - previous.leading_zeros()) as usize;
-    let mut remaining = air;
-    let mut best = None;
-    let mut result = 0;
-    while remaining != 0 {
-        let start = remaining.trailing_zeros() as usize;
-        let span = (remaining >> start).trailing_ones() as usize;
-        let run = ((1_u16 << span) - 1) << start;
-        remaining &= !run;
-        let take = span.min(width as usize);
-        if take < 2 { continue; }
-        for left in start..=start + span - take {
-            let window = ((1_u16 << take) - 1) << left;
-            let overlap = window & previous;
-            if overlap & (overlap << 1) == 0 { continue; }
-            let canonical_left = if reflected { WIDTH - left - take } else { left };
-            let key = (overlap.count_ones(), std::cmp::Reverse((2 * left + take - 1).abs_diff(previous_center)),
-                std::cmp::Reverse(canonical_left));
-            if best.is_none_or(|prior| key > prior) {
-                best = Some(key);
-                result = window;
-            }
-        }
-    }
-    result
-}
-
-fn row_split_costs(row: u16, holes: u16, protected: u16) -> (u16, u16) {
-    if row == 0 { return (0, 0); }
-    let mut free = FULL_ROW & !row;
-    let (mut runs, mut buried) = (0_u16, 0_u16);
-    while free != 0 {
-        let left = free.trailing_zeros();
-        let width = (free >> left).trailing_ones();
-        let run = ((1_u16 << width) - 1) << left;
-        free &= !run;
-        let charged = run & !protected;
-        runs += u16::from(charged != 0);
-        buried += u16::from(charged & holes != 0);
-    }
-    let buried = buried.saturating_sub(1);
-    (buried, runs.saturating_sub(1) - buried)
+fn bank_density(row: u16, opening: u16) -> f64 {
+    if opening == 0 { return 0.0; }
+    let left = opening.trailing_zeros() as usize;
+    let right = (u16::BITS - opening.leading_zeros()) as usize;
+    if left == 0 || right >= WIDTH { return 0.0; }
+    let left_cells = (row & ((1_u16 << left) - 1)).count_ones();
+    let right_cells = (row & (FULL_ROW << right)).count_ones();
+    let reflected = (row.reverse_bits() >> (u16::BITS as usize - WIDTH)) & FULL_ROW;
+    let left_edge = row.trailing_ones().min(left as u32);
+    let right_edge = reflected.trailing_ones().min((WIDTH - right) as u32);
+    ((left_cells + left_edge) as f64 / (2 * left) as f64)
+        .min((right_cells + right_edge) as f64 / (2 * (WIDTH - right)) as f64)
 }
 
 fn two_banks(row: u16, opening: u16) -> bool {
@@ -1218,11 +1202,6 @@ impl SingleGoal {
         debt(board, &self.required_filled, &self.support_any)
     }
 
-    /// A quiet preparation must keep the finisher's cells free and leave at
-    /// least one additional gap on every non-target row it will occupy. A
-    /// local double-shaped pocket is valid when the full board still singles.
-    /// `None` checks an already updated board; `Some` checks a proposed quiet
-    /// placement before line compression. This is geometry, not a move proof.
     pub(crate) fn preserved_after(&self, board: &Board, pose: Option<Pose>) -> bool {
         if self.clear_row as usize >= HEIGHT { return false; }
         let added = if let Some(pose) = pose {
@@ -1241,7 +1220,7 @@ impl SingleGoal {
     /// A quiet placement must preserve the final shape and pay some obligation.
     /// The caller reserves the finisher, checks no clear, and replays the move.
     pub(crate) fn accepts_support(&self, board: &Board, pose: Pose) -> bool {
-        if !self.preserved_after(board, Some(pose)) {
+        if !board.legal(pose) || intersects(&board.rows, &self.required_empty) {
             return false;
         }
         let Some(cells) = pose_mask(pose) else {
@@ -1508,7 +1487,7 @@ fn support_height(clauses: &[CellMask], heights: &[u8; WIDTH]) -> u16 {
         .sum()
 }
 
-type GoalRank = (u16, u16, u8, (u8, [(u8, u8); 4], u8));
+type GoalRank = (u16, u16, u8, Pose);
 
 fn goal_profile_cost(pose: Pose, profile: u8, opening: u16) -> u16 {
     let cells = pose.cells();
@@ -1553,17 +1532,10 @@ pub(crate) fn single_goals_for(
     let mut pools: [Vec<(GoalRank, SingleGoal)>; 7] = std::array::from_fn(|_| Vec::new());
     let facts = BoardFacts::new(board);
     let heights = facts.heights;
-    let reflected = canonical_reflection(board, inventory, profile);
     row_poses(board, inventory, true, |pose, clear_row, empty| {
         let mut filled = [0; HEIGHT];
         filled[clear_row as usize] = FULL_ROW & !empty[clear_row as usize];
-        let mut keep = |mut clauses: Clauses| {
-            if reflected {
-                clauses.masks[..clauses.len].sort_by(|a, b| {
-                    a.iter().map(|&row| reflected_row(row))
-                        .cmp(b.iter().map(|&row| reflected_row(row)))
-                });
-            }
+        let mut keep = |clauses: Clauses| {
             let pool = &mut pools[pose.piece as usize];
             if pool.iter().any(|(_, g)| {
                 g.pose == pose && g.clear_row == clear_row && g.support_any == clauses.slice()
@@ -1577,7 +1549,7 @@ pub(crate) fn single_goals_for(
                     + goal_profile_cost(pose, profile, facts.workspace_columns),
                 support_height(clauses.slice(), &heights),
                 clear_row,
-                canonical_pose_key(pose, reflected),
+                pose,
             );
             let mut same_count = 0;
             let mut same_worst = None;

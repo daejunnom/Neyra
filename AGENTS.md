@@ -23,6 +23,12 @@
   deployment. Existing GitHub checks and access controls still apply.
 - Keep source research, implementation status, and measured search results
   distinct. Do not copy private reference code into this public repository.
+- Keep af8dac63a9a9155fc28e480246fd617bc855bfb1 as the fixed strongest-source
+  reference. Build candidate algorithm changes from that source and preserve
+  the current probability/transport contracts. Improvement over the shipped
+  version alone does not establish parity with this fixed reference. Compare
+  matched rules, settings and work; keep benchmark tools and results outside
+  the repository. Preserve existing test modules and do not commit new tests.
 - Exclude O spins in this build-search profile. Keep physical rotation data
   separate from search-state equivalence: an origin-only rotation need not
   become a separate geometric search candidate.
@@ -70,8 +76,10 @@
 - The displayed partial record uses spins*countedProbability/max(7, placed),
   then higher counted probability, more bags and more total spins.
   This is a selection score, not an expected completion-time certificate.
-  Scheduling uses ((spinRank+0.95)*countedProbability-0.95)*7/productiveLocks;
-  preserve the original arithmetic exactly at probability one. Pending plans
+  Scheduling uses R=spins*7/L + 0.2*quality/(120+abs(quality))*7/L,
+  where L=max(7,placed-7), then (R+shift)*countedProbability-shift with
+  shift=0.2*7/L. Keep quality and its risk shift on the same depth scale.
+  At probability one, return this R expression exactly. Pending plans
   use their verified parent's probability, never invented future coverage.
   For two one-bag records with equal spins, higher first-bag
   construction probability precedes raw field quality. Otherwise use raw field
@@ -94,13 +102,12 @@
   Traverse the first bag's 2,520 reflection pairs directly. A proven pair cost
   may skip its other canonical query; skipped raw entries remain unknown.
   Distinguish effective model coverage from actual canonical query counts.
-  In empty-root placement generation, keep one representative of a reflected
-  chronological typed-target prefix. Defer the decision for a self-reflecting
-  prefix and keep its first asymmetric decision stable under later extensions.
-  This uses the accepted reflection model, not a new mirrored-input proof.
-  Do not merge unrelated piece-to-target assignments by board occupancy alone.
-  Partition retained first placements into worker lanes after the mirror cut,
-  and account for symmetry skips separately from failed supplies or bounds.
+  Keep supply reflection separate from optional root geometry reduction.
+  The adopted af8-based generator partitions first-placement proposals among
+  workers without the later chronological reflected-prefix cut. Preserve
+  piece-to-target assignment, deletion history and execution context; board
+  occupancy alone must not merge distinct fixed tilings.
+
 - Share only monotonic verified same-depth spin benchmarks between workers.
   Enable those raw cross-path spin/quality cuts and peer hints only when the
   overall success threshold is 100%. Under a relaxed threshold, keep raw maxima
@@ -147,24 +154,34 @@
   to one narrow generation. Failed retries alone must not widen its frontier;
   productive or improved boundaries retain larger budgets. Fresh root
   foundations keep their separate exploration allowance.
-- Body-clearance connectivity alone must not exempt buried cavities in the
-  side banks or under a roof. Preserve cavity/cover/fragmentation costs unless
-  an actual immediate spin witness explains its own footprint. Keep the low
-  central working passage distinct from adjacent storage cavities. Raw hole
-  and debt history remains available for row mapping; opening a roof is not
-  cell repayment. Historical debt uses the same current-board classification
-  in generation and boundary ordering, and repayment starts from initially
-  charged cells. Never subtract a witness footprint from debt and then also
-  claim its repayment. Static clearance is an ordering approximation.
-- Penalize a straight central passage that keeps the same span for at least
-  three consecutive rows. Preserve genuine bends and displaced openings.
-  Keep geometry-only rewards small; a precise spin witness may justify more
-  preparation value. Analyze all connected depth branches rather than taking
-  the first left-hand branch. Static field evaluation and reflected goals must
-  respect reflection; finite-budget forecast evidence remains a separate fact.
-  Preserve at least one empty cell in every non-target row touched by a planned
-  finisher. A local double-shaped pocket is legal when the whole board clears
-  exactly one row; quiet support must not accidentally turn it into a double.
+- Body-clearance connectivity is an ordering approximation, not an input or
+  supply proof. In the selected low connected working cavity, retain a terrain
+  residual of 0.5*holes + 0.05*cover + 0.5*buriedSplits. Charge that geometry
+  once instead of stacking ordinary hole, historical debt and pursuit penalties
+  on the same connected cells. Outside that region retain the ordinary cavity,
+  cover and repair costs plus historical rates 4 in prefixes and 12 at boundaries.
+  Keep the full raw debt mask for row mapping. Opening a roof is not repayment;
+  current classification may make a cell neutral without deleting its history.
+  Forecast repayment begins only from initially charged history and counts
+  actual fills/deleted rows in one first-bag continuation. Never credit initially
+  uncharged working cells as newly repaid debt.
+  Use only a zero-preparation, actually replayed first spin as immediate_anchor
+  on the original board. A prepared/later anchor is route evidence only.
+  Residual cover/splits and the ordinary far-hole base do not all vanish merely
+  because an immediate footprint explains a hole. The retained cavity_roof_tops
+  allowance remains a static connected-cavity roof model, not a new input proof.
+- Analyze all connected workspace-depth branches and break static board ties
+  in a canonical reflected orientation. On a self-reflecting board, alternatives
+  are not simultaneous resources: use one goal-aligned workspace for terrain
+  and only their shared connected region for neutral historical cost.
+  Keep finite-budget forecast differences distinct from static reflection.
+  Gate the small unresolved-preparation bonus with preserved_after: withhold
+  that bonus when a non-target finisher row would close. Do not imply this guard
+  filters every quiet/support proposal. The retained accepts_support checks
+  footprint emptiness and useful support; ready() and actual execution must
+  still clear exactly one row. An arbitrary proposed quiet alternative is not
+  a certificate that the intended finisher remains a valid Spin Single.
+
 - Prefer dense side banks beside accessible low working space, without fixing
   the center column or rewarding absolute stack height. A capped prepared-roof
   preference must refer to an existing roof over a concrete single goal; it is
@@ -173,40 +190,57 @@
   and excess towers above a useful roof.
   Root prefixes with no actual spin keep foundation-dependency weighting in
   mixed rounds too; this changes ordering, not their permission to clear.
-- Blend bank occupancy with its connection to the outer wall. An isolated
-  center stack must not receive the same bank preference as outer storage.
-  Keep positive width/depth preferences weak and charge split low body-air
-  channels plus the small separating mass, including edge-open channels.
-  This is a bounded ordering cost, not an impossibility cut. Symmetric workspace
-  alternatives are not simultaneous useful regions: use one goal-aligned
-  workspace for terrain and only their common open core for neutral history.
-  An immediate spin in another pocket cannot unlock this workspace's rewards.
-- Continuation forecasts may span three bag inventories and seek six coherent
-  Spin Singles. Consume all seven labels before resetting inventory and its
-  bag-local start board, deleted rows and supply mask. Keep at most three
-  distinct alternative paths, including piece-to-target assignment; never sum
-  their spins, debt payments or supply success. First-forecast-bag spins and
-  obstruction/debt relief stay separate from the total forecast count. Rank
-  coherent probe lines by total spins, then fewer placements and earlier bag
-  distribution. Once a boundary has been probed, one more predicted spin must
-  outrank every secondary field/efficiency difference at equal actual spins;
-  cap those secondary terms instead of adding unbounded terrain/debt scores.
-  Never treat an unprobed mino prefix as if it already had a six-spin forecast.
-  Extra horizon work requires actual productive completed inventories, not open space or an
-  unexecuted goal. Keep the base and second-bag work limits bounded, and stop
-  deep expansion after reaching six while allowing a short reserved tail for
-  alternatives and independence checks.
-  These are bounded geometric move-ordering hints, not P7 certificates or a
-  mandatory prefix. Actual progress and public best routes count executed,
-  verified bags only. Failure to find a forecast is unknown, not impossibility.
-- Better forecasts may refresh an existing exact plan without repeating P7,
-  only when tiling, boards, actual counts, debt and certificate context match.
-  Preserve its supply proof, actual frames and probability. Carry forecast
-  count, distribution and placement count through compact/full summaries and
-  archive identity. A scheduling cooldown may attenuate the forecast premium
-  over cached static quality, never rewrite the retained record's quality.
+- Keep the af8 preparation gradient: the selected low workspace uses full
+  width/depth preference and weaker-side occupancy density, plus a concrete
+  prepared-roof reward capped at 6. Do not multiply these positive preferences
+  down merely because the finishing spin has not yet been executed. They remain
+  shape preferences and cannot add actual spins or manufacture probability.
+  Do not claim ordinary bank preference uses the later wall-attachment blend
+  or split-channel penalty, or that an unconditional outward slope is active.
+  Only an actual immediate
+  input witness enables directional bank cost: min(4,0.15*sum(inwardRise)
+  +0.10*sum(min(max(inwardRise-1,0),4)^2)). Use its nearby selected workspace
+  or actual footprint; leave unfinished prefix ordering unchanged. Only when
+  that immediate goal lies more than two rows above the inherited lower floor
+  may the goal-relative active-roof formula replace the ordinary roof reward,
+  still capped at 6. Keep old low-roof behavior and inherited cells, raw debt
+  and probability resources; a higher workspace never resets the board.
+
+- Continuation forecasts span two bag inventories and seek six coherent
+  Spin Singles. Open the second inventory only after all seven first-bag labels
+  have been placed and at least two actual forecast spins have occurred.
+  Reset the bag-local start board, deleted rows and supply mask at that real
+  boundary. Keep at most three distinct typed paths; never sum alternatives'
+  spins, debt payments or supply success. First-bag gain/debt/obstruction remains
+  separate from the total. With first/second gains g1/g2, first-bag quiet count q,
+  paid initially charged cells p and terrain change dT, use
+  A1=-10*q+6*p+0.25*dT, forecastLine=60*g1+18*g2+A1, and select lines with
+  g1+0.3*g2+0.45*A1/(120+abs(A1)). Add the best readiness and independence
+  evidence once. Boundary quality is 2*terrain+forecast-12*unpaidHistory.
+  Keep this direct raw composition; do not reintroduce 120*totalForecast or
+  an additional 48-point saturation that suppresses all secondary differences.
+  Never assume an unprobed prefix already has forecast spins. Extra work needs
+  actual productive completed inventory, not open sky or an unfinished goal.
+  Keep the base/second-bag work caps 64/96 and 320/352, with reserved evidence
+  checks sharing the cap. Stop deeper expansion at six spins.
+  Forecasts are move-ordering hints, not P7 certificates or mandatory prefixes.
+  Public progress counts executed verified bags. A missing forecast is unknown.
+
+- Retain forecast count, two-bag distribution and placement count in full,
+  compact and exported summaries. Preserve the fixed plan's supply proof,
+  actual frames and probability. This source does not implement automatic
+  forecast-only refresh of an already known P7 key. A future refresh must prove
+  matching tiling, boards, actual counts, debt and certificate context first.
+  Temporary scheduling uses the fading positive forecast plus predicted paid
+  history, not a rewritten archived field quality or probability.
+
 - Keep pending-spin readiness and order independence as separate capped field
-  features. Use one best concrete preparation/first-spin witness and one best
+  features. Use 15/(1+quiet) for an actually replayed first spin after at most
+  two quiet preparations; an unresolved preserved goal with missing<=4 uses
+  5/((1+missing)*(1+quiet)). Take the best preparation evidence, never a sum.
+  A disjoint pair that works in both orders scores 20/(1+quietA+quietB), at most
+  one best pair. The combined preparation/independence cap is 35. Use one best
+  concrete preparation/first-spin witness and one best
   disjoint recipe pair checked in both orders with actual single clears and a
   common end board. Do not sum alternate slots, count a repeated finisher twice,
   or turn pairwise geometric order tolerance into a P7 probability. Extra target

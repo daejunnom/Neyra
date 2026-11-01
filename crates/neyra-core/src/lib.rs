@@ -20,6 +20,39 @@ pub fn evaluate_board(rows_json: &str) -> Result<String, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Evaluate with a downloaded v2 model without mixing any search/terrain score.
+#[wasm_bindgen]
+pub fn evaluate_board_model(rows_json: &str, model_json: &str) -> Result<String, JsValue> {
+    let rows: [u16; physics::HEIGHT] = serde_json::from_str(rows_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid board: {e}")))?;
+    if rows.iter().any(|&row| row > physics::FULL_ROW) {
+        return Err(JsValue::from_str("Board cells exceed ten columns"));
+    }
+    let model = evaluator::SpinModel::from_json(model_json).map_err(|e| JsValue::from_str(&e))?;
+    serde_json::to_string(&model.evaluate(&physics::Board { rows }))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// CPU training clients can bootstrap from these versioned embedded weights.
+#[wasm_bindgen]
+pub fn spin_model_json() -> String { evaluator::model_json().into() }
+
+/// Run only the bounded deep-field labeling workflow, never a completion search.
+/// Call this synchronous function from a dedicated browser worker.
+#[wasm_bindgen]
+pub fn label_board(sample_json: &str, config_json: &str) -> Result<String, JsValue> {
+    if sample_json.len() > 65_536 || config_json.len() > 4096 {
+        return Err(JsValue::from_str("Learning input is too large"));
+    }
+    let sample: search::labels::BoardSample = serde_json::from_str(sample_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid learning board: {e}")))?;
+    let config: search::labels::LabelConfig = serde_json::from_str(config_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid learning budget: {e}")))?;
+    let label = search::labels::collect_board_label(sample, config)
+        .map_err(|e| JsValue::from_str(&e))?;
+    serde_json::to_string(&label).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 #[wasm_bindgen]
 pub struct NeyraEngine {
     session: SearchSession,

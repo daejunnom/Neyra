@@ -103,11 +103,6 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .best-card strong span{font-size:11px;font-weight:450;letter-spacing:0;color:#a2bc8d}
 .verified-tag{display:flex;align-items:center;gap:4px;font-size:9px;color:#b6dd94}
 .best-card p{font-size:10px;color:#a3c083;display:flex;justify-content:space-between;align-items:center;margin:10px 0 0}
-.cnn-estimate{margin-top:9px;padding:9px 11px;border:1px solid #405b39;border-radius:5px;background:#1c302280}
-.cnn-estimate>span{font-size:8px;color:#a0b793;letter-spacing:.2px}
-.cnn-estimate p{margin:5px 0;font-size:10px;line-height:1.5;color:#b4cba5;font-variant-numeric:tabular-nums}
-.cnn-estimate b{font-weight:550;color:#d5e7c8;white-space:nowrap}
-.cnn-estimate small{display:block;font-size:8px;line-height:1.5;color:#869d7a;word-break:keep-all}
 .bag-chances{margin-top:12px}
 .bag-chances h4{font-size:10px;font-weight:500;color:#a2b996;margin:0 0 7px}
 .bag-chances ol{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(76px,1fr));gap:5px;max-height:108px;overflow:auto;scrollbar-width:thin;scrollbar-color:#506744 transparent}
@@ -139,6 +134,15 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .verification-note{font-size:9px;color:#9aaf88;margin:13px 0 0;line-height:1.5;min-height:27px}
 .verified-progress{display:flex;justify-content:space-between;gap:8px;font-size:9px;line-height:1.5;color:#9aaf88;margin:15px 0 0}
 .verified-progress span{white-space:nowrap;color:#7f977c}
+.contribution-status{border-top:1px solid #354d32;margin-top:12px;padding-top:10px;font-size:9px;color:#91aa80}
+.contribution-status>div:first-child{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.contribution-status label{display:inline-flex;align-items:center;gap:6px;color:#c6dab7;font-size:10px;cursor:pointer}
+.contribution-status input{accent-color:#a5d578;margin:0}
+.contribution-status>div:first-child>span{font-size:8px;color:#809978}
+.contribution-status p{margin:7px 0 5px;line-height:1.55;word-break:keep-all}
+.contribution-progress{display:flex;justify-content:space-between;align-items:center;gap:8px;line-height:1.55;min-height:18px}
+.contribution-progress .text-button{font-size:9px;white-space:nowrap}
+.contribution-status>small{display:block;color:#c5ad7f;font-size:8px;line-height:1.55;margin-top:4px}
 .session-notice{font-size:10px;line-height:1.5;color:#c6b98a;margin:12px 0 0}
 .save-status{display:block;font-size:9px;color:#a2c084;min-height:12px;margin-top:9px}
 .learning-export{display:flex;justify-content:flex-end;margin-top:4px}

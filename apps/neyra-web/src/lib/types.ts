@@ -12,13 +12,14 @@ export interface SearchConfig {
   budget_start: number;
   seed: number;
   beam_width: number;
-  /** Experimental CPU board model; disabled until its search value is validated. */
+  /** Compatibility field. Public search always forces the existing evaluator. */
   cnn_evaluation: boolean;
   /** Browser scheduling only; zero uses all reported logical processors. */
   worker_count: number;
 }
 
-export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count'> & {
+export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count' | 'cnn_evaluation'> & {
+  cnn_evaluation: false;
   search_profile: number;
   search_lane: number;
   search_lanes: number;
@@ -34,19 +35,6 @@ export interface BoardFrame {
   spin: boolean;
   /** Actual pre-clear physical cells; absent only in older saved records. */
   placedCells?: [number, number][];
-}
-
-/** Current-board predictions under a fixed continuation budget, never certificates. */
-export interface BoardEvaluation {
-  modelId: string;
-  shapePreference: number;
-  observedSpins: number;
-  observedChoices: number;
-  horizonBags: 2 | 3;
-  workBudget: number;
-  adjustment: number;
-  experimental: true;
-  scope: string;
 }
 
 /** Actual certified boundary input for the offline label collector. No labels are invented here. */
@@ -68,9 +56,18 @@ export interface TrainingField {
     qualified: true;
     seed: number;
     runSeed: number;
-    modelMode: 'heuristic' | 'cnn-experimental';
-    modelId?: string;
+    modelMode: 'heuristic';
     buildVersion: string;
+    rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
+    searchConfig: {
+      minSuccessPercent: number;
+      bagMinSuccessPercent: number;
+      firstBagMinSuccessPercent: number;
+      riskMinSpinsPerBag: number;
+      pieceGoal: number;
+      maxPieces: number;
+      beamWidth: number;
+    };
   };
 }
 
@@ -100,14 +97,12 @@ export interface Candidate {
   frames: BoardFrame[];
   frameCount: number;
   rankingScore: number;
-  /** Raw forecast/terrain quality plus optional CNN preference, before actual-spin ranking. */
+  /** Existing raw forecast/terrain quality, before actual-spin ranking. */
   fieldQuality: number;
   /** One coherent geometric continuation; never added to actual progress. */
   forecastSpins?: number;
   forecastSpinsByBag?: number[];
   forecastPlacements?: number;
-  /** Optional CPU estimate for these exact rows; independent of actual spins and probability. */
-  boardEvaluation?: BoardEvaluation;
 }
 
 export interface BagCandidates {

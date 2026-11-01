@@ -8,7 +8,8 @@ use super::*;
 use std::collections::BTreeMap;
 
 const LABEL_GOAL: u8 = u8::MAX;
-const LABEL_POLICY: &str = "neyra-fixed-bag-continuation-v1";
+const LABEL_POLICY: &str = "neyra-fixed-bag-continuation-v2";
+pub const LABEL_TASK: &str = "naga-spin-observations-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,14 +17,14 @@ pub struct LabelSource {
     pub kind: String,
     pub reference: String,
     pub family: String,
-    /// Number of completed bags before the supplied field. Zero is forbidden.
+    /// Number of completed bags before the supplied field. Learning starts at two.
     pub bag_boundary: u16,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BoardSample {
     pub id: String,
     /// Physical rows, bottom first; bit zero is the leftmost column.
@@ -47,8 +48,8 @@ pub struct LabelConfig {
 impl Default for LabelConfig {
     fn default() -> Self {
         Self {
-            horizon_bags: 2, work_budget: 65_536, beam_width: 32,
-            profile: 0, seed: 1, max_nodes: 64, attempts_per_node: 4,
+            horizon_bags: 2, work_budget: 131_072, beam_width: 48,
+            profile: 0, seed: 1, max_nodes: 96, attempts_per_node: 6,
             source_revision: "unknown".into(),
         }
     }
@@ -70,18 +71,11 @@ impl LabelConfig {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CurrentBoardTeacher {
-    pub terrain_score: f64,
-    pub height: u8,
-    pub cells: u16,
-    pub holes: u16,
-    pub sealed_cells: u16,
-    pub cover_depth: u16,
-    pub roughness: u16,
-    pub access_deficit: u16,
-    pub obstructed_mass: u16,
-    pub workspace_width: u8,
-    pub workspace_depth: u8,
+pub struct SpinTargets {
+    /// Whether this bounded search observed at least one actual future spin.
+    /// False is censored absence, not a proof of impossibility.
+    pub found_spin: bool,
+    pub observed_spins: u8,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -161,10 +155,11 @@ pub struct ReachableWitness {
 #[serde(rename_all = "camelCase")]
 pub struct BoardLabel {
     pub schema_version: u8,
+    pub task: &'static str,
     pub policy: &'static str,
     pub input: BoardSample,
     pub config: LabelConfig,
-    pub current_board_teacher: CurrentBoardTeacher,
+    pub targets: SpinTargets,
     pub measured: LabelMeasurements,
     pub certified_witnesses: Vec<CertifiedWitness>,
     pub reachable_witness: Option<ReachableWitness>,
@@ -226,22 +221,21 @@ fn chain_key(parent: &LabelNode, seed: &SeedState) -> Vec<u8> {
 pub fn collect_board_label(input: BoardSample, config: LabelConfig) -> Result<BoardLabel, String> {
     config.validate()?;
     let board = Board { rows: input.rows };
-    if input.id.trim().is_empty() || input.source.bag_boundary == 0
+    if input.id.trim().is_empty() || input.source.bag_boundary < 2
         || input.source.kind.trim().is_empty() || input.source.reference.trim().is_empty()
         || input.source.family.trim().is_empty()
         || !board.is_valid() || board.cell_count() == 0
         || board.rows.iter().any(|row| *row == 1023)
     {
-        return Err("Labels require a named nonempty 24-row, post-clear bag boundary after at least one completed bag, with source provenance".into());
+        return Err("Spin labels require a named nonempty 24-row, post-clear field after at least two completed bags, with source provenance".into());
     }
-    let facts = BoardFacts::new(&board);
-    let teacher = CurrentBoardTeacher {
-        terrain_score: facts.terrain_score(None), height: facts.height, cells: facts.cells,
-        holes: facts.hole_count, sealed_cells: facts.sealed_count,
-        cover_depth: facts.cover_depth, roughness: facts.roughness,
-        access_deficit: facts.access_deficit, obstructed_mass: facts.obstructed_mass,
-        workspace_width: facts.workspace_width, workspace_depth: facts.workspace_depth,
-    };
+    for forbidden in ["referencePrior", "priorIsMeasuredOutcome", "currentBoardTeacher",
+                      "terrainScore", "fieldQuality", "rankingScore", "shapePreference",
+                      "observedChoices", "boardEvaluation"] {
+        if input.source.extra.contains_key(forbidden) {
+            return Err(format!("Legacy evaluation metadata is not a spin-only learning input: {forbidden}"));
+        }
+    }
     let mut observations = LabelMeasurements {
         max_reachable_observed_spins: 0, geometric_whole_bag_chains: 0,
         productive_geometric_whole_bag_chains: 0, certified_whole_bag_chains: 0,
@@ -412,8 +406,10 @@ pub fn collect_board_label(input: BoardSample, config: LabelConfig) -> Result<Bo
         break;
     }
     Ok(BoardLabel {
-        schema_version: 1, policy: LABEL_POLICY, input, config,
-        current_board_teacher: teacher, measured: observations,
+        schema_version: 2, task: LABEL_TASK, policy: LABEL_POLICY, input, config,
+        targets: SpinTargets { found_spin: observations.max_reachable_observed_spins > 0,
+            observed_spins: observations.max_reachable_observed_spins },
+        measured: observations,
         certified_witnesses: witnesses, reachable_witness,
     })
 }

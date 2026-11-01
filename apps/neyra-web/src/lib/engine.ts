@@ -31,6 +31,13 @@ export function workerSeed(seed: number, index: number): number {
   return ((seed - 1 + index * 2654435761) % 4294967295) + 1;
 }
 
+/** A fresh, nonzero u32 for this page entry; a manual seed stays valid within the tab. */
+export function randomSeed(): number {
+  const value = new Uint32Array(1);
+  do { crypto.getRandomValues(value); } while (value[0] === 0);
+  return value[0];
+}
+
 function atBudget(candidate: Candidate): number {
   return candidate.cdf.find((point) => point.pieces === candidate.budgetPieces)?.probability ?? candidate.probability;
 }
@@ -134,12 +141,13 @@ export class SearchClient {
   private bestSpinsByBag = Array<number>(101).fill(0);
   private shareSpinBenchmarks = true;
 
-  constructor(private receive: (event: EngineEvent) => void) {}
+  constructor(private receive: (event: EngineEvent) => void,
+    private contribute: (field: TrainingField) => void = () => {}) {}
 
   start(config: SearchConfig) {
     this.dispose();
     this.runId = crypto.randomUUID();
-    this.runConfig = { ...config };
+    this.runConfig = { ...config, cnn_evaluation: false };
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
@@ -176,7 +184,7 @@ export class SearchClient {
       try {
         slot.worker.postMessage({
           type: 'start', runId,
-          config: { ...engineConfig, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
+          config: { ...engineConfig, cnn_evaluation: false, seed: workerSeed(config.seed, slot.id), search_profile: slot.id % 4,
             search_lane: slot.id, search_lanes: this.slots.length },
           assetBase: `${location.origin}${base}/wasm/`, assetVersion: version, watchCurrent: slot.watching
         } satisfies EngineCommand);
@@ -273,7 +281,6 @@ export class SearchClient {
    * together when splitting training and validation data. */
   trainingFields(): TrainingField[] {
     if (!this.runConfig || !this.runId) return [];
-    const config = this.runConfig;
     const records: OwnedCandidate[] = [...this.bagRecords.values()].flat();
     if (this.selectedArchive) records.push(this.selectedArchive);
     for (const slot of this.slots) {
@@ -282,30 +289,52 @@ export class SearchClient {
     const seen = new Set<string>();
     const fields: TrainingField[] = [];
     for (const record of records) {
-      const candidate = record.candidate;
       const id = this.ownedId(record);
-      // The label collector accepts actual post-clear, nonempty 24-row boards.
-      // A completed route can end inside a bag, so it needs this boundary check too.
-      if (seen.has(id) || !candidate.verified || !candidate.qualified ||
-          !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 ||
-          candidate.placed !== candidate.bagCount * 7 ||
-          candidate.frames.length !== candidate.frameCount || candidate.rows.length !== 24 ||
-          !candidate.rows.some((row) => row !== 0) ||
-          !candidate.rows.every((row) => Number.isInteger(row) && row >= 0 && row < 1023)) continue;
+      const field = this.trainingField(record);
+      if (seen.has(id) || !field) continue;
       seen.add(id);
-      fields.push({ schemaVersion: 1, id: `${this.runId}:${id}`, rows: [...candidate.rows], source: {
-        kind: 'search', family: `search:${this.runId}`,
-        reference: `neyra:run:${this.runId}/candidate:${id}`,
-        runId: this.runId, candidateId: id, bagBoundary: candidate.bagCount,
-        probability: candidate.probability, firstBagProbability: candidate.firstBagProbability ?? null,
-        ignoreFirstBagProbability: config.ignore_first_bag_probability, verified: true, qualified: true,
-        seed: workerSeed(config.seed, record.slot.id), runSeed: config.seed,
-        modelMode: config.cnn_evaluation ? 'cnn-experimental' : 'heuristic',
-        ...(candidate.boardEvaluation ? { modelId: candidate.boardEvaluation.modelId } : {}),
-        buildVersion: version
-      } });
+      fields.push(field);
     }
     return fields.sort((a, b) => a.source.bagBoundary - b.source.bagBoundary || a.id.localeCompare(b.id));
+  }
+
+  private trainingField(record: OwnedCandidate): TrainingField | null {
+    if (!this.runConfig || !this.runId) return null;
+    const config = this.runConfig;
+    const candidate = record.candidate;
+    const id = this.ownedId(record);
+    // A terminal result may stop inside a bag. Only completed post-clear
+    // boundaries with a captured representative are useful collection origins.
+    if (!candidate.verified || !candidate.qualified ||
+        !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 ||
+        candidate.placed !== candidate.bagCount * 7 ||
+        candidate.frames.length !== candidate.frameCount || candidate.rows.length !== 24 ||
+        !candidate.rows.some((row) => row !== 0) ||
+        !candidate.rows.every((row) => Number.isInteger(row) && row >= 0 && row < 1023)) return null;
+    return { schemaVersion: 1, id: `${this.runId}:${id}`, rows: [...candidate.rows], source: {
+      kind: 'search', family: `search:${this.runId}`,
+      reference: `neyra:run:${this.runId}/candidate:${id}`,
+      runId: this.runId, candidateId: id, bagBoundary: candidate.bagCount,
+      probability: candidate.probability, firstBagProbability: candidate.firstBagProbability ?? null,
+      ignoreFirstBagProbability: config.ignore_first_bag_probability, verified: true, qualified: true,
+      seed: workerSeed(config.seed, record.slot.id), runSeed: config.seed,
+      modelMode: 'heuristic', buildVersion: version,
+      rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1',
+      searchConfig: {
+        minSuccessPercent: config.min_success_percent,
+        bagMinSuccessPercent: config.bag_min_success_percent,
+        firstBagMinSuccessPercent: config.first_bag_min_success_percent,
+        riskMinSpinsPerBag: config.risk_min_spins_per_bag,
+        pieceGoal: config.piece_goal, maxPieces: config.max_pieces, beamWidth: config.beam_width
+      }
+    } };
+  }
+
+  private contributeRecord(record: OwnedCandidate) {
+    const field = this.trainingField(record);
+    if (!field) return;
+    // Data transport is optional and must never interrupt search or alter a record.
+    try { this.contribute(field); } catch { /* The transport reports its own state. */ }
   }
 
   dispose() {
@@ -345,6 +374,7 @@ export class SearchClient {
       if (complete(message.candidate) &&
           (!slot.incumbent || betterComplete(message.candidate, slot.incumbent.candidate))) {
         slot.incumbent = { candidate: message.candidate, data: message.data };
+        this.contributeRecord({ slot, candidate: message.candidate });
       }
       this.publishProgress();
     } else if (message.type === 'bag-record') {
@@ -477,6 +507,7 @@ export class SearchClient {
     // Full certificate ownership remains separate even when two workers find
     // similar boards. Keep just the two displayed records, plus one user pin.
     this.bagRecords.set(candidate.bagCount, records.slice(0, 2));
+    if (records.slice(0, 2).includes(record)) this.contributeRecord(record);
   }
 
   private publishedBagRecords(): BagCandidates[] {
@@ -491,9 +522,6 @@ export class SearchClient {
     const merge = (next: Candidate | null, previous: Candidate | null | undefined, exactRecord = false) => {
       const sameRows = !!next && !!previous && next.rows.length === previous.rows.length &&
         next.rows.every((row, y) => row === previous.rows[y]);
-      if (next && !next.boardEvaluation && sameRows && previous?.boardEvaluation) {
-        next = { ...next, boardEvaluation: previous.boardEvaluation };
-      }
       if (next && next.frames.length === 0 && next.frameCount > 0 && previous?.id === next.id &&
           (!exactRecord || samePartialRecord(next, previous)) &&
           previous.verified === next.verified && previous.placed === next.placed && previous.spins === next.spins &&

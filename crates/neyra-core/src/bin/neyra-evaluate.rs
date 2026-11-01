@@ -2,6 +2,24 @@
 use std::io::{self, BufRead, Write};
 
 fn run() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    let model = match args.next().as_deref() {
+        None => None,
+        Some("--help" | "-h") => {
+            println!("neyra-evaluate [--model v2-model.json]\nRead current-board JSONL from stdin and emit spin-only CPU predictions. No search or legacy score is used.");
+            return Ok(());
+        }
+        Some("--model") => {
+            let path = args.next().ok_or("--model needs a JSON path")?;
+            if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 2 * 1024 * 1024 {
+                return Err("Model file is too large".into());
+            }
+            let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            Some(neyra_core::evaluator::SpinModel::from_json(&json)?)
+        }
+        Some(_) => return Err("Unknown option; use --help".into()),
+    };
+    if args.next().is_some() { return Err("Unexpected extra arguments".into()); }
     let input = io::stdin();
     let mut output = io::BufWriter::new(io::stdout().lock());
     for (line_index, line) in input.lock().lines().enumerate() {
@@ -18,8 +36,9 @@ fn run() -> Result<(), String> {
         }
         let board = neyra_core::physics::Board { rows };
         let result = serde_json::json!({
-            "id": input.get("id"), "rawOutput": neyra_core::evaluator::raw_prediction(&board),
-            "boardEvaluation": neyra_core::evaluator::evaluate(&board),
+            "id": input.get("id"),
+            "rawOutput": model.as_ref().map_or_else(|| neyra_core::evaluator::raw_prediction(&board), |model| model.raw_prediction(&board)),
+            "boardEvaluation": model.as_ref().map_or_else(|| neyra_core::evaluator::evaluate(&board), |model| model.evaluate(&board)),
         });
         writeln!(output, "{result}").map_err(|e| e.to_string())?;
     }

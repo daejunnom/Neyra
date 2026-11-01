@@ -1,4 +1,4 @@
-import type { BoardEvaluation, Candidate, EngineCommand, EngineEvent, SearchSnapshot } from './types';
+import type { Candidate, EngineCommand, EngineEvent, SearchSnapshot } from './types';
 
 type WasmEngine = {
   advance(work: number): void;
@@ -11,7 +11,6 @@ type WasmEngine = {
 type WasmModule = {
   default(options: { module_or_path: string }): Promise<unknown>;
   NeyraEngine: new (config: string) => WasmEngine;
-  evaluate_board(rows: string): string;
 };
 
 const scope = globalThis as unknown as {
@@ -32,35 +31,8 @@ let detailedCurrentKey = '';
 let modulePromise: Promise<WasmModule> | undefined;
 let bestSpinsByBag = Array<number>(101).fill(0);
 let bagRecordVersions = new Map<string, string>();
-let evaluateBoard: WasmModule['evaluate_board'] | null = null;
-const boardEvaluations = new Map<string, BoardEvaluation | null>();
-const EVALUATION_CACHE_LIMIT = 64;
 
 function send(message: EngineEvent) { scope.postMessage(message); }
-
-function withBoardEvaluation(candidate: Candidate | null, compute = false): Candidate | null {
-  if (!candidate || !evaluateBoard) return candidate;
-  const key = JSON.stringify(candidate.rows);
-  let evaluation = boardEvaluations.get(key);
-  if (!boardEvaluations.has(key) && compute) {
-    evaluation = JSON.parse(evaluateBoard(key)) as BoardEvaluation | null;
-    // Empty/out-of-domain boards deliberately have no estimate. Cache that
-    // answer too, rather than repeatedly evaluating the initial empty field.
-    if (evaluation !== null && (typeof evaluation?.modelId !== 'string' || typeof evaluation.scope !== 'string' ||
-        evaluation.experimental !== true || ![2, 3].includes(evaluation.horizonBags) ||
-        !Number.isInteger(evaluation.workBudget) || evaluation.workBudget < 1 || evaluation.workBudget > 4194304 ||
-        ![evaluation.shapePreference, evaluation.observedSpins, evaluation.observedChoices,
-          evaluation.adjustment].every(Number.isFinite) || evaluation.observedSpins < 0 ||
-        evaluation.observedChoices < 0 || Math.abs(evaluation.adjustment) > 12)) {
-      throw new Error('CNN 필드 예측의 형식을 확인하지 못했어요.');
-    }
-    boardEvaluations.set(key, evaluation);
-    if (boardEvaluations.size > EVALUATION_CACHE_LIMIT) {
-      boardEvaluations.delete(boardEvaluations.keys().next().value!);
-    }
-  }
-  return evaluation ? { ...candidate, boardEvaluation: evaluation } : candidate;
-}
 
 function observeBenchmarks(incoming: number[]) {
   if (!Array.isArray(incoming)) return;
@@ -111,13 +83,11 @@ function readSnapshot(full = false): SearchSnapshot | null {
           record.frames.length !== record.frameCount) {
         throw new Error('가방별 후보의 검증 기록을 가져오지 못했어요.');
       }
-      const evaluated = withBoardEvaluation(record, true)!;
-      data.candidate = evaluated;
-      captured.set(record.id, evaluated);
+      captured.set(record.id, record);
       // This is a selected certificate archive. Its aggregate search snapshot
       // is unrelated to that selection and would repeat other routes' replays.
       delete data.snapshot;
-      send({ type: 'bag-record', runId, candidate: evaluated, data });
+      send({ type: 'bag-record', runId, candidate: record, data });
     }
   }
   bagRecordVersions = retained;
@@ -141,21 +111,14 @@ function readSnapshot(full = false): SearchSnapshot | null {
         compact.bestPartial = detail.bestPartial;
       }
     }
-    compact.current = withBoardEvaluation(compact.current, true);
     detailedCurrentKey = key;
   }
-  // Unchanged compact updates only reuse cached values. New certified records
-  // and the changed visible current board are the inference entry points.
-  compact.current = withBoardEvaluation(compact.current);
-  compact.best = withBoardEvaluation(compact.best, !!compact.best && compact.best.id !== incumbentId);
-  compact.bestPartial = withBoardEvaluation(compact.bestPartial, full);
   return compact;
 }
 
 function retainIncumbent(value: SearchSnapshot) {
   if (engine && value.best && value.best.id !== incumbentId) {
     const data = JSON.parse(engine.export_selected_json('best'));
-    data.candidate = withBoardEvaluation(data.candidate, true);
     incumbentId = value.best.id;
     // The archive includes full frames even if this worker only sends compact
     // routine updates. Retain complete results across a worker failure.
@@ -226,19 +189,15 @@ scope.onmessage = async ({ data }) => {
     detailedCurrentKey = '';
     bestSpinsByBag.fill(0);
     bagRecordVersions.clear();
-    boardEvaluations.clear();
-    evaluateBoard = null;
     runId = data.runId;
     const requestedId = runId;
     try {
       const module = await wasm(data.assetBase, data.assetVersion);
       if (runId !== requestedId) return;
-      if (data.config.cnn_evaluation) {
-        if (typeof module.evaluate_board !== 'function') throw new Error('CNN 평가기가 포함된 탐색기를 불러오지 못했어요.');
-        evaluateBoard = module.evaluate_board;
-      }
       // Pause/cancel can arrive while the async module is loading.
-      engine = new module.NeyraEngine(JSON.stringify(data.config));
+      // Public Pages always runs the established search. A stale saved config
+      // or an old caller must not re-enable learned ordering or training here.
+      engine = new module.NeyraEngine(JSON.stringify({ ...data.config, cnn_evaluation: false }));
       if (bestSpinsByBag.some((spins) => spins > 0)) {
         engine.observe_benchmarks(JSON.stringify(bestSpinsByBag));
       }
@@ -278,7 +237,6 @@ scope.onmessage = async ({ data }) => {
       // exported certificate refer to the same worker state.
       const state = readSnapshot(true);
       if (!result.candidate) throw new Error('아직 저장할 후보가 없어요.');
-      result.candidate = withBoardEvaluation(result.candidate, true);
       send({ type: 'export', runId, requestId: data.requestId, data: result, snapshot: state ?? undefined });
     } catch (error) {
       send({ type: 'export-error', runId, requestId: data.requestId, message: error instanceof Error ? error.message : String(error) });

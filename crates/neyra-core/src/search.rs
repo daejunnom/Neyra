@@ -71,7 +71,8 @@ pub struct SearchConfig {
     pub search_lane: u16,
     #[serde(alias = "searchLanes")]
     pub search_lanes: u16,
-    /// CPU model preference at certified boundaries, never a supply/spin proof.
+    /// Legacy setting accepted for saved-config compatibility. Search ignores it;
+    /// spin-only CNN evaluation belongs to the separate learning workflow.
     #[serde(alias = "cnnEvaluation")]
     pub cnn_evaluation: bool,
 }
@@ -4175,10 +4176,7 @@ impl SearchSession {
         // Reuse this boundary's immutable geometry facts locally. No shared
         // cache or certificate policy is introduced by the reuse.
         let facts = BoardFacts::new(&job.plan.expected);
-        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future)
-            + if self.config.cnn_evaluation && !job.plan.terminal {
-                crate::evaluator::boundary_adjustment(&job.plan.expected)
-            } else { 0.0 };
+        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future);
         let obstruction = job.plan.future.obstructed_mass
             .map_or(facts.obstructed_mass, |after| facts.obstructed_mass.min(after));
         let certificate = Rc::new(BagCertificate {
@@ -4613,10 +4611,9 @@ impl SearchSession {
             "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
-            "boardEvaluation": archive.and_then(|a| crate::evaluator::evaluate(&Board { rows: a.summary.rows })),
-            "learnedOrdering": { "enabled": self.config.cnn_evaluation,
-                "scope": "CertifiedNonterminalBoundaryOnly;BeforeSpinRank;NoInputOrProbabilityEffect",
-                "maxAbsoluteAdjustment": 12.0 },
+            "learnedOrdering": { "enabled": false,
+                "scope": "Disabled;SpinOnlyModelIsIndependentOfSearch",
+                "maxAbsoluteAdjustment": 0.0 },
             "candidate": archive.map(|a| a.for_snapshot(true)), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",

@@ -10,7 +10,7 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            println!("neyra-label [--input boards.jsonl] [--output labels.jsonl] [--config config.json]\nOmitted input/output use stdin/stdout. Requires nonempty post-clear fields after at least one completed bag.\nConfig: horizonBags (2 or 3), workBudget, beamWidth, profile, seed, maxNodes, attemptsPerNode, sourceRevision.\nLabels are censored budgeted observations, not impossibility or completion certificates.");
+            println!("neyra-label [--input boards.jsonl] [--output labels.jsonl] [--config config.json]\nOmitted input/output use stdin/stdout. Requires nonempty post-clear fields after at least two completed bags.\nConfig: horizonBags (2 or 3), workBudget, beamWidth, profile, seed, maxNodes, attemptsPerNode, sourceRevision.\nV2 spin-only labels contain no Terrain teacher or opener prior. They are censored budgeted observations, not impossibility or completion certificates.");
             return Ok(());
         }
         let value = args.next().ok_or_else(|| format!("Missing value for {arg}"))?;

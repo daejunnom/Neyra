@@ -1,17 +1,41 @@
-//! Small current-board CNN. Pure CPU inference, shared by native and WASM.
-//! Outputs describe a censored training search, never physical certificates.
+//! Independent Naga Eyes spin evaluator. All layers run on CPU in Rust/WASM.
+//! Only current occupancy is input; outputs describe a censored search policy.
 
 use crate::physics::{Board, HEIGHT, WIDTH};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+pub const MODEL_TASK: &str = "naga-spin-observations-v2";
+pub const MODEL_PARAMETERS: usize = 33_442;
+const MODEL_JSON: &str = include_str!("../models/naga-spin-cnn-v2.json");
+const MODEL_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Model {
+struct Architecture {
+    name: String,
+    input: Vec<usize>,
+    channels: Vec<usize>,
+    kernel: usize,
+    padding: usize,
+    pool_output: Vec<usize>,
+    pool_kernel: Vec<usize>,
+    hidden: usize,
+    heads: usize,
+    parameters: usize,
+}
+
+/// Validated owner-produced weights. No search ranking or heuristic score is used.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpinModel {
     schema_version: u8,
+    task: String,
     model_id: String,
     trained: bool,
+    device: String,
+    architecture: Architecture,
     horizon_bags: u8,
     work_budget: u32,
     weights: HashMap<String, Vec<f32>>,
@@ -20,48 +44,121 @@ struct Model {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardEvaluation {
+    pub schema_version: u8,
+    pub task: &'static str,
     pub model_id: String,
-    pub shape_preference: f64,
+    /// Likelihood of observing at least one spin under this labeling policy.
+    /// This is not fixed-plan construction success or an impossibility test.
+    pub found_spin_likelihood: f64,
     pub observed_spins: f64,
-    pub observed_choices: f64,
     pub horizon_bags: u8,
     pub work_budget: u32,
-    pub adjustment: f64,
     pub experimental: bool,
     pub scope: &'static str,
 }
 
-fn model() -> Option<&'static Model> {
-    static MODEL: OnceLock<Option<Model>> = OnceLock::new();
-    MODEL.get_or_init(|| {
-        let model: Model = serde_json::from_str(include_str!("../models/naga-cnn-v1.json")).ok()?;
-        if model.schema_version != 1 || !model.trained || !(2..=3).contains(&model.horizon_bags)
-            || model.work_budget == 0 { return None; }
-        for (name, size) in [("conv1.weight", 108), ("conv1.bias", 6),
-                             ("conv2.weight", 432), ("conv2.bias", 8),
-                             ("hidden.weight", 1024), ("hidden.bias", 16),
-                             ("output.weight", 48), ("output.bias", 3)] {
-            let values = model.weights.get(name)?;
-            if values.len() != size || values.iter().any(|x| !x.is_finite()) { return None; }
+impl SpinModel {
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        if json.len() > MODEL_MAX_BYTES { return Err("Spin model is too large".into()); }
+        let model: Self = serde_json::from_str(json)
+            .map_err(|e| format!("Invalid spin model JSON: {e}"))?;
+        let a = &model.architecture;
+        if model.schema_version != 2 || model.task != MODEL_TASK || !model.trained
+            || model.device != "cpu" || model.model_id.is_empty() || model.model_id.len() > 128
+            || !(2..=3).contains(&model.horizon_bags)
+            || !(1..=4_194_304).contains(&model.work_budget)
+            || a.name != "neyra-spin-cnn-v2" || a.input != [1, HEIGHT, WIDTH]
+            || a.channels != [24, 32, 48] || a.kernel != 3 || a.padding != 1
+            || a.pool_output != [4, 2] || a.pool_kernel != [6, 5]
+            || a.hidden != 32 || a.heads != 2 || a.parameters != MODEL_PARAMETERS
+        {
+            return Err("Unsupported spin-only CPU model contract".into());
         }
-        Some(model)
-    }).as_ref()
+        let layout = [
+            ("conv1.weight", 216), ("conv1.bias", 24),
+            ("conv2.weight", 6912), ("conv2.bias", 32),
+            ("conv3.weight", 13824), ("conv3.bias", 48),
+            ("hidden.weight", 12288), ("hidden.bias", 32),
+            ("output.weight", 64), ("output.bias", 2),
+        ];
+        if model.weights.len() != layout.len() { return Err("Unexpected model tensors".into()); }
+        for (name, size) in layout {
+            let values = model.weights.get(name).ok_or_else(|| format!("Missing tensor {name}"))?;
+            if values.len() != size || values.iter().any(|x| !x.is_finite() || x.abs() > 1000.0) {
+                return Err(format!("Invalid tensor {name}"));
+            }
+        }
+        Ok(model)
+    }
+
+    pub fn raw_prediction(&self, board: &Board) -> Option<[f32; 2]> {
+        if board.rows.iter().all(|&r| r == 0) || board.rows.iter().any(|&r| r >= 1023) { return None; }
+        let w = &self.weights;
+        let first = convolution(&encode(board), 1, 24, &w["conv1.weight"], &w["conv1.bias"]);
+        let second = convolution(&first, 24, 32, &w["conv2.weight"], &w["conv2.bias"]);
+        let third = convolution(&second, 32, 48, &w["conv3.weight"], &w["conv3.bias"]);
+        let mut pooled = [0.0; 384];
+        for channel in 0..48 {
+            for py in 0..4 {
+                for px in 0..2 {
+                    let mut sum = 0.0;
+                    for y in py * 6..(py + 1) * 6 {
+                        for x in px * 5..(px + 1) * 5 {
+                            sum += third[channel * HEIGHT * WIDTH + y * WIDTH + x];
+                        }
+                    }
+                    pooled[channel * 8 + py * 2 + px] = sum / 30.0;
+                }
+            }
+        }
+        let mut hidden = [0.0; 32];
+        for (out, value) in hidden.iter_mut().enumerate() {
+            let mut sum = w["hidden.bias"][out];
+            for (i, input) in pooled.iter().enumerate() {
+                sum += input * w["hidden.weight"][out * 384 + i];
+            }
+            *value = sum.max(0.0);
+        }
+        let mut output = [0.0; 2];
+        for (out, value) in output.iter_mut().enumerate() {
+            let mut sum = w["output.bias"][out];
+            for (i, input) in hidden.iter().enumerate() {
+                sum += input * w["output.weight"][out * 32 + i];
+            }
+            *value = sum;
+        }
+        output.iter().all(|x| x.is_finite()).then_some(output)
+    }
+
+    pub fn evaluate(&self, board: &Board) -> Option<BoardEvaluation> {
+        let raw = self.raw_prediction(board)?;
+        let logit = f64::from(raw[0]).clamp(-80.0, 80.0);
+        Some(BoardEvaluation {
+            schema_version: 2, task: MODEL_TASK, model_id: self.model_id.clone(),
+            found_spin_likelihood: 1.0 / (1.0 + (-logit).exp()),
+            observed_spins: (f64::from(raw[1]) * 6.0).clamp(0.0, f64::from(self.horizon_bags) * 6.0),
+            horizon_bags: self.horizon_bags, work_budget: self.work_budget,
+            experimental: true,
+            scope: "Current occupancy only. Predictions of censored follow-up spin observations; not construction probability, exhaustive feasibility, or a heuristic-score blend.",
+        })
+    }
 }
 
-fn encode(board: &Board) -> [f32; 2 * HEIGHT * WIDTH] {
+fn model() -> Option<&'static SpinModel> {
+    static MODEL: OnceLock<Option<SpinModel>> = OnceLock::new();
+    MODEL.get_or_init(|| SpinModel::from_json(MODEL_JSON).ok()).as_ref()
+}
+
+/// Return the selected embedded model for owner-only training clients.
+pub fn model_json() -> &'static str { MODEL_JSON }
+
+fn encode(board: &Board) -> [f32; HEIGHT * WIDTH] {
     let reflected = board.rows.map(|row| row.reverse_bits() >> 6);
     let rows = if reflected < board.rows { reflected } else { board.rows };
-    let mut input = [0.0; 2 * HEIGHT * WIDTH];
-    for x in 0..WIDTH {
-        let mut covered = false;
-        for y in (0..HEIGHT).rev() {
-            let index = y * WIDTH + x;
-            if rows[y] & (1 << x) != 0 {
-                input[index] = 1.0;
-                covered = true;
-            } else if covered {
-                input[HEIGHT * WIDTH + index] = 1.0;
-            }
+    let mut input = [0.0; HEIGHT * WIDTH];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            input[y * WIDTH + x] = if rows[y] & (1 << x) != 0 { 1.0 } else { 0.0 };
         }
     }
     input
@@ -93,62 +190,10 @@ fn convolution(input: &[f32], cin: usize, cout: usize, weight: &[f32], bias: &[f
     output
 }
 
-/// Current occupancy/covered-air only. First-bag empty starts are outside the
-/// training domain. The reflection canonicalization is a shape approximation.
-pub fn raw_prediction(board: &Board) -> Option<[f32; 3]> {
-    if board.rows.iter().all(|&r| r == 0) || board.rows.iter().any(|&r| r >= 1023) { return None; }
-    let model = model()?;
-    let w = &model.weights;
-    let first = convolution(&encode(board), 2, 6, &w["conv1.weight"], &w["conv1.bias"]);
-    let second = convolution(&first, 6, 8, &w["conv2.weight"], &w["conv2.bias"]);
-    let mut pooled = [0.0; 64];
-    for channel in 0..8 {
-        for py in 0..4 {
-            for px in 0..2 {
-                let mut sum = 0.0;
-                for y in py * 6..(py + 1) * 6 {
-                    for x in px * 5..(px + 1) * 5 {
-                        sum += second[channel * HEIGHT * WIDTH + y * WIDTH + x];
-                    }
-                }
-                pooled[channel * 8 + py * 2 + px] = sum / 30.0;
-            }
-        }
-    }
-    let mut hidden = [0.0; 16];
-    for (out, value) in hidden.iter_mut().enumerate() {
-        let mut sum = w["hidden.bias"][out];
-        for (i, input) in pooled.iter().enumerate() { sum += input * w["hidden.weight"][out * 64 + i]; }
-        *value = sum.max(0.0);
-    }
-    let mut output = [0.0; 3];
-    for (out, value) in output.iter_mut().enumerate() {
-        let mut sum = w["output.bias"][out];
-        for (i, input) in hidden.iter().enumerate() { sum += input * w["output.weight"][out * 16 + i]; }
-        *value = sum;
-    }
-    output.iter().all(|x| x.is_finite()).then_some(output)
+pub fn raw_prediction(board: &Board) -> Option<[f32; 2]> {
+    model()?.raw_prediction(board)
 }
 
 pub fn evaluate(board: &Board) -> Option<BoardEvaluation> {
-    let raw = raw_prediction(board)?;
-    let model = model()?;
-    let shape = f64::from(raw[0]).clamp(-1.0, 1.0);
-    let spins = (f64::from(raw[1]) * 6.0).clamp(0.0, f64::from(model.horizon_bags) * 6.0);
-    let log_choices = (f64::from(raw[2]) * 4.0).clamp(0.0, 12.0);
-    let adjustment = 12.0 * (0.4 * shape
-        + 0.4 * (2.0 * (spins / 6.0).clamp(0.0, 1.0) - 1.0)
-        + 0.2 * (2.0 * (log_choices / 4.0).clamp(0.0, 1.0) - 1.0));
-    Some(BoardEvaluation {
-        model_id: model.model_id.clone(), shape_preference: shape,
-        observed_spins: spins, observed_choices: log_choices.exp_m1(),
-        horizon_bags: model.horizon_bags, work_budget: model.work_budget,
-        adjustment: adjustment.clamp(-12.0, 12.0), experimental: true,
-        scope: "Prediction of bounded-policy observations; not a spin witness, exhaustive count, or construction probability.",
-    })
-}
-
-/// A bounded ordering preference applied once at certified boundaries only.
-pub fn boundary_adjustment(board: &Board) -> f64 {
-    evaluate(board).map_or(0.0, |value| value.adjustment)
+    model()?.evaluate(board)
 }

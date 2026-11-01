@@ -55,7 +55,10 @@
   $: hasSession = status !== 'idle' && status !== 'failed';
   $: displayedConfig = snapshot !== null || hasSession ? runConfig : config;
   $: conditionalProbability = displayedConfig.ignore_first_bag_probability;
-  $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
+  $: recommendedRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
+  $: selectedRoute = snapshot?.selectedCandidate ?? null;
+  $: bestRoute = selectedRoute ?? recommendedRoute;
+  $: bagCandidates = snapshot?.bestByBag ?? [];
   $: foundationOnly = !!bestRoute && !bestRoute.complete && bestRoute.bagCount === 1;
   $: bagProbabilities = bestRoute?.bagProbabilities ?? [];
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
@@ -214,6 +217,21 @@
     client.resume();
   }
   function stop() { playing = false; client.cancel(); }
+  function selectRoute(item: Candidate) {
+    if (client.selectCandidate(item.id)) {
+      view = 'best';
+      frameIndex = -1;
+      playing = false;
+      savedMessage = '';
+    }
+  }
+  function followRecommended() {
+    client.selectCandidate(null);
+    view = 'best';
+    frameIndex = -1;
+    playing = false;
+    savedMessage = '';
+  }
   function validateConfig(value: SearchConfig) {
     if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '전체 성공률은 0% 초과, 100% 이하로 입력해 주세요.';
     if (Math.abs(value.min_success_percent * 100 - Math.round(value.min_success_percent * 100)) > 1e-7) return '전체 성공률은 소수 둘째 자리까지 입력해 주세요.';
@@ -363,14 +381,14 @@
     <section class="board-panel" aria-label="후보 필드">
       <div class="panel-top">
         <div class="view-tabs" role="tablist" aria-label="필드 보기">
-          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} onclick={() => view = 'best'}>최선 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
+          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} onclick={() => view = 'best'}>{selectedRoute ? '선택한 경로' : '최선 경로'} {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
           <button role="tab" aria-selected={view === 'current'} class:selected={view === 'current'} onclick={() => view = 'current'}>탐색 중</button>
         </div>
         <span class="board-dimensions">10 × 24</span>
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? selectedRoute ? '선택한 경로 필드' : '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate} /></div>
         <div class="field-summary">
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
@@ -425,13 +443,14 @@
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최선 경로'}</h3><div class="result-actions">
+        <div class="section-heading"><h3><Icon name="spark" size={16} />{selectedRoute ? `${selectedRoute.bagCount}가방 경로` : bestRoute?.complete ? '최선 완주' : '최선 경로'}</h3><div class="result-actions">
           <select bind:value={exportFormat} disabled={exportBusy} aria-label="내보내기 형식"><option value="ctk3">CTK3</option><option value="fumen">Fumen</option></select>
           <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('download')} aria-label="선택한 후보 저장" title="문서 다운로드"><Icon name="download" size={15} /></button>
           <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('copy')} aria-label="선택한 후보 복사" title="클립보드 복사"><Icon name="copy" size={15} /></button>
         </div></div>
+        {#if selectedRoute}<div class="route-selection"><span>선택한 경로를 보고 있어요.</span><button class="text-button" onclick={followRecommended}>추천 경로로 돌아가기</button></div>{/if}
         {#if bestRoute}
-          <button class="best-card" onclick={() => view = 'best'}>
+          <button class="best-card" data-candidate-id={bestRoute.id} onclick={() => view = 'best'}>
             {#if !bestRoute.complete}<span class="efficiency-caption">{foundationOnly ? '첫 가방 기반 평가' : '성공률 반영 효율'}{#if !foundationOnly && bestRoute.probability < 1}<small>실제 {efficiencyLabel(bestRoute)}스핀/가방</small>{/if}</span>{/if}
             <div>
               {#if bestRoute.complete}
@@ -453,7 +472,7 @@
             {/if}
           </button>
           {#if bagProbabilities.length > 0}
-            <section class="bag-chances" aria-label="최선 경로의 가방별 구축률">
+            <section class="bag-chances" aria-label={selectedRoute ? '선택한 경로의 가방별 구축률' : '최선 경로의 가방별 구축률'}>
               <h4>가방별 구축률</h4>
               <ol>
                 {#each bagProbabilities as probability, bag}
@@ -464,6 +483,38 @@
           {/if}
         {:else}
           <div class="best-empty"><span class="empty-line"></span><div class="best-empty-heading"><strong>첫 가방을 확인하고 있어요.</strong><span class="field-evaluation">필드 평가 <b>—</b></span></div><p>첫 가방은 후속 스핀을 위한 기반의 품질로 비교합니다.</p></div>
+        {/if}
+        {#if bagCandidates.length > 0}
+          <section class="depth-results" aria-label="가방 수별 최적과 차선 후보">
+            <h4>가방 수별 후보</h4>
+            <div class="depth-table-wrap">
+              <table>
+                <thead><tr><th scope="col">가방</th><th scope="col">최적</th><th scope="col">차선</th></tr></thead>
+                <tbody>
+                  {#each bagCandidates as group (group.bagCount)}
+                    <tr>
+                      <th scope="row">{group.bagCount}</th>
+                      {#each [group.best, group.runnerUp] as item, rank}
+                        <td>
+                          {#if item}
+                            <button class="depth-candidate" class:selected={selectedRoute?.id === item.id}
+                              data-candidate-id={item.id}
+                              aria-pressed={selectedRoute?.id === item.id}
+                              aria-label={`${group.bagCount}가방 ${rank === 0 ? '최적' : '차선'} 후보, ${item.spins}스핀, ${efficiencyLabel(item)}스핀/가방, 성공률 ${coverageLabel(item)}`}
+                              onclick={() => selectRoute(item)}>
+                              <span><strong>{item.spins}스핀</strong><span>{efficiencyLabel(item)}<small>/가방</small></span></span>
+                              <small>{coverageLabel(item)} · 필드 {evaluationLabel(item)}</small>
+                            </button>
+                          {:else}<span class="depth-empty">아직 없음</span>{/if}
+                        </td>
+                      {/each}
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+            <p>첫 가방은 기반 품질, 이후는 성공률을 반영한 스핀/가방으로 비교해요.</p>
+          </section>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
@@ -506,6 +557,7 @@
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
   <p>일반 배치는 홀드 없이 가능한지 확인하며, 홀드와 성공률 기준은 줄을 지우는 전개에 적용합니다.</p>
   <p><strong>최선 경로</strong>에서는 미노별 배치를 재생할 수 있고, <strong>탐색 중</strong>에서는 후보의 마지막 필드만 보여 줍니다. 오른쪽에서 작업 진척도와 가방별 구축률을 확인할 수 있습니다.</p>
+  <p><strong>가방 수별 후보</strong>에서 같은 가방 수의 최적·차선 경로를 골라 재생하고 저장할 수 있습니다. 선택한 경로는 탐색이 진행되어도 유지되며, 추천 경로로 돌아가면 새 최선 결과를 따라갑니다.</p>
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>

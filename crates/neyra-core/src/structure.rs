@@ -18,13 +18,27 @@ const BANK_DENSITY_LIMIT: f64 = 8.0;
 // Only cavities outside the central body's local service area incur this
 // burden. An actual spin witness can additionally explain its own cells.
 const UNEXPLAINED_HOLE_COST: f64 = 0.5;
-// Prepared roofs may justify some local surface damage, but never acquire the
-// value of an executed spin or cancel the board's hole/access obligations.
-const PREPARED_ROOF_LIMIT: f64 = 6.0;
+// Roof preparation is deliberately valuable even on a damaged board. Its
+// independent positive term never changes actual spins or hole/access facts.
+const PREPARED_ROOF_SCALE: f64 = 3.0;
+const PREPARED_ROOF_LIMIT: f64 = 18.0;
 // A turning side wall can prepare a roof without already choosing a finisher.
-// It remains a small shape preference, separate from witnessed goal readiness.
-const CURLED_ROOF_COLUMN_REWARD: f64 = 0.5;
-const CURLED_ROOF_PREFERENCE_LIMIT: f64 = 2.0;
+// Keep it separate from witnessed goal readiness and probability.
+const CURLED_ROOF_COLUMN_REWARD: f64 = 1.5;
+const CURLED_ROOF_PREFERENCE_LIMIT: f64 = 6.0;
+const LOW_NOTCH_REWARD: f64 = 0.8;
+const TWO_WIDE_WORKSPACE_REWARD: f64 = -3.6;
+const TWO_ROW_STEP_COST: f64 = 0.6;
+const LARGE_STEP_COST: f64 = 3.4;
+const SUSPENDED_ROOF_STEP_RESIDUAL: f64 = 0.25;
+const PLACED_ROOF_COLUMN_REWARD: f64 = 6.0;
+const PLACED_ROOF_LIMIT: f64 = 18.0;
+const FUTURE_ROOF_COLUMN_REWARD: f64 = 3.0;
+const FUTURE_ROOF_RELIEF_WEIGHT: f64 = 0.5;
+const FUTURE_ROOF_LIMIT: f64 = 12.0;
+const LEVEL_REPAIR_RELIEF_WEIGHT: f64 = 0.25;
+const LEVEL_REPAIR_LIMIT: f64 = 6.0;
+const NEW_STEP_DEPENDENCY_WEIGHT: f64 = 0.25;
 // Repeated identical outlines need new preparation before they offer a turn.
 // Inspect a bounded local band; neither more sky nor an arbitrarily tall wall
 // creates additional preference beyond these limits.
@@ -105,6 +119,8 @@ pub(crate) struct BoardFacts {
     lower_floor: u8,
     lower_narrow: [u16; 3],
     lower_slits: [u16; 3],
+    lower_notches: [u16; 3],
+    low_notch_reward: f64,
     workspace_reward: f64,
     bank_reward: f64,
     curled_roof_reward: f64,
@@ -155,6 +171,8 @@ impl BoardFacts {
                 .unwrap_or(0) as u8,
             lower_narrow: [0; 3],
             lower_slits: [0; 3],
+            lower_notches: [0; 3],
+            low_notch_reward: 0.0,
             workspace_reward: 0.0,
             bank_reward: 0.0,
             curled_roof_reward: 0.0,
@@ -184,9 +202,30 @@ impl BoardFacts {
             .sum();
         facts.find_components(board);
         facts.find_working_air(board);
+        facts.find_low_notches(board);
         facts.find_workspace_shape(board);
         facts.summarize_cavity_costs(board);
         facts
+    }
+
+    /// A shallow one-cell bottom can be a useful finishing notch underneath
+    /// a wider body opening. It is not a one-cell body passage: require a
+    /// floor immediately below and existing body clearance immediately above.
+    /// Keep one small reward, rather than adding unrelated tiny openings.
+    fn find_low_notches(&mut self, board: &Board) {
+        for level in 0..3 {
+            let y = self.lower_floor as usize + level;
+            if y + 1 >= HEIGHT { break; }
+            let floor = if y == 0 { FULL_ROW } else { board.rows[y - 1] };
+            let notches = self.lower_slits[level] & floor
+                & self.body_air[y + 1] & !self.sealed[y];
+            self.lower_notches[level] = notches;
+            if notches != 0 {
+                self.low_notch_reward = self.low_notch_reward.max(
+                    LOW_NOTCH_REWARD * lower_weight(level),
+                );
+            }
+        }
     }
 
     /// Follow actual empty row intervals from the selected accessible pocket.
@@ -663,7 +702,8 @@ impl BoardFacts {
         (0..3)
             .map(|level| {
                 let y = self.lower_floor as usize + level;
-                let protected = self.central_air.get(y).copied().unwrap_or(0) | witnessed_goal
+                let protected = self.central_air.get(y).copied().unwrap_or(0)
+                    | self.lower_notches[level] | witnessed_goal
                     .filter(|_| y < HEIGHT)
                     .map_or(0, |goal| goal.required_empty[y]);
                 let narrow = self.lower_narrow[level] & !protected;
@@ -776,7 +816,8 @@ impl BoardFacts {
             1 => 0.75,
             _ => 0.5,
         };
-        (2.0 + f64::from(contacts.min(2)) * 1.5 + self.bank_reward * 0.1875)
+        ((2.0 + f64::from(contacts.min(2)) * 1.5 + self.bank_reward * 0.1875)
+            * PREPARED_ROOF_SCALE)
             .min(PREPARED_ROOF_LIMIT)
             * readiness
             * low
@@ -837,7 +878,8 @@ impl BoardFacts {
             _ => 0.5,
         };
         let bank = bank_density(self.occupied_row(row), columns) * BANK_DENSITY_LIMIT;
-        (2.0 + f64::from(contacts.min(2)) * 1.5 + bank * 0.1875)
+        ((2.0 + f64::from(contacts.min(2)) * 1.5 + bank * 0.1875)
+            * PREPARED_ROOF_SCALE)
             .min(PREPARED_ROOF_LIMIT)
             * readiness
             * local
@@ -973,12 +1015,22 @@ impl BoardFacts {
             self.workspace_roof_top,
         ));
         let surface_fragmentation = self.charged_surface_splits as f64 * 0.0625;
+        // Every adjacent edge keeps its dependency pressure. A selected goal
+        // or broad workspace alone cannot explain a tall step. Only actual
+        // suspended occupancy over working air reduces its explained part.
+        let dependency_pressure = self.height_dependency_cost();
+        let roof_preference = goal.map_or(0.0, |goal| {
+            if witnessed && goal.clear_row > self.lower_floor.saturating_add(2) {
+                self.active_roof_reward(goal, true)
+            } else { self.prepared_roof_reward(goal) }
+        });
         let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
             let (_, _, repair_pressure) = self.bank_skyline(0, 0);
             return -defects
                 - (self.roughness as f64 * 0.0125 + surface_fragmentation)
                     .min(SKYLINE_PREFERENCE_LIMIT)
-                - repair_pressure;
+                - repair_pressure - dependency_pressure
+                + self.low_notch_reward + roof_preference;
         };
         let footprint = usable_goal.map_or(workspace, SingleGoal::working_columns);
         // The dynamic opening does not prove that its neighbouring bank
@@ -1025,18 +1077,18 @@ impl BoardFacts {
         });
         let skyline = (linear as f64 * 0.02 + squared as f64 * 0.003 + surface_fragmentation)
             .min(SKYLINE_PREFERENCE_LIMIT);
-        -defects - skyline - repair_pressure - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
+        -defects - skyline - repair_pressure - dependency_pressure
+            - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
             - directional
             + self.workspace_reward
             + self.bank_reward
+            + self.low_notch_reward
             + self.curled_roof_reward
-            + usable_goal.map_or(0.0, |goal| {
-                if witnessed && goal.clear_row > self.lower_floor.saturating_add(2) {
-                    // A real higher spin can work above inherited residue.
-                    // The residue and raw debt are retained without a reset.
-                    self.active_roof_reward(goal, true)
-                } else { self.prepared_roof_reward(goal) }
-            })
+            + roof_preference
+    }
+
+    fn height_dependency_cost(&self) -> f64 {
+        adjacent_dependency_cost(&self.heights, &self.cavity_roof_tops)
     }
 
     fn outward_bank_cost(&self, workspace: u16) -> f64 {
@@ -1062,9 +1114,9 @@ impl BoardFacts {
         (linear as f64 * 0.15 + severe as f64 * 0.10).min(OUTWARD_BANK_LIMIT)
     }
 
-    /// Ordinary bank steps only affect the capped skyline preference. Large
-    /// cliffs and deep, one-column wells restrict the next bag's useful piece
-    /// choices, so their excess receives a separate repair-pressure cost.
+    /// Skyline texture and deep one-column wells remain separate from the
+    /// all-edge dependency cost. In particular, the latter is never waived
+    /// merely because a goal or workspace selected these columns.
     /// This is not a feasibility test: no piece order or future clear is known.
     /// Reuse the nine bank edges. Normal skyline texture may use the generous
     /// pocket rim; severe bank defects only inherit that rim from a usable
@@ -1072,7 +1124,6 @@ impl BoardFacts {
     fn bank_skyline(&self, working: u16, repair_protected: u16) -> (u16, u16, f64) {
         let mut linear = 0_u16;
         let mut squared = 0_u16;
-        let mut cliffs = 0_u16;
         let mut narrow_wells = 0_u16;
         for x in 0..WIDTH - 1 {
             // The roof immediately above a usable side cavity is not bank
@@ -1090,10 +1141,6 @@ impl BoardFacts {
                 squared += change * change;
             }
             if repair_protected & (3 << x) == 0 {
-                // Up to three rows often match an ordinary J/L or I surface.
-                // Taller differences must not disappear when skyline caps.
-                let surplus = change.saturating_sub(3);
-                cliffs += repair_severity(surplus);
                 if x > 0 && repair_protected & (1 << (x - 1)) == 0 {
                     let depth = self.heights[x - 1]
                         .min(self.heights[x + 1])
@@ -1109,7 +1156,7 @@ impl BoardFacts {
         (
             linear,
             squared,
-            cliffs as f64 * 0.45 + narrow_wells as f64 * 0.60,
+            narrow_wells as f64 * 0.60,
         )
     }
 
@@ -1147,6 +1194,33 @@ fn repair_severity(excess: u16) -> u16 {
     local * local + excess.saturating_sub(4) * 8
 }
 
+fn step_dependency_cost(change: u8) -> f64 {
+    match change {
+        0 | 1 => 0.0,
+        2 => TWO_ROW_STEP_COST,
+        _ => TWO_ROW_STEP_COST + LARGE_STEP_COST * repair_severity((change - 2) as u16) as f64,
+    }
+}
+
+fn adjacent_dependency_cost(heights: &[u8; WIDTH], roofs: &[u8; WIDTH]) -> f64 {
+    let edge = |x: usize| {
+        let (higher, lower) = if heights[x] >= heights[x + 1] {
+            (x, x + 1)
+        } else { (x + 1, x) };
+        let change = heights[higher] - heights[lower];
+        let ordinary = step_dependency_cost(change);
+        let excess = heights[higher].saturating_sub(heights[lower].max(roofs[higher]));
+        let unexplained = step_dependency_cost(excess);
+        unexplained + (ordinary - unexplained) * SUSPENDED_ROOF_STEP_RESIDUAL
+    };
+    // Sum reflected edge pairs together. The placement probe branches on
+    // changes of this value, so reversed summation must not turn exactly four
+    // points into values just above and below its preparation threshold.
+    let pairs = (WIDTH - 1) / 2;
+    let center = if (WIDTH - 1) % 2 == 1 { edge(pairs) } else { 0.0 };
+    (0..pairs).map(|x| edge(x) + edge(WIDTH - 2 - x)).sum::<f64>() + center
+}
+
 fn bank_density(row: u16, opening: u16) -> f64 {
     if opening == 0 { return 0.0; }
     let left = opening.trailing_zeros() as usize;
@@ -1182,7 +1256,7 @@ fn opening_width_reward(width: u8) -> f64 {
         3 => 4.2,
         5 => 3.2,
         6 => 2.4,
-        2 => -2.4,
+        2 => TWO_WIDE_WORKSPACE_REWARD,
         _ => 0.0,
     }
 }
@@ -1207,23 +1281,12 @@ fn working_region(goal: &SingleGoal) -> Option<(u16, u8)> {
     Some((columns, highest.saturating_add(2).min(HEIGHT as u8)))
 }
 
-fn ridge_pressure(heights: &[u8; WIDTH], column: usize, working: u16) -> u16 {
-    let mut pressure = 0;
-    for neighbour in [column - 1, column + 1] {
-        if working & ((1 << column) | (1 << neighbour)) == 0 {
-            let rise = heights[column].saturating_sub(heights[neighbour]) as u16;
-            pressure += rise * rise;
-        }
-    }
-    pressure
-}
-
-/// Quiet-placement ordering for an interior vertical I. Horizontal and edge I
-/// placements, cavity insertions that do not raise the skyline, and filling an
-/// existing valley receive no extra penalty. A remaining tetromino that can
-/// geometrically level the new ridge reduces the penalty; it is not claimed
-/// to be reachable or independently placeable until the normal verifier runs.
-/// Existing BoardFacts are passed in to avoid another full-board analysis.
+/// Compare the actual quiet placement and one optimistic use of the remaining
+/// inventory. A new roof over existing working air gets direct preference;
+/// a tall ordinary step keeps dependency pressure. A future roof is worth more
+/// than simply leveling the same step, but neither is an input/supply proof.
+/// The finite geometric pass uses only the existing column tops and at most
+/// four cells per pose; no BoardFacts flood or recursive search is performed.
 pub(crate) fn placement_bias(
     before: &BoardFacts,
     after: &BoardFacts,
@@ -1232,51 +1295,42 @@ pub(crate) fn placement_bias(
     remaining: u8,
     goal: Option<&SingleGoal>,
 ) -> f64 {
-    if pose.piece != Piece::I {
-        return 0.0;
-    }
-    let cells = pose.cells();
-    let column = cells[0].0;
-    if column <= 0 || column >= WIDTH as i8 - 1 || cells.iter().any(|&(x, _)| x != column) {
-        return 0.0;
-    }
-    let column = column as usize;
-    if after.heights[column] <= before.heights[column] {
-        return 0.0;
-    }
-    let working = goal.and_then(working_region).map_or(0, |r| r.0);
-    let prior = ridge_pressure(&before.heights, column, working);
-    let current = ridge_pressure(&after.heights, column, working);
-    let introduced = current.saturating_sub(prior);
-    if introduced == 0 {
-        return 0.0;
-    }
-    let mut best = current;
-    // The intended finisher cannot also be spent as a quiet repair in this
-    // same proposal. Geometry here is an optimistic, single-use resource hint.
-    let available = remaining & !goal.map_or(0, |g| g.pose.piece.bit());
-    for piece in Piece::ALL {
-        if available & piece.bit() == 0 {
-            continue;
+    let mut placed_columns = 0_u16;
+    let mut formed_roof = 0_u16;
+    for (x, y) in pose.cells() {
+        let (x, y) = (x as usize, y as usize);
+        placed_columns |= 1 << x;
+        if after.cavity_roof_tops[x] == y as u8 + 1
+            && after.cavity_roof_tops[x] > before.cavity_roof_tops[x]
+        {
+            formed_roof |= 1 << x;
         }
+    }
+    let direct = (formed_roof.count_ones() as f64 * PLACED_ROOF_COLUMN_REWARD)
+        .min(PLACED_ROOF_LIMIT);
+    let current = after.height_dependency_cost();
+    let introduced = (current - before.height_dependency_cost()).max(0.0);
+    // Small two-row texture has no extra preparation search or placement tax.
+    if introduced < step_dependency_cost(3) { return direct; }
+    let affected = (placed_columns | placed_columns << 1 | placed_columns >> 1) & FULL_ROW;
+    let left = affected.trailing_zeros() as i8;
+    let right = (u16::BITS - affected.leading_zeros()) as i8;
+    // One remaining mino cannot also be this proposal's intended finisher.
+    let available = remaining & !goal.map_or(0, |g| g.pose.piece.bit());
+    let mut best = 0.0_f64;
+    for piece in Piece::ALL {
+        if available & piece.bit() == 0 { continue; }
         let rotations = match piece {
             Piece::O => 1,
             Piece::I | Piece::S | Piece::Z => 2,
             _ => 4,
         };
         for rotation in 0..rotations {
-            let shape = Pose {
-                piece,
-                rotation,
-                x: 0,
-                y: 0,
-            }
-            .cells();
+            let shape = Pose { piece, rotation, x: 0, y: 0 }.cells();
             let min_x = shape.iter().map(|p| p.0).min().unwrap();
             let max_x = shape.iter().map(|p| p.0).max().unwrap();
-            // A useful repair must touch the ridge or either neighbour.
-            let start = (-min_x).max(column as i8 - 1 - max_x);
-            let end = (WIDTH as i8 - max_x).min(column as i8 + 2 - min_x);
+            let start = (-min_x).max(left - max_x);
+            let end = (WIDTH as i8 - max_x).min(right - min_x);
             for x in start..end {
                 let mut bottoms = [i8::MAX; WIDTH];
                 for &(dx, dy) in &shape {
@@ -1286,25 +1340,9 @@ pub(crate) fn placement_bias(
                 let y = (0..WIDTH)
                     .filter(|&at| bottoms[at] != i8::MAX)
                     .map(|at| after.heights[at] as i8 - bottoms[at])
-                    .max()
-                    .unwrap();
-                // Every used column is supported without creating a new
-                // buried gap. Necessary roofs are handled by goal generation,
-                // not by pretending these arbitrary gaps are free repairs.
-                if (0..WIDTH)
-                    .any(|at| bottoms[at] != i8::MAX && y + bottoms[at] != after.heights[at] as i8)
-                {
-                    continue;
-                }
-                let repair = Pose {
-                    piece,
-                    rotation,
-                    x,
-                    y,
-                };
-                if !board_after.legal(repair) {
-                    continue;
-                }
+                    .max().unwrap();
+                let repair = Pose { piece, rotation, x, y };
+                if !board_after.legal(repair) { continue; }
                 let mut heights = after.heights;
                 let mut filled = [0_u16; HEIGHT];
                 let mut preserves = true;
@@ -1317,24 +1355,43 @@ pub(crate) fn placement_bias(
                     heights[at] = heights[at].max(row as u8 + 1);
                     filled[row] |= 1 << at;
                 }
-                if !preserves
-                    || filled.iter().enumerate().any(|(row, cells)| {
-                        *cells != 0 && board_after.rows[row] | cells == FULL_ROW
-                    })
-                {
-                    continue;
+                if !preserves || filled.iter().enumerate().any(|(row, cells)| {
+                    *cells != 0 && board_after.rows[row] | cells == FULL_ROW
+                }) { continue; }
+                let mut roofs = after.cavity_roof_tops;
+                let mut new_roof = 0_u16;
+                let mut unsupported = false;
+                for (at, row) in repair.cells() {
+                    let (at, row) = (at as usize, row as usize);
+                    if row == 0 || (board_after.rows[row - 1] | filled[row - 1]) & (1 << at) != 0 {
+                        continue;
+                    }
+                    // Suspended cells must cover the current local working
+                    // cavity. Empty sky and unrelated buried holes cannot
+                    // manufacture a hypothetical roof or a free level repair.
+                    if after.central_air[row - 1] & (1 << at) != 0 {
+                        roofs[at] = roofs[at].max(row as u8 + 1);
+                        new_roof |= 1 << at;
+                    } else {
+                        unsupported = true;
+                    }
                 }
-                best = best.min(ridge_pressure(&heights, column, working));
-                if current.saturating_sub(best) >= introduced {
-                    return -(introduced as f64) * 0.20;
-                }
+                if unsupported { continue; }
+                let relief = (current - adjacent_dependency_cost(&heights, &roofs))
+                    .max(0.0).min(introduced);
+                let value = if new_roof != 0 {
+                    (new_roof.count_ones() as f64 * FUTURE_ROOF_COLUMN_REWARD
+                        + relief * FUTURE_ROOF_RELIEF_WEIGHT).min(FUTURE_ROOF_LIMIT)
+                } else {
+                    (relief * LEVEL_REPAIR_RELIEF_WEIGHT).min(LEVEL_REPAIR_LIMIT)
+                };
+                best = best.max(value);
             }
         }
     }
-    // Retain a small cost even for an optimistic repair: spending one specific
-    // remaining piece is a dependency, not unconditional terrain flexibility.
-    let recoverable = current.saturating_sub(best).min(introduced);
-    -(introduced as f64 - recoverable as f64 * 0.75) * 0.8
+    // Spending a particular remaining mino still introduces dependence. Take
+    // one best coherent repair, never sum different pieces or positions.
+    direct + best - introduced * NEW_STEP_DEPENDENCY_WEIGHT
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

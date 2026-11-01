@@ -244,6 +244,14 @@ impl std::ops::Deref for CandidateSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BagCandidatesSnapshot {
+    pub bag_count: u16,
+    pub best: CandidateSnapshot,
+    pub runner_up: Option<CandidateSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProgressSnapshot {
     pub phase: String,
     pub expanded: u64,
@@ -262,6 +270,9 @@ pub struct ProgressSnapshot {
     pub current: Option<CandidateSnapshot>,
     pub best: Option<CandidateSnapshot>,
     pub best_partial: Option<CandidateSnapshot>,
+    /// Two certified whole-bag records per depth, independent of the live tree.
+    /// Always compact; fetch one record's frames with candidate:<id> export.
+    pub best_by_bag: Vec<BagCandidatesSnapshot>,
     pub duplicates: u64,
     /// Selective productivity/terrain cuts, never exact P7 failures.
     pub selective_pruned: u64,
@@ -3107,6 +3118,7 @@ pub struct SearchSession {
     best: Option<Archived>,
     other_complete: Option<Archived>,
     best_partial: Option<Archived>,
+    best_by_bag: Vec<Vec<Archived>>,
     finished: bool,
     last_checked: u16,
     last_success: u16,
@@ -3197,6 +3209,7 @@ impl SearchSession {
             best: None,
             other_complete: None,
             best_partial: None,
+            best_by_bag: vec![],
             finished: false,
             last_checked: 0,
             last_success: 0,
@@ -4220,6 +4233,7 @@ impl SearchSession {
             pending_plan: None,
         };
         self.current = Some(archived.clone());
+        Self::retain_bag_candidate(&mut self.best_by_bag, &archived);
         if qualified {
             self.qualified_bags = self.qualified_bags.max(counts.len() as u16);
             if summary.spins > self.qualified_spins {
@@ -4397,6 +4411,35 @@ impl SearchSession {
         Some(index)
     }
 
+    /// Store display records before live-tree pruning or replacement. Each
+    /// entry owns one unchanged certificate chain; alternatives are not merged.
+    fn retain_bag_candidate(best_by_bag: &mut Vec<Vec<Archived>>, candidate: &Archived) {
+        let summary = &candidate.summary;
+        if !summary.verified || !summary.qualified || summary.complete
+            || summary.bag_count == 0
+            || summary.placed != summary.bag_count * 7
+            || candidate.certificates.len() != usize::from(summary.bag_count)
+        {
+            return;
+        }
+        let depth = usize::from(summary.bag_count);
+        best_by_bag.resize_with(best_by_bag.len().max(depth + 1), Vec::new);
+        let records = &mut best_by_bag[depth];
+        if let Some(index) = records.iter().position(|prior| prior.summary.id == summary.id) {
+            if better_partial(&records[index].summary, summary) { return; }
+            records[index] = candidate.clone();
+        } else if records.len() < 2 {
+            records.push(candidate.clone());
+        } else if better_partial(summary, &records[1].summary) {
+            records[1] = candidate.clone();
+        } else {
+            return;
+        }
+        if records.len() == 2 && better_partial(&records[1].summary, &records[0].summary) {
+            records.swap(0, 1);
+        }
+    }
+
     pub fn snapshot(&self) -> ProgressSnapshot {
         self.snapshot_with_frames(true)
     }
@@ -4444,6 +4487,13 @@ impl SearchSession {
                 .best_partial
                 .as_ref()
                 .map(|a| a.for_snapshot(include_frames)),
+            best_by_bag: self.best_by_bag.iter().enumerate().filter_map(|(depth, records)| {
+                records.first().map(|best| BagCandidatesSnapshot {
+                    bag_count: depth as u16,
+                    best: best.for_snapshot(false),
+                    runner_up: records.get(1).map(|a| a.for_snapshot(false)),
+                })
+            }).collect(),
             duplicates: self.duplicates,
             selective_pruned: self.selective_pruned,
             best_spins_by_bag: self.best_spins_by_bag.clone(),
@@ -4465,7 +4515,11 @@ impl SearchSession {
             "best" => self.best.as_ref(),
             "current" => self.current.as_ref(),
             "partial" => self.best_partial.as_ref(),
-            _ => None,
+            _ => selection.strip_prefix("candidate:").and_then(|id| {
+                self.best_by_bag.iter().flatten().find(|record| record.summary.id == id)
+                    .or_else(|| self.best_partial.as_ref().filter(|record| record.summary.id == id))
+                    .or_else(|| self.best.as_ref().filter(|record| record.summary.id == id))
+            }),
         })
     }
 
@@ -4544,7 +4598,7 @@ impl SearchSession {
             "deepExploration": "OneOfFourExplorationPhases;EligibleCertifiedDepthAtLeastTwoBags"
         });
         selective_search["fieldModel"] = serde_json::json!(
-            "ConnectedCavityResidual;ImmediateWitness;WitnessedOutwardBanks;GoalRelativeUpperRoof;SymmetricGoalWorkspace;CurledWorkspaceRoofPotential;StraightWorkspaceWindowCost"
+            "ConnectedCavityResidual;ImmediateWitness;WitnessedOutwardBanks;StrongPreparedAndGoalRelativeRoof;SymmetricGoalWorkspace;StrongCurledWorkspaceRoof;StraightWorkspaceWindowCost;AllAdjacentHeightDependence;SuspendedRoofStepRelief;LowOneCellNotch;OneMinoRoofOrLevelRepair"
         );
         serde_json::json!({
             "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
@@ -4564,6 +4618,7 @@ impl SearchSession {
             "mirroredInputsVerified": false,
             "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
             "displayPartialRanking": "ProductiveStageOverFoundation;oneBag:FieldQuality,StartProbability,CountedProbability,Spins,FewerLocks;later:spins*CountedProbability/max(7,placed),Probability,MoreBags,Spins,FieldQuality,FewerLocks",
+            "bagRecords": "TwoQualifiedVerifiedWholeBagPartialsPerDepth;SamePartialComparator;DistinctPlanIds;IndependentCertificateChains;CandidateIdSelection",
             "bagProbabilityScope": "IndependentFloorAfterFirstBag;BelowActualBagSpinThresholdRequires100Percent;FirstBagUsesItsOwnFloor;DisplayedBagsUseFullCertifiedCoverage",
             "probabilityBudget": archive.filter(|a| a.summary.verified).map(|a| {
                 let chance = a.summary.probability;

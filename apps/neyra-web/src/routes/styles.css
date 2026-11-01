@@ -110,6 +110,25 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .bag-chances li>span{display:flex;align-items:center;justify-content:space-between;gap:3px;font-size:9px;color:#8da77c}
 .bag-chances li small{font-size:8px;color:#829477;white-space:nowrap}
 .bag-chances li strong{font-size:11px;font-weight:550;font-variant-numeric:tabular-nums;color:#d1e4bf}
+.route-selection{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:10px 0 -3px;font-size:9px;color:#91aa80}
+.route-selection .text-button{font-size:9px}
+.depth-results{margin-top:16px}
+.depth-results h4{font-size:11px;font-weight:550;color:#c6dab7;margin:0 0 8px}
+.depth-table-wrap{max-height:205px;overflow:auto;scrollbar-width:thin;scrollbar-color:#506744 transparent;border:1px solid #354d32;border-radius:5px}
+.depth-results table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;font-variant-numeric:tabular-nums}
+.depth-results thead th{position:sticky;top:0;background:#223426;color:#95af85;font-size:9px;font-weight:500;text-align:left;padding:6px 7px;z-index:1}
+.depth-results thead th:first-child{width:35px;text-align:center}
+.depth-results tbody th{font-size:11px;font-weight:550;color:#b7cfa6;text-align:center;border-top:1px solid #30462e}
+.depth-results td{padding:4px;border-top:1px solid #30462e}
+.depth-candidate{display:flex;flex-direction:column;gap:5px;width:100%;background:#17281d;border:1px solid transparent;border-radius:4px;padding:7px 6px;color:#cfdfc1;text-align:left;min-width:0}
+.depth-candidate:hover{background:#2a3e29;border-color:#65854e}
+.depth-candidate.selected{border-color:#a5d578;background:#334c2b}
+.depth-candidate>span{display:flex;align-items:baseline;justify-content:space-between;gap:4px;font-size:10px;white-space:nowrap}
+.depth-candidate strong{font-size:11px;font-weight:550}
+.depth-candidate>small{font-size:8px;color:#8fa97c;white-space:nowrap}
+.depth-candidate span small{font-size:8px;color:#8fa97c;margin-left:2px}
+.depth-empty{display:block;font-size:9px;color:#72896b;text-align:center}
+.depth-results>p{font-size:9px;color:#829b75;line-height:1.5;margin:7px 0 0;word-break:keep-all}
 .secondary-result{display:flex;justify-content:space-between;margin-top:14px;font-size:10px;color:#d8c48f}
 .secondary-result strong{font-weight:550}
 .verification-note{font-size:9px;color:#9aaf88;margin:13px 0 0;line-height:1.5;min-height:27px}

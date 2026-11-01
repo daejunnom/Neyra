@@ -1,4 +1,4 @@
-import type { Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus, SearchConfig, SearchSnapshot } from './types';
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus, SearchConfig, SearchSnapshot } from './types';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
 
@@ -113,14 +113,6 @@ function samePartialRecord(a: Candidate, b: Candidate): boolean {
     a.rows.length === b.rows.length && a.rows.every((row, y) => row === b.rows[y]);
 }
 
-function partialArchiveKey(item: OwnedCandidate): string {
-  const value = item.candidate;
-  return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, value.bagCount, fieldQuality(value),
-    value.forecastSpins, value.forecastSpinsByBag, value.forecastPlacements,
-    value.probability, value.bagProbabilities ?? [], value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
-    value.frameCount, value.rows]);
-}
-
 function complete(candidate: Candidate | null | undefined): candidate is Candidate {
   return !!candidate?.complete && candidate.qualified && candidate.verified && candidate.budgetPieces !== null;
 }
@@ -135,12 +127,9 @@ export class SearchClient {
   private nextFocusAt = 0;
   private lastProgressAt = 0;
   private progressTimer: ReturnType<typeof setTimeout> | undefined;
-  private pendingExports = new Map<string, { owner: number; view: CandidateView }>();
-  private pendingDetails = new Map<number, { requestId: string }>();
-  private partialPeak: OwnedCandidate | null = null;
-  private partialArchive: ArchivedCandidate | null = null;
-  private pendingPartialArchive: { requestId: string; owner: number; key: string } | null = null;
-  private rejectedPartialArchives = new Set<string>();
+  private pendingExports = new Map<string, { owner: number; view: CandidateView; candidateId: string }>();
+  private bagRecords = new Map<number, ArchivedCandidate[]>();
+  private selectedArchive: ArchivedCandidate | null = null;
   private bestSpinsByBag = Array<number>(101).fill(0);
   private shareSpinBenchmarks = true;
 
@@ -231,9 +220,23 @@ export class SearchClient {
     this.publishStatus();
   }
 
-  export(view: CandidateView = 'best', requestId = crypto.randomUUID()): boolean {
+  /** Pin the actual selected certificate; later rankings do not switch its replay. */
+  selectCandidate(id: string | null): boolean {
+    if (id === null) {
+      this.selectedArchive = null;
+      this.publishProgress(true);
+      return true;
+    }
+    const record = [...this.bagRecords.values()].flat().find((item) => this.ownedId(item) === id);
+    if (!record) return false;
+    this.selectedArchive = record;
+    this.publishProgress(true);
+    return true;
+  }
+
+  export(view: 'current' | 'best' | 'partial' = 'best', requestId = crypto.randomUUID()): boolean {
     const owner = view === 'current' ? this.currentCandidateOwner() :
-      view === 'partial' ? this.partialOwner() : this.bestOwner() ?? this.partialOwner();
+      view === 'partial' ? this.partialOwner() : this.selectedArchive ?? this.bestOwner() ?? this.partialOwner();
     if (!owner) return false;
     const selection: CandidateView = view === 'current' ? 'current' : owner.candidate.complete ? 'best' : 'partial';
     if (selection === 'best' && owner.slot.incumbent?.candidate.id === owner.candidate.id) {
@@ -241,18 +244,19 @@ export class SearchClient {
       this.receive({ type: 'export', runId: this.runId, requestId, data: owner.slot.incumbent.data });
       return true;
     }
-    if (selection === 'partial' && this.partialArchive?.slot.id === owner.slot.id &&
-        samePartialRecord(this.partialArchive.candidate, owner.candidate)) {
-      this.receive({ type: 'export', runId: this.runId, requestId, data: this.partialArchive.data });
+    const archived = this.findArchive(owner);
+    if (selection === 'partial' && archived) {
+      this.receive({ type: 'export', runId: this.runId, requestId, data: archived.data });
       return true;
     }
     if (owner.slot.status === 'failed') {
       this.receive({ type: 'export-error', runId: this.runId, requestId, message: '이 경로의 기록을 받기 전에 탐색기가 중단됐어요. 이미 보관한 결과는 계속 저장할 수 있습니다.' });
       return false;
     }
-    this.pendingExports.set(requestId, { owner: owner.slot.id, view: selection });
+    const requestView: CandidateView = selection === 'partial' ? `candidate:${owner.candidate.id}` : selection;
+    this.pendingExports.set(requestId, { owner: owner.slot.id, view: requestView, candidateId: owner.candidate.id });
     try {
-      owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: selection } satisfies EngineCommand);
+      owner.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: requestView } satisfies EngineCommand);
       return true;
     } catch {
       this.pendingExports.delete(requestId);
@@ -268,11 +272,8 @@ export class SearchClient {
     for (const slot of this.slots) slot.worker.terminate();
     this.slots = [];
     this.pendingExports.clear();
-    this.pendingDetails.clear();
-    this.partialPeak = null;
-    this.partialArchive = null;
-    this.pendingPartialArchive = null;
-    this.rejectedPartialArchives.clear();
+    this.bagRecords.clear();
+    this.selectedArchive = null;
     this.bestSpinsByBag.fill(0);
     // Invalidate queued messages before a new generation starts.
     this.runId = '';
@@ -291,12 +292,6 @@ export class SearchClient {
     if (message.type === 'progress') {
       this.updateSnapshot(slot, message.snapshot);
       this.publishProgress();
-    } else if (message.type === 'detail') {
-      const pending = this.pendingDetails.get(slot.id);
-      if (!pending || pending.requestId !== message.requestId) return;
-      this.pendingDetails.delete(slot.id);
-      this.updateSnapshot(slot, message.snapshot);
-      this.publishProgress(true);
     } else if (message.type === 'status') {
       // A start acknowledgement can arrive after pause/cancel was requested.
       // Keep waiting for the matching control acknowledgement from every worker.
@@ -309,38 +304,24 @@ export class SearchClient {
         slot.incumbent = { candidate: message.candidate, data: message.data };
       }
       this.publishProgress();
+    } else if (message.type === 'bag-record') {
+      this.retainBagRecord(slot, message.candidate, message.data);
+      this.publishProgress();
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
     } else if (message.type === 'export' || message.type === 'export-error') {
-      const archive = this.pendingPartialArchive;
-      if (archive?.requestId === message.requestId) {
-        if (archive.owner !== slot.id) return;
-        this.pendingPartialArchive = null;
-        if (message.type === 'export') {
-          if (message.snapshot) this.updateSnapshot(slot, message.snapshot);
-          const candidate = (message.data as { candidate?: Candidate } | null)?.candidate;
-          if (candidate?.verified && candidate.qualified && !candidate.complete &&
-              candidate.frames.length === candidate.frameCount) {
-            // The engine can improve between request and reply. Keep that newer
-            // certificate, but a late reply cannot overwrite a higher record.
-            if (!this.partialArchive || betterPartial(candidate, this.partialArchive.candidate)) {
-              this.partialArchive = { slot, candidate, data: message.data };
-            }
-          } else {
-            this.rejectedPartialArchives.add(archive.key);
-          }
-        } else {
-          this.rejectedPartialArchives.add(archive.key);
-        }
-        this.publishProgress(true);
-        return;
-      }
       const request = this.pendingExports.get(message.requestId);
       if (!request || request.owner !== slot.id) return;
       this.pendingExports.delete(message.requestId);
       if (message.type === 'export-error') {
         this.receive({ type: 'export-error', runId: this.runId, requestId: message.requestId, message: message.message });
       } else {
+        const candidate = (message.data as { candidate?: Candidate } | null)?.candidate;
+        if (request.view !== 'current' && (!candidate || candidate.id !== request.candidateId)) {
+          this.receive({ type: 'export-error', runId: this.runId, requestId: message.requestId,
+            message: '선택한 후보의 기록이 바뀌었어요. 후보를 다시 선택해 주세요.' });
+          return;
+        }
         if (message.snapshot) this.updateSnapshot(slot, message.snapshot);
         if (request.view === 'current') {
           this.currentOwner = slot.id;
@@ -356,8 +337,6 @@ export class SearchClient {
     if (slot.status === 'failed') return;
     slot.status = 'failed';
     slot.worker.terminate();
-    this.pendingDetails.delete(slot.id);
-    if (this.pendingPartialArchive?.owner === slot.id) this.pendingPartialArchive = null;
     for (const [requestId, request] of this.pendingExports) {
       if (request.owner === slot.id) {
         this.pendingExports.delete(requestId);
@@ -408,30 +387,61 @@ export class SearchClient {
   }
 
   private partialOwner(): OwnedCandidate | null {
-    let best = this.partialPeak;
+    let best: OwnedCandidate | null = null;
+    for (const records of this.bagRecords.values()) {
+      for (const record of records) {
+        if (!best || betterPartial(record.candidate, best.candidate)) best = record;
+      }
+    }
     for (const slot of this.slots) {
       const candidate = slot.snapshot?.bestPartial;
-      if (candidate?.verified && candidate.qualified && !candidate.complete &&
-          (!best || betterPartial(candidate, best.candidate) ||
-            (best.slot.id === slot.id && samePartialRecord(best.candidate, candidate) &&
-              candidate.frames.length >= best.candidate.frames.length))) best = { slot, candidate };
+      if (slot.status !== 'failed' && candidate?.verified && candidate.qualified && !candidate.complete &&
+          (!best || betterPartial(candidate, best.candidate))) best = { slot, candidate };
     }
-    const archived = this.partialArchive;
-    if (archived && (!best || betterPartial(archived.candidate, best.candidate) ||
-        (best.slot.id === archived.slot.id && samePartialRecord(best.candidate, archived.candidate)))) best = archived;
-    this.partialPeak = best;
     return best;
   }
 
-  private archivePartial(item: OwnedCandidate | null) {
-    if (!item || item.slot.status === 'failed' || this.pendingPartialArchive ||
-        (this.partialArchive && !betterPartial(item.candidate, this.partialArchive.candidate)) ||
-        this.rejectedPartialArchives.has(partialArchiveKey(item))) return;
-    const requestId = crypto.randomUUID();
-    this.pendingPartialArchive = { requestId, owner: item.slot.id, key: partialArchiveKey(item) };
-    // Archive only the new global record. Ordinary progress stays compact and
-    // this internal request never triggers a download in the user's browser.
-    item.slot.worker.postMessage({ type: 'export', runId: this.runId, requestId, view: 'partial' } satisfies EngineCommand);
+  private ownedId(item: OwnedCandidate): string {
+    return `w${item.slot.id}:${item.candidate.id}`;
+  }
+
+  private findArchive(item: OwnedCandidate): ArchivedCandidate | null {
+    const matches = (record: ArchivedCandidate) => record.slot.id === item.slot.id &&
+      samePartialRecord(record.candidate, item.candidate);
+    if (this.selectedArchive && matches(this.selectedArchive)) return this.selectedArchive;
+    return this.bagRecords.get(item.candidate.bagCount)?.find(matches) ?? null;
+  }
+
+  private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown) {
+    const exported = (data as { candidate?: Candidate } | null)?.candidate;
+    if (!candidate.verified || !candidate.qualified || candidate.complete ||
+        !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 || candidate.bagCount > 100 ||
+        candidate.placed !== candidate.bagCount * 7 || candidate.frames.length !== candidate.frameCount ||
+        !exported || !samePartialRecord(candidate, exported) || exported.frames.length !== exported.frameCount) {
+      this.failed(slot, '가방별 후보의 검증 기록이 일치하지 않아요.');
+      return;
+    }
+    const record: ArchivedCandidate = { slot, candidate, data };
+    const sameId = (item: ArchivedCandidate) => item.slot.id === slot.id && item.candidate.id === candidate.id;
+    const previous = this.selectedArchive && sameId(this.selectedArchive) ? this.selectedArchive :
+      this.bagRecords.get(candidate.bagCount)?.find(sameId);
+    if (previous && betterPartial(previous.candidate, candidate)) return;
+    if (this.selectedArchive && sameId(this.selectedArchive)) this.selectedArchive = record;
+    const records = (this.bagRecords.get(candidate.bagCount) ?? []).filter((item) => !sameId(item));
+    records.push(record);
+    records.sort((a, b) => betterPartial(a.candidate, b.candidate) ? -1 :
+      betterPartial(b.candidate, a.candidate) ? 1 : 0);
+    // Full certificate ownership remains separate even when two workers find
+    // similar boards. Keep just the two displayed records, plus one user pin.
+    this.bagRecords.set(candidate.bagCount, records.slice(0, 2));
+  }
+
+  private publishedBagRecords(): BagCandidates[] {
+    return [...this.bagRecords.entries()].sort(([a], [b]) => a - b).map(([bagCount, records]) => ({
+      bagCount,
+      best: { ...records[0].candidate, id: this.ownedId(records[0]) },
+      runnerUp: records[1] ? { ...records[1].candidate, id: this.ownedId(records[1]) } : null
+    }));
   }
 
   private updateSnapshot(slot: WorkerSlot, snapshot: SearchSnapshot) {
@@ -482,13 +492,6 @@ export class SearchClient {
     }
   }
 
-  private requestPartialDetail(item: OwnedCandidate | null) {
-    if (!item || item.slot.status === 'failed' || item.candidate.frames.length >= item.candidate.frameCount || this.pendingDetails.has(item.slot.id)) return;
-    const requestId = crypto.randomUUID();
-    this.pendingDetails.set(item.slot.id, { requestId });
-    item.slot.worker.postMessage({ type: 'detail', runId: this.runId, requestId } satisfies EngineCommand);
-  }
-
   private currentCandidateOwner(): OwnedCandidate | null {
     const ready = this.slots.filter((slot) => slot.snapshot?.current && slot.status !== 'failed');
     if (ready.length === 0) return null;
@@ -524,14 +527,10 @@ export class SearchClient {
     const best = this.bestOwner();
     const partial = this.partialOwner();
     this.watchCurrentOwner(this.observingCurrent ? current?.slot.id : undefined);
-    if (!best) {
-      this.archivePartial(partial);
-      if (!this.pendingPartialArchive) this.requestPartialDetail(partial);
-    }
     const sum = (read: (value: SearchSnapshot) => number) => values.reduce((value, next) => value + read(next), 0);
     const max = (read: (value: SearchSnapshot) => number) => Math.max(0, ...values.map(read));
     const selected = current?.slot.snapshot;
-    const owned = (item: OwnedCandidate | null) => item ? { ...item.candidate, id: `w${item.slot.id}:${item.candidate.id}` } : null;
+    const owned = (item: OwnedCandidate | null) => item ? { ...item.candidate, id: this.ownedId(item) } : null;
     this.receive({ type: 'progress', runId: this.runId, snapshot: {
       phase: selected?.phase ?? 'searching',
       expanded: sum((value) => value.expanded),
@@ -551,6 +550,7 @@ export class SearchClient {
       frontier: sum((value) => value.frontier),
       finished: this.status === 'completed',
       current: owned(current), best: owned(best), bestPartial: owned(partial),
+      bestByBag: this.publishedBagRecords(), selectedCandidate: owned(this.selectedArchive),
       workers: this.slots.filter((slot) => !['failed', 'completed', 'cancelled'].includes(slot.status)).length
     } });
   }

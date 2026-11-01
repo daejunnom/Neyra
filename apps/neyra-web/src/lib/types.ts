@@ -21,7 +21,7 @@ export type WorkerSearchConfig = Omit<SearchConfig, 'worker_count'> & {
   search_lane: number;
   search_lanes: number;
 };
-export type CandidateView = 'current' | 'best' | 'partial';
+export type CandidateView = 'current' | 'best' | 'partial' | `candidate:${string}`;
 
 export interface BoardFrame {
   rows: number[];
@@ -68,6 +68,12 @@ export interface Candidate {
   forecastPlacements?: number;
 }
 
+export interface BagCandidates {
+  bagCount: number;
+  best: Candidate;
+  runnerUp: Candidate | null;
+}
+
 export interface SearchSnapshot {
   phase: string;
   expanded: number;
@@ -91,6 +97,10 @@ export interface SearchSnapshot {
   current: Candidate | null;
   best: Candidate | null;
   bestPartial: Candidate | null;
+  /** Two independent certified whole-bag routes at each reached depth. */
+  bestByBag?: BagCandidates[];
+  /** Explicit browser selection, pinned while later records improve. */
+  selectedCandidate?: Candidate | null;
   /** Added by the browser coordinator, not combined into any certificate. */
   workers?: number;
 }
@@ -104,6 +114,7 @@ export type EngineEvent =
   | { type: 'error'; runId: string; message: string }
   | { type: 'warning'; runId: string; message: string }
   | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown }
+  | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown }
   | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
   | { type: 'export'; runId: string; requestId: string; data: unknown; snapshot?: SearchSnapshot }
   | { type: 'export-error'; runId: string; requestId: string; message: string };

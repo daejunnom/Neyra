@@ -110,6 +110,18 @@
   scheduling may exclude it. Keep the total-spin maximum as separate progress.
   Reset only for a new run; compare records identically in Rust and TypeScript.
   Same-ID quality improvements must replace old fields and archived exports.
+- Retain two qualified, verified whole-bag partial routes per placed bag count,
+  independently of live-tree replacement. Keep distinct plan IDs, complete
+  certificate chains and representative frames; never combine alternatives'
+  success sets. `bestByBag` remains compact even in full/export snapshots.
+  Export a retained route through its exact candidate ID; a missing ID must
+  return no candidate instead of another route. In the browser, scope IDs by
+  worker and run, retain the global two per depth plus one explicit selection,
+  and capture new records before advertising them. A selected route stays pinned
+  through new progress, pause, cancellation or worker failure, until another
+  selection or a new run. Serialize its full proof only on a record change or
+  selected export, not on every current-field detail update. Keep terminal
+  completions separate from these whole-bag partial records.
 - Under a relaxed overall floor, compare verified probability-resource use
   with uniform logarithmic consumption to a fixed selected horizon. Add
   `24*clamp(pacedFraction-spentFraction,-1,1)` only to temporary scheduling
@@ -212,22 +224,28 @@
   a certificate that the intended finisher remains a valid Spin Single.
 
 - Prefer dense side banks beside accessible low working space, without fixing
-  the center column or rewarding absolute stack height. A capped prepared-roof
-  preference must refer to an existing roof over a concrete single goal; it is
-  not a spin witness and cannot excuse inaccessible cavities. Reduce ordinary
-  smoothness preference while preserving deep one-column repair dependencies
-  and excess towers above a useful roof.
+  the center column or rewarding absolute stack height. Give an existing roof
+  over a concrete single goal a strong capped preference, independently of
+  whether the rest of the field is damaged or its total Terrain is negative.
+  A static access warning does not suppress this shape reward, but all access,
+  hole and debt costs remain separate; the roof is not an input/spin witness.
+  Preserve deep one-column repair dependencies and excess towers above a roof.
   Every root prefix keeps foundation-dependency weighting in mixed rounds too.
   Use `k*setup_score + weight*structural`, with weights .06 for locks 1–3,
   then .12/.18/.24/.30 for locks 4–7, and k=1 or .35 for a relaxed setup round.
   Use at most two points of ordering jitter. A first-bag pursuit may refer to a
   next-bag finisher already spent in this inventory if its footprint remains
   preserved; actual clears release it. This is ordering, not permission to clear.
-- Keep the af8 preparation gradient: the selected low workspace uses full
-  width/depth preference and weaker-side occupancy density, plus a concrete
-  prepared-roof reward capped at 6. Do not multiply these positive preferences
-  down merely because the finishing spin has not yet been executed. They remain
-  shape preferences and cannot add actual spins or manufacture probability.
+- Keep the af8 preparation gradient: the selected low workspace uses explicit
+  width/depth preference and weaker-side occupancy density, plus the increased
+  concrete prepared-roof value recorded in STRUCTURAL_EVALUATION.md. Do not
+  multiply these positive preferences down merely because the finishing spin
+  has not yet been executed. They remain shape preferences and cannot add actual
+  spins or manufacture probability. Lower the width-two workspace preference;
+  a shallow low width-one notch earns at most 0.8 and avoids its generic narrow
+  gap charge only with a floor immediately below and body clearance above.
+  This notch is not body clearance itself and does not erase hole/access/debt
+  obligations; long one-column shafts and edge I spaces are not such notches.
   Do not claim ordinary bank preference uses the later wall-attachment blend
   or split-channel penalty, or that an unconditional outward slope is active.
   Only an actual immediate
@@ -236,17 +254,34 @@
   or actual footprint; leave unfinished prefix ordering unchanged. Only when
   that immediate goal lies more than two rows above the inherited lower floor
   may the goal-relative active-roof formula replace the ordinary roof reward,
-  still capped at 6. Keep old low-roof behavior and inherited cells, raw debt
-  and probability resources; a higher workspace never resets the board.
+  using the same increased cap. Keep inherited cells, raw debt and probability
+  resources; a higher workspace never resets the board.
+- Charge every adjacent column edge for height dependence, independently of
+  selected goal/workspace protection: difference two is mild; three and higher
+  have a strong increasing cost. Only actual suspended occupancy over useful
+  working air reduces its explained portion to 25%; height above that roof
+  keeps its full cost. A detached roof after clears may qualify for this relief;
+  arbitrary floating blocks cannot. Replace the old cliff subtotal rather than
+  charge it twice. Sum reflected edge pairs in a fixed order so rounding cannot
+  change a preparation-threshold branch under reflection.
+- Quiet-placement ordering applies to all piece types. Reward a newly formed
+  actual working roof directly; if new height dependence is large, compare a
+  single remaining mino's roof-making placement with ordinary leveling. Reserve
+  the intended finisher, preserve its empty cells, reject hypothetical clears
+  and unrelated unsupported gaps, and take one best alternative. Retain a
+  dependency cost for consuming that specific piece. Keep this bounded geometry
+  pass separate from actual input/P7 proof; do not perform new flood analyses
+  or recursive search for each counterfactual placement.
 - Add bounded curl potential and straight-wall cost around the selected low
   workspace, within two rows of the inherited lower floor. Follow at most five
   rows of actual empty intervals, width 2–6, between occupied sidewalls. Adjacent
   rows must share at least two adjacent body-clearance cells. Keep coherent
   paths separate; alternative branches must not donate lip columns to each other.
-  Curl potential is max_paths(L(level)*min(2,0.5*distinctAttachedLipColumns)),
-  with L=1/.6/.3 at levels 0/1/2. Count inward steps only from a gap at least
+  Curl potential uses the increased explicit per-column reward and cap in
+  STRUCTURAL_EVALUATION.md, taking one best coherent path, with L=1/.6/.3 at
+  levels 0/1/2. Count inward steps only from a gap at least
   three cells wide, with occupied cells continuously attaching the new lip to
-  the previous sidewall. This small goal-free potential is separate from the
+  the previous sidewall. This goal-free potential is separate from the
   concrete prepared-roof reward. Floating islands, closed lids, repeated lip
   columns and height outside the five-row band add no curl preference.
 - Add the worst connected straight segment's cost to terrain defects D:
@@ -329,6 +364,11 @@
 - Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
+  Show the best and runner-up for each placed bag count with actual spins per
+  bag, counted chance and field quality. Explicit selection controls replay,
+  the shown bag probabilities and exports together; returning to the recommended
+  route resumes automatic best selection. At equal chance, six spins in three
+  bags outranks nine in five, while both depths remain separately inspectable.
   Keep playback on the retained best route; the current-search tab shows only
   its final board and has no autoplay or replay controls. Show all certified
   per-bag construction probabilities on the best route, including 100%, and

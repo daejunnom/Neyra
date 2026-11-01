@@ -1,4 +1,4 @@
-import type { EngineCommand, EngineEvent, SearchSnapshot } from './types';
+import type { Candidate, EngineCommand, EngineEvent, SearchSnapshot } from './types';
 
 type WasmEngine = {
   advance(work: number): void;
@@ -30,6 +30,7 @@ let watchCurrent = false;
 let detailedCurrentKey = '';
 let modulePromise: Promise<WasmModule> | undefined;
 let bestSpinsByBag = Array<number>(101).fill(0);
+let bagRecordVersions = new Map<string, string>();
 
 function send(message: EngineEvent) { scope.postMessage(message); }
 
@@ -64,15 +65,53 @@ async function wasm(assetBase: string, build: string): Promise<WasmModule> {
 function readSnapshot(full = false): SearchSnapshot | null {
   if (!engine) return null;
   const compact = JSON.parse(engine.snapshot_compact()) as SearchSnapshot;
+  // Capture new certified records before advertising their IDs. A later step
+  // can replace Rust's second-place archive before an on-demand request arrives.
+  // Routine snapshots remain compact; the coordinator retains just two per bag.
+  const captured = new Map<string, Candidate>();
+  const retained = new Map<string, string>();
+  for (const group of compact.bestByBag ?? []) {
+    for (const candidate of [group.best, group.runnerUp]) {
+      if (!candidate) continue;
+      const revision = JSON.stringify(candidate);
+      retained.set(candidate.id, revision);
+      if (bagRecordVersions.get(candidate.id) === revision) continue;
+      const data = JSON.parse(engine.export_selected_json(`candidate:${candidate.id}`));
+      const record = data.candidate as Candidate | undefined;
+      if (!record || record.id !== candidate.id || record.bagCount !== group.bagCount ||
+          !record.verified || !record.qualified || record.complete ||
+          record.frames.length !== record.frameCount) {
+        throw new Error('가방별 후보의 검증 기록을 가져오지 못했어요.');
+      }
+      captured.set(record.id, record);
+      // This is a selected certificate archive. Its aggregate search snapshot
+      // is unrelated to that selection and would repeat other routes' replays.
+      delete data.snapshot;
+      send({ type: 'bag-record', runId, candidate: record, data });
+    }
+  }
+  bagRecordVersions = retained;
   const current = compact.current;
   const key = current ? JSON.stringify([current.id, current.verified, current.frameCount,
     current.placed, current.spins, current.rows]) : '';
   // A verified witness can use another order than the same plan's preview.
   // Only changed replay identities need another full history transfer.
   if (full || (watchCurrent && key !== detailedCurrentKey)) {
-    const value = JSON.parse(engine.snapshot()) as SearchSnapshot;
+    const capturedCurrent = current ? captured.get(current.id) : undefined;
+    if (!full && capturedCurrent) {
+      compact.current = capturedCurrent;
+    } else {
+      // Full snapshots contain only current/best/partial histories; every
+      // per-depth entry stays compact in Rust. Avoid serializing P7 proofs
+      // merely to display a changing current field.
+      const detail = JSON.parse(engine.snapshot()) as SearchSnapshot;
+      compact.current = detail.current;
+      if (full) {
+        compact.best = detail.best;
+        compact.bestPartial = detail.bestPartial;
+      }
+    }
     detailedCurrentKey = key;
-    return value;
   }
   return compact;
 }
@@ -149,6 +188,7 @@ scope.onmessage = async ({ data }) => {
     watchCurrent = data.watchCurrent;
     detailedCurrentKey = '';
     bestSpinsByBag.fill(0);
+    bagRecordVersions.clear();
     runId = data.runId;
     const requestedId = runId;
     try {

@@ -248,8 +248,9 @@ struct SeedState {
     score: f64,
     quality: f64,
     pursuit: Option<Rc<SingleGoal>>,
-    /// Newly buried cells created by quiet setup placements. Row deletion and
-    /// actual filling pay this debt; merely opening a roof does not.
+    /// Newly buried cells created by quiet setup placements. Keep the history
+    /// until a cell is filled or deleted; charge only its centrally inaccessible
+    /// subset on the current board, so an opened working pocket is not punished.
     debt: CellMask,
     future: Continuation,
     /// Optimistic first-lock choices before this bag's row deletions.
@@ -1071,12 +1072,21 @@ const CONTINUATION_ALTERNATIVES: usize = 3;
 const CONTINUATION_TASKS: usize = 192;
 const CONTINUATION_RESERVED: usize = 24;
 const CONTINUATION_DEEP_WORK: u16 = 128;
+const CONTINUATION_RECIPES: usize = 4;
+const CONTINUATION_PAIR_LIMIT: u8 = 3;
+const CONTINUATION_READY_CAP: f64 = 12.0;
+const CONTINUATION_PREPARED_CAP: f64 = 4.0;
+const CONTINUATION_INDEPENDENCE_CAP: f64 = 16.0;
 
 #[derive(Clone, Default)]
 struct Continuation {
     placements: Vec<Placement>,
     alternatives: Vec<Vec<Placement>>,
     score: f64,
+    /// Best concrete readiness evidence; never a count of alternative slots.
+    preparation_score: f64,
+    /// Best pair replayed successfully in both orders, not a P7 probability.
+    independence_score: f64,
     paid: u16,
     /// Immediate forecast bag only; selective cuts must not borrow bag two.
     spins: u8,
@@ -1154,6 +1164,29 @@ enum ProbeTask {
     Finish(Rc<ProbeState>, Pose),
     Support(Rc<ProbeState>, Rc<SingleGoal>, Piece),
     Bank(Rc<ProbeState>, Piece),
+    Independence(Box<IndependenceCheck>),
+}
+
+struct SpinRecipe {
+    /// Quiet targets followed by one finisher, before any earlier line clear.
+    targets: Vec<TargetOperation>,
+    rotations: Vec<u8>,
+    footprint: CellMask,
+    used: u8,
+    end: Board,
+    deleted: u32,
+    preparation: u8,
+}
+
+struct IndependenceCheck {
+    first: Rc<SpinRecipe>,
+    second: Rc<SpinRecipe>,
+    reverse: bool,
+    next: usize,
+    board: Board,
+    deleted: u32,
+    used: u8,
+    first_order_end: Option<Board>,
 }
 
 struct ForecastLine {
@@ -1174,6 +1207,12 @@ struct ContinuationProbe {
     base_score: f64,
     best: Continuation,
     lines: Vec<ForecastLine>,
+    recipes: Vec<Rc<SpinRecipe>>,
+    preparation_score: f64,
+    independence_score: f64,
+    pair_attempts: u8,
+    pair_queries: u8,
+    pair_finisher_masks: Vec<u8>,
     minimum_success: u16,
     profile: u8,
     budget: u16,
@@ -1181,6 +1220,10 @@ struct ContinuationProbe {
 
 impl ContinuationProbe {
     fn new(board: Board, debt: CellMask, profile: u8, minimum_success: u16) -> Self {
+        let facts = BoardFacts::new(&board);
+        // Track relief only for initially charged debt. Filling a free working
+        // cavity must not earn a second reward for removing an uncharged hole.
+        let debt = facts.penalized_debt(&debt);
         Self {
             tasks: std::collections::VecDeque::from([ProbeTask::Expand(Rc::new(ProbeState {
                 board, inventory: ALL_PIECES, debt, quiet: 0, quiet_since_spin: 0,
@@ -1191,8 +1234,10 @@ impl ContinuationProbe {
             }))]),
             reserved: std::collections::VecDeque::new(),
             seen: vec![], work: 0, debt_count: mask_count(&debt),
-            base_score: BoardFacts::new(&board).score(), best: Continuation::default(),
-            lines: vec![], minimum_success, profile,
+            base_score: facts.score(), best: Continuation::default(),
+            lines: vec![], recipes: vec![], preparation_score: 0.0,
+            independence_score: 0.0, pair_attempts: 0, pair_queries: 0,
+            pair_finisher_masks: vec![], minimum_success, profile,
             budget: if profile == 3 { 96 } else { 64 },
         }
     }
@@ -1346,6 +1391,7 @@ impl ContinuationProbe {
                     self.accept(&state, placement, board, 0, false, None, false);
                 }
             }
+            ProbeTask::Independence(check) => self.check_independence(*check, cache),
         }
     }
 
@@ -1388,6 +1434,7 @@ impl ContinuationProbe {
         let line = ForecastLine {
             continuation: Continuation {
                 placements: state.placements.clone(), alternatives: vec![], score,
+                preparation_score: 0.0, independence_score: 0.0,
                 paid: first.paid, spins: first.spins, planned_spins: state.spins,
                 anchor: state.anchor.clone(), obstructed_mass: Some(first.obstructed_mass),
             },
@@ -1415,9 +1462,150 @@ impl ContinuationProbe {
             self.lines[index].continuation.anchor != self.lines[0].continuation.anchor
         }) { self.lines.swap(1, other); }
         self.lines.truncate(CONTINUATION_ALTERNATIVES);
-        self.best = self.lines[0].continuation.clone();
+        self.refresh_best();
+    }
+
+    fn refresh_best(&mut self) {
+        self.best = self.lines.first().map(|line| line.continuation.clone()).unwrap_or_default();
         self.best.alternatives = self.lines.iter().skip(1)
             .map(|line| line.continuation.placements.clone()).collect();
+        self.best.preparation_score = self.preparation_score;
+        self.best.independence_score = self.independence_score;
+        self.best.score += self.preparation_score + self.independence_score;
+    }
+
+    fn record_preparation(&mut self, state: &ProbeState) {
+        // No earlier clear may be necessary for this readiness preference.
+        // The full coherent route has a separate throughput value below.
+        if state.bag != 0 || state.spins != 0 { return; }
+        let Some(goal) = &state.pursuit else { return; };
+        if state.inventory & goal.pose.piece.bit() == 0 { return; }
+        let missing = goal.remaining(&state.board);
+        if missing > 4 { return; }
+        // This goal still needs a reachable finishing rotation. Its small
+        // preparation score cannot masquerade as an executed spin witness.
+        let score = CONTINUATION_PREPARED_CAP
+            / ((1 + missing) as f64 * (1 + state.quiet) as f64);
+        if score > self.preparation_score {
+            self.preparation_score = score;
+            self.refresh_best();
+        }
+    }
+
+    fn record_first_spin(&mut self, state: &ProbeState) {
+        if state.bag != 0 || state.spins != 1 || state.quiet > 2 { return; }
+        let readiness = CONTINUATION_READY_CAP / (1 + state.quiet) as f64;
+        if readiness > self.preparation_score {
+            self.preparation_score = readiness;
+            self.refresh_best();
+        }
+        let mut targets = Vec::new();
+        let mut rotations = Vec::new();
+        let mut footprint = [0; HEIGHT];
+        let mut used = 0;
+        for placement in &state.placements {
+            let Some(target) = normalize_target(placement.pose, 0) else { return; };
+            if used & target.piece.bit() != 0 { return; }
+            used |= target.piece.bit();
+            for &(x, y) in &target.cells { footprint[y as usize] |= 1 << x; }
+            targets.push(target);
+            rotations.push(placement.pose.rotation);
+        }
+        let Some(finisher) = targets.last().map(|target| target.piece) else { return; };
+        let recipe = Rc::new(SpinRecipe {
+            targets, rotations, footprint, used, end: state.board,
+            deleted: state.deleted, preparation: state.quiet,
+        });
+        // Four variants of one finisher are not four independent options.
+        // A different footprint may nevertheless free a partner, so replace
+        // the old recipe when it reduces preparation or removes that conflict.
+        let compatibility = |candidate: &SpinRecipe| self.recipes.iter()
+            .filter(|prior| Self::recipes_disjoint(prior, candidate)).count();
+        let new_partners = compatibility(&recipe);
+        if let Some(index) = self.recipes.iter().position(|prior| {
+            prior.targets.last().is_some_and(|target| target.piece == finisher)
+        }) {
+            let prior = &self.recipes[index];
+            if prior.preparation <= recipe.preparation
+                && compatibility(prior) >= new_partners { return; }
+            self.recipes.remove(index);
+        } else if self.recipes.len() >= CONTINUATION_RECIPES {
+            let (index, prior) = self.recipes.iter().enumerate()
+                .min_by_key(|(_, prior)| (compatibility(prior), std::cmp::Reverse(prior.preparation)))
+                .unwrap();
+            if compatibility(prior) >= new_partners
+                && prior.preparation <= recipe.preparation { return; }
+            self.recipes.remove(index);
+        }
+        // Reuse each first-spin witness. Only the other recipe on the changed
+        // board needs a new exact-target query, once per placement and order.
+        let mut partners: Vec<_> = self.recipes.iter()
+            .filter(|prior| Self::recipes_disjoint(prior, &recipe)).cloned().collect();
+        partners.sort_by_key(|prior| prior.preparation);
+        for prior in partners {
+            if self.pair_attempts == CONTINUATION_PAIR_LIMIT { break; }
+            let pair_mask = prior.targets.last().unwrap().piece.bit() | finisher.bit();
+            if self.pair_finisher_masks.contains(&pair_mask) { continue; }
+            self.pair_finisher_masks.push(pair_mask);
+            self.pair_attempts += 1;
+            let check = IndependenceCheck {
+                board: prior.end, deleted: prior.deleted, used: prior.used,
+                first: prior, second: Rc::clone(&recipe), reverse: false,
+                next: 0, first_order_end: None,
+            };
+            self.reserve_independence(check);
+        }
+        self.recipes.push(recipe);
+    }
+
+    fn recipes_disjoint(a: &SpinRecipe, b: &SpinRecipe) -> bool {
+        a.used & b.used == 0 && !(0..HEIGHT).any(|y| a.footprint[y] & b.footprint[y] != 0)
+    }
+
+    fn reserve_independence(&mut self, check: IndependenceCheck) {
+        if self.reserved.len() == CONTINUATION_RESERVED { self.reserved.pop_back(); }
+        self.reserved.push_front(ProbeTask::Independence(Box::new(check)));
+    }
+
+    fn check_independence(&mut self, mut check: IndependenceCheck, cache: &mut PhysicsCache) {
+        let recipe = if check.reverse { &check.first } else { &check.second };
+        let Some(target) = recipe.targets.get(check.next) else { return; };
+        if check.used & target.piece.bit() != 0 { return; }
+        // Retain the original rotation to bound this selective check to one
+        // target query. A failed orientation is Unknown, not impossibility.
+        let Some(pose) = projected_poses(target, check.deleted).into_iter()
+            .find(|pose| pose.rotation == recipe.rotations[check.next]) else { return; };
+        let finisher = check.next + 1 == recipe.targets.len();
+        self.pair_queries += 1;
+        let Some(placement) = cache.target(check.board, pose, finisher) else { return; };
+        let Some(result) = check.board.apply(&placement) else { return; };
+        if (finisher && (result.lines != 1 || !result.spin))
+            || (!finisher && result.lines != 0) { return; }
+        let Some(deleted) = deleted_after(check.deleted, result.cleared_rows) else { return; };
+        check.board = result.board;
+        check.deleted = deleted;
+        check.used |= target.piece.bit();
+        check.next += 1;
+        if check.next < recipe.targets.len() {
+            self.reserve_independence(check);
+        } else if !check.reverse {
+            check.first_order_end = Some(check.board);
+            check.reverse = true;
+            check.board = check.second.end;
+            check.deleted = check.second.deleted;
+            check.used = check.second.used;
+            check.next = 0;
+            self.reserve_independence(check);
+        } else if check.first_order_end == Some(check.board) {
+            // Pairwise order robustness is distinct from readiness, total
+            // future spins, or the success probability of the full fixed bag.
+            let preparation = check.first.preparation + check.second.preparation;
+            let score = CONTINUATION_INDEPENDENCE_CAP / (1 + preparation) as f64;
+            if score > self.independence_score {
+                self.independence_score = score;
+                self.refresh_best();
+            }
+        }
     }
 
     fn accept(
@@ -1455,6 +1643,10 @@ impl ContinuationProbe {
         state.placements.push(placement);
         state.bridge_used = !spin && (state.bridge_used || bridge);
         state.pursuit = pursuit;
+        if source.bag == 0 && source.spins == 0 {
+            if spin { self.record_first_spin(&state); }
+            else { self.record_preparation(&state); }
+        }
         let base = if self.profile == 3 { 96 } else { 64 };
         if state.spins != 0 {
             if state.bag == 0 {
@@ -1979,7 +2171,7 @@ impl GenerationJob {
                 &facts.holes,
             );
             let mut structural = facts.terrain_score(pursuit.as_deref()) * 2.0;
-            structural -= mask_count(&debt) as f64 * 4.0;
+            structural -= mask_count(&facts.penalized_debt(&debt)) as f64 * 4.0;
             if result.lines == 0 {
                 structural += placement_bias(
                     &before_facts,
@@ -1994,10 +2186,12 @@ impl GenerationJob {
                 structural -= pursuit.remaining(&result.board) as f64 * 8.0;
                 structural -= facts.unplanned_holes(&pursuit.required_empty) as f64 * 4.0;
             }
-            let quality = if self.setup {
+            let quality = if self.setup || (self.start_pieces == 0 && spins == 0) {
                 // The first bag must first leave independent landing slots
                 // for all seven pieces. A strong flatness/slot reward here
                 // spends the floor too early and destroys P7 robustness.
+                // Keep that preference for quiet prefixes in mixed root rounds
+                // too; allowing a clear does not make setup order independent.
                 // Continuation refinement compares the completed foundations.
                 setup_score(&self.start, state.targets.iter().chain(std::iter::once(&target)))
                     * if self.relaxed_setup { 0.35 } else { 1.0 }
@@ -2341,7 +2535,7 @@ fn boundary_quality(board: &Board, debt: &CellMask, future: &Continuation) -> f6
 }
 
 fn boundary_quality_from_facts(facts: &BoardFacts, debt: &CellMask, future: &Continuation) -> f64 {
-    let unexplained = mask_count(debt).saturating_sub(future.paid);
+    let unexplained = mask_count(&facts.penalized_debt(debt)).saturating_sub(future.paid);
     facts.terrain_score_witnessed(future.anchor.as_deref()) * 2.0 + future.score
         - unexplained as f64 * 12.0
 }
@@ -3144,10 +3338,11 @@ impl SearchSession {
             .filter(|(_, (p, _))| parent.is_none_or(|parent| parent == *p))
             .max_by(|(_, (_, a)), (_, (_, b))| {
                 let priority = |plan: &Plan| {
-                    // Reuse the bounded probe result; do not flood every
-                    // pending board again whenever the scheduler compares it.
-                    let quality = plan.future.score
-                        - f64::from(mask_count(&plan.debt).saturating_sub(plan.future.paid)) * 12.0;
+                    // The completed boundary score already distinguishes
+                    // central working pockets from charged cavity history.
+                    // Reuse it instead of reinstating raw-hole penalties or
+                    // flooding each waiting board during every comparison.
+                    let quality = plan.quality;
                     efficiency(plan.expected_spins, plan.start_pieces + plan.targets.len() as u16)
                         + 0.2 * quality / (120.0 + quality.abs())
                 };
@@ -3353,8 +3548,10 @@ impl SearchSession {
                     // A geometric continuation is not a P7 extension. Its
                     // speculative credit fades when repeated rounds cannot
                     // improve a certified child. Real progress resets the age.
+                    // paid tracks only the initially charged cavity ledger;
+                    // accessible working pockets cannot earn repayment credit.
                     let speculative = node.future.score.max(0.0)
-                        + f64::from(node.future.paid.min(mask_count(&node.debt))) * 12.0;
+                        + f64::from(node.future.paid) * 12.0;
                     let quality = node.quality - speculative * stale / (stale + 4.0);
                     // Stored cells can pay for later singles. Charging every
                     // prefix lock again here permanently starves deeper setup
@@ -3888,6 +4085,15 @@ impl SearchSession {
         let certificates: Vec<_> = archive
             .map(|a| a.certificates.iter().map(|c| c.as_ref()).collect())
             .unwrap_or_default();
+        let spin_preparation = serde_json::json!({
+                "preparationEvidence": "BestReachableFirstSpinOrSmallConcretePreparation;NoAlternativeSum",
+                "preparationReadyCap": CONTINUATION_READY_CAP,
+                "preparationGoalCap": CONTINUATION_PREPARED_CAP,
+                "independenceEvidence": "BestDisjointRecipePair;BothOrdersSingleOnly;SameEndBoard;NotP7",
+                "independenceCap": CONTINUATION_INDEPENDENCE_CAP,
+                "independencePairLimit": CONTINUATION_PAIR_LIMIT,
+                "independenceTargetQueryCap": CONTINUATION_PAIR_LIMIT * 6,
+        });
         let selective_search = serde_json::json!({
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
                 "paceNearSlack": PACE_NEAR_SLACK, "paceDistanceSlack": PACE_DISTANCE_SLACK,
@@ -3912,6 +4118,7 @@ impl SearchSession {
                 "continuationMeaning": "CoherentGeometricPathsOnly;FirstBagGainAndDebtSeparate;NotP7",
                 "continuationTaskLimit": CONTINUATION_TASKS,
                 "continuationWorkCap": if self.config.search_profile == 3 { 352 } else { 320 },
+                "spinPreparation": spin_preparation,
                 "siblingWindow": "SameParentNextPiece;noLessActualOrOptimisticSpins;supplyMaskSuperset;samePursuit",
                 "equalSpinSiblingQualityMargin": 24,
                 "proposalScope": "FastSurfaceAndWitnessedSingles;periodicBroadSonicLocks;notExhaustive",

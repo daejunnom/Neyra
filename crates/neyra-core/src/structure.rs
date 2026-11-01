@@ -10,11 +10,12 @@ use crate::physics::{Board, Piece, Pose, FULL_ROW, HEIGHT, WIDTH};
 pub(crate) type CellMask = [u16; HEIGHT];
 
 // A smooth skyline is a weak convenience, not evidence of a usable spin
-// sequence. Bound only this preference; holes, access debt, severe bank
-// repair pressure and roof towers retain their own costs outside this cap.
-const SKYLINE_PREFERENCE_LIMIT: f64 = 6.0;
-// Existing cavities still have their base cost. Only a replayed spin goal can
-// explain the additional burden; a proposed pocket alone is not a repair plan.
+// sequence. Accessible side cavities are work space, while inaccessible
+// cavities, severe one-column debt and excess towers keep their own costs.
+const SKYLINE_PREFERENCE_LIMIT: f64 = 2.0;
+const BANK_DENSITY_LIMIT: f64 = 8.0;
+// Only cavities outside the central body's local service area incur this
+// burden. An actual spin witness can additionally explain its own cells.
 const UNEXPLAINED_HOLE_COST: f64 = 0.5;
 // Prepared roofs may justify some local surface damage, but never acquire the
 // value of an executed spin or cancel the board's hole/access obligations.
@@ -73,6 +74,12 @@ pub(crate) struct BoardFacts {
     pub workspace_depth: u8,
     body_air: CellMask,
     service_air: CellMask,
+    central_air: CellMask,
+    charged_hole_count: u16,
+    charged_cover_depth: u16,
+    charged_buried_splits: u16,
+    charged_surface_splits: u16,
+    cavity_roof_tops: [u8; WIDTH],
     obstructed_cells: CellMask,
     workspace_roof_top: u8,
     workspace_row: u8,
@@ -107,6 +114,12 @@ impl BoardFacts {
             workspace_depth: 0,
             body_air: [0; HEIGHT],
             service_air: [0; HEIGHT],
+            central_air: [0; HEIGHT],
+            charged_hole_count: 0,
+            charged_cover_depth: 0,
+            charged_buried_splits: 0,
+            charged_surface_splits: 0,
+            cavity_roof_tops: [0; WIDTH],
             obstructed_cells: [0; HEIGHT],
             workspace_roof_top: 0,
             workspace_row: 0,
@@ -136,29 +149,6 @@ impl BoardFacts {
                 }
             }
         }
-        for (y, &row) in board.rows.iter().enumerate().take(facts.height as usize) {
-            if row == 0 {
-                continue;
-            }
-            let gaps = FULL_ROW & !row;
-            let runs = (gaps & !(gaps << 1)).count_ones() as u16;
-            facts.row_gap_runs += runs;
-            facts.split_gaps += runs.saturating_sub(1);
-            let mut remaining = if runs > 1 && facts.holes[y] != 0 {
-                gaps
-            } else {
-                0
-            };
-            let mut buried_runs = 0_u16;
-            while remaining != 0 {
-                let left = remaining.trailing_zeros();
-                let width = (remaining >> left).trailing_ones();
-                let run = ((1_u16 << width) - 1) << left;
-                remaining &= !run;
-                buried_runs += u16::from(run & facts.holes[y] != 0);
-            }
-            facts.buried_split_gaps += buried_runs.saturating_sub(1);
-        }
         facts.roughness = facts
             .heights
             .windows(2)
@@ -166,6 +156,7 @@ impl BoardFacts {
             .sum();
         facts.find_components(board);
         facts.find_working_air(board);
+        facts.summarize_cavity_costs(board);
         facts
     }
 
@@ -327,7 +318,7 @@ impl BoardFacts {
                     let right_cells = (board.rows[y] & (FULL_ROW << right)).count_ones();
                     let density = (left_cells as f64 / left as f64)
                         .min(right_cells as f64 / (WIDTH - right) as f64);
-                    lower_weight(level) * density * 4.0
+                    lower_weight(level) * density * BANK_DENSITY_LIMIT
                 } else {
                     0.0
                 };
@@ -344,6 +335,142 @@ impl BoardFacts {
                 }
             }
         }
+        self.find_central_air(&free, &slots, &mut queue);
+    }
+
+    /// Reuse the clearance slots and queue for a local component rooted in
+    /// the selected low workspace. Global sky access alone does not make an
+    /// unrelated side shaft part of the central working cavity. The top is
+    /// only four rows above the workspace, so a high mouth cannot wash away
+    /// a blocked bottom. This is still a stencil, not exact mino reachability.
+    fn find_central_air(
+        &mut self,
+        free: &CellMask,
+        slots: &CellMask,
+        queue: &mut [u8; WIDTH * HEIGHT],
+    ) {
+        if self.workspace_columns == 0
+            || self.workspace_row > self.lower_floor.saturating_add(2)
+        {
+            return;
+        }
+        let start = self.workspace_row as usize;
+        let top = (start + 4).min(HEIGHT);
+        let pairs = self.workspace_columns & (self.workspace_columns >> 1);
+        let mut reached = [0_u16; HEIGHT];
+        let (mut read, mut len) = (0, 0);
+        for row in [start.checked_sub(1), Some(start)].into_iter().flatten() {
+            if row + 1 < top {
+                reached[row] = slots[row] & pairs;
+                if reached[row] != 0 {
+                    queue[len] = row as u8;
+                    len += 1;
+                }
+            }
+        }
+        while read < len {
+            let y = queue[read] as usize;
+            read += 1;
+            let mut row = reached[y];
+            loop {
+                let expanded = row | ((row << 1 | row >> 1) & slots[y]);
+                if row == expanded {
+                    break;
+                }
+                row = expanded;
+            }
+            reached[y] = row;
+            for next in [y.checked_sub(1), (y + 2 < top).then_some(y + 1)]
+                .into_iter()
+                .flatten()
+            {
+                let added = row & slots[next] & !reached[next];
+                if added != 0 {
+                    reached[next] |= added;
+                    queue[len] = next as u8;
+                    len += 1;
+                }
+            }
+        }
+        for (y, &row) in reached.iter().enumerate().take(top - 1) {
+            let cells = row | row << 1;
+            self.central_air[y] |= cells;
+            self.central_air[y + 1] |= cells;
+        }
+        for (y, row) in self.central_air.iter_mut().enumerate().take(top) {
+            // One lateral tip can sit under a roof alongside the body. Do
+            // not propagate down one-cell shafts or through a long slit.
+            *row = (*row | *row << 1 | *row >> 1) & free[y] & !self.sealed[y];
+        }
+    }
+
+    /// Raw cell history remains intact. Accessible working cavities have no
+    /// current debt cost, but opening their roof never counts as filling them.
+    pub(crate) fn penalized_debt(&self, cells: &CellMask) -> CellMask {
+        std::array::from_fn(|y| cells[y] & !self.central_air[y] & FULL_ROW)
+    }
+
+    fn summarize_cavity_costs(&mut self, board: &Board) {
+        self.charged_hole_count = self.hole_count;
+        self.charged_cover_depth = self.cover_depth;
+        let mut relieved_columns = 0_u16;
+        for (y, &row) in board.rows.iter().enumerate().take(self.height as usize) {
+            let relieved = self.holes[y] & self.central_air[y];
+            self.charged_hole_count -= relieved.count_ones() as u16;
+            relieved_columns |= relieved;
+            if y + 1 < HEIGHT {
+                let mut roofs = relieved & board.rows[y + 1];
+                while roofs != 0 {
+                    let x = roofs.trailing_zeros() as usize;
+                    roofs &= roofs - 1;
+                    self.cavity_roof_tops[x] = y as u8 + 2;
+                }
+            }
+            if row == 0 {
+                continue;
+            }
+            let gaps = FULL_ROW & !row;
+            let runs = (gaps & !(gaps << 1)).count_ones() as u16;
+            self.row_gap_runs += runs;
+            self.split_gaps += runs.saturating_sub(1);
+            // Outside the local workspace an uncovered row has only the
+            // ordinary surface splits; no gap-by-gap classification is needed.
+            if self.central_air[y] == 0 && self.holes[y] == 0 {
+                self.charged_surface_splits += runs.saturating_sub(1);
+                continue;
+            }
+            let mut remaining = if runs > 1 { gaps } else { 0 };
+            let (mut buried, mut charged, mut charged_buried) = (0_u16, 0_u16, 0_u16);
+            while remaining != 0 {
+                let left = remaining.trailing_zeros();
+                let width = (remaining >> left).trailing_ones();
+                let run = ((1_u16 << width) - 1) << left;
+                remaining &= !run;
+                buried += u16::from(run & self.holes[y] != 0);
+                let unserved = run & !self.central_air[y];
+                charged += u16::from(unserved != 0);
+                charged_buried += u16::from(unserved & self.holes[y] != 0);
+            }
+            self.buried_split_gaps += buried.saturating_sub(1);
+            let buried_splits = charged_buried.saturating_sub(1);
+            self.charged_buried_splits += buried_splits;
+            self.charged_surface_splits += charged.saturating_sub(1) - buried_splits;
+        }
+        // Only columns with an exempt cavity need another cover scan. This
+        // preserves raw cover facts and avoids a second complete board pass.
+        while relieved_columns != 0 {
+            let x = relieved_columns.trailing_zeros() as usize;
+            relieved_columns &= relieved_columns - 1;
+            let bit = 1 << x;
+            let mut above = 0;
+            for y in (0..self.heights[x] as usize).rev() {
+                if board.rows[y] & bit != 0 {
+                    above += 1;
+                } else if self.central_air[y] & bit != 0 {
+                    self.charged_cover_depth -= above;
+                }
+            }
+        }
     }
 
     fn goal_access_cost(&self, goal: &CellMask) -> u16 {
@@ -356,7 +483,7 @@ impl BoardFacts {
         (0..3)
             .map(|level| {
                 let y = self.lower_floor as usize + level;
-                let protected = witnessed_goal
+                let protected = self.central_air.get(y).copied().unwrap_or(0) | witnessed_goal
                     .filter(|_| y < HEIGHT)
                     .map_or(0, |goal| goal.required_empty[y]);
                 let narrow = self.lower_narrow[level] & !protected;
@@ -428,7 +555,7 @@ impl BoardFacts {
             1 => 0.75,
             _ => 0.5,
         };
-        (2.0 + f64::from(contacts.min(2)) * 1.5 + self.bank_reward * 0.375)
+        (2.0 + f64::from(contacts.min(2)) * 1.5 + self.bank_reward * 0.1875)
             .min(PREPARED_ROOF_LIMIT)
             * readiness
             * low
@@ -488,7 +615,7 @@ impl BoardFacts {
 
     pub(crate) fn unplanned_holes(&self, owned: &CellMask) -> u16 {
         (0..HEIGHT)
-            .map(|y| (self.holes[y] & !owned[y]).count_ones() as u16)
+            .map(|y| (self.holes[y] & !self.central_air[y] & !owned[y]).count_ones() as u16)
             .sum()
     }
 
@@ -526,16 +653,16 @@ impl BoardFacts {
             0
         };
         let unexplained_holes = if witnessed {
-            goal.map_or(self.hole_count, |g| self.unplanned_holes(&g.required_empty))
+            goal.map_or(self.charged_hole_count, |g| self.unplanned_holes(&g.required_empty))
         } else {
-            self.hole_count
+            self.charged_hole_count
         };
-        let defects = self.hole_count as f64 * 2.0
+        let defects = self.charged_hole_count as f64 * 2.0
             + unexplained_holes as f64 * UNEXPLAINED_HOLE_COST
             + self.sealed_count as f64 * 0.5
             + self.sealed_components as f64
-            + self.cover_depth as f64 * 0.25
-            + self.buried_split_gaps as f64 * 2.0
+            + self.charged_cover_depth as f64 * 0.25
+            + self.charged_buried_splits as f64 * 2.0
             + (self.height as f64).powi(2) * 0.06
             + self.cells as f64 * 0.04
             + self.access_deficit.saturating_sub(witnessed_access) as f64 * 3.0
@@ -548,12 +675,11 @@ impl BoardFacts {
                 & FULL_ROW,
             self.workspace_roof_top,
         ));
-        let surface_fragmentation =
-            self.split_gaps.saturating_sub(self.buried_split_gaps) as f64 * 0.25;
+        let surface_fragmentation = self.charged_surface_splits as f64 * 0.0625;
         let Some((working, roof_top)) = usable_goal.and_then(working_region).or(dynamic) else {
             let (_, _, repair_pressure) = self.bank_skyline(0, 0);
             return -defects
-                - (self.roughness as f64 * 0.05 + surface_fragmentation)
+                - (self.roughness as f64 * 0.0125 + surface_fragmentation)
                     .min(SKYLINE_PREFERENCE_LIMIT)
                 - repair_pressure;
         };
@@ -578,13 +704,13 @@ impl BoardFacts {
             // The rim can be a tall legitimate bank alongside a low pocket.
             // Only towers over the final mino's own columns are capped here.
             let above = if footprint & (1 << x) != 0 {
-                h.saturating_sub(roof_top) as u16
+                h.saturating_sub(roof_top.max(self.cavity_roof_tops[x])) as u16
             } else {
                 0
             };
             sum + above * above
         });
-        let skyline = (linear as f64 * 0.08 + squared as f64 * 0.012 + surface_fragmentation)
+        let skyline = (linear as f64 * 0.02 + squared as f64 * 0.003 + surface_fragmentation)
             .min(SKYLINE_PREFERENCE_LIMIT);
         -defects - skyline - repair_pressure - rim_pressure as f64 * 0.45 - excess as f64 * 0.10
             + self.workspace_reward
@@ -605,7 +731,16 @@ impl BoardFacts {
         let mut cliffs = 0_u16;
         let mut narrow_wells = 0_u16;
         for x in 0..WIDTH - 1 {
-            let change = self.heights[x].abs_diff(self.heights[x + 1]) as u16;
+            // The roof immediately above a usable side cavity is not bank
+            // damage. Charge only height above that roof; a low cavity must
+            // never protect an unrelated tall spike in the same column.
+            let (higher, lower) = if self.heights[x] >= self.heights[x + 1] {
+                (x, x + 1)
+            } else {
+                (x + 1, x)
+            };
+            let change = self.heights[higher]
+                .saturating_sub(self.heights[lower].max(self.cavity_roof_tops[higher])) as u16;
             if working & (3 << x) == 0 {
                 linear += change;
                 squared += change * change;
@@ -652,7 +787,9 @@ impl BoardFacts {
             let (Some(rim), Some(bank)) = pair else {
                 return pressure;
             };
-            let rise = self.heights[rim].saturating_sub(roof_top.max(self.heights[bank]));
+            let rise = self.heights[rim].saturating_sub(
+                roof_top.max(self.heights[bank]).max(self.cavity_roof_tops[rim]),
+            );
             pressure + repair_severity(rise.saturating_sub(3) as u16)
         })
     }

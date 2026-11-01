@@ -121,14 +121,22 @@
   to one narrow generation. Failed retries alone must not widen its frontier;
   productive or improved boundaries retain larger budgets. Fresh root
   foundations keep their separate exploration allowance.
-- Increase unexplained-hole cost only as a static ordering preference. Only an
-  actual spin witness may exempt its required-empty cells from the extra 0.5
-  cost; a speculative goal cannot claim that exemption. Preserve open channels
-  and the witnessed roof, and never turn this score into a hard impossibility.
+- Charge cavity defects and historical debt only outside the local body-clear
+  component connected to the low dynamic central workspace. Keep raw hole and
+  debt facts for row mapping; merely opening a cavity does not repay its cells.
+  Apply the same charged subset to holes, cover, fragmentation, prefix and
+  boundary debt so usable side pockets do not receive hidden duplicate costs.
+  Forecast repayment credit starts from initially charged debt only. Static
+  connectivity is an ordering feature, not a reachability certificate; an
+  actual spin witness may additionally explain its own required-empty cells.
 - Prefer dense side banks beside accessible low working space, without fixing
   the center column or rewarding absolute stack height. A capped prepared-roof
   preference must refer to an existing roof over a concrete single goal; it is
-  not a spin witness and cannot cancel hole, access or debt obligations.
+  not a spin witness and cannot excuse inaccessible cavities. Reduce ordinary
+  smoothness preference while preserving deep one-column repair dependencies
+  and excess towers above a useful roof.
+  Root prefixes with no actual spin keep foundation-dependency weighting in
+  mixed rounds too; this changes ordering, not their permission to clear.
 - Continuation forecasts may span two bag inventories and seek six coherent
   Spin Singles. Consume all seven labels before resetting inventory and its
   bag-local start board, deleted rows and supply mask. Keep at most three
@@ -138,6 +146,12 @@
   These are bounded geometric move-ordering hints, not P7 certificates or a
   mandatory prefix. Actual progress and public best routes count executed,
   verified bags only. Failure to find a forecast is unknown, not impossibility.
+- Keep pending-spin readiness and order independence as separate capped field
+  features. Use one best concrete preparation/first-spin witness and one best
+  disjoint recipe pair checked in both orders with actual single clears and a
+  common end board. Do not sum alternate slots, count a repeated finisher twice,
+  or turn pairwise geometric order tolerance into a P7 probability. Extra target
+  checks share the existing continuation work cap; retain diverse finishers.
 - Keep one bag's remaining inventories distinct inside the proposal frontier.
   Public nonterminal paths and certified bestPartial are whole-bag boundaries;
   a real terminal prefix may consume only part of its last bag.

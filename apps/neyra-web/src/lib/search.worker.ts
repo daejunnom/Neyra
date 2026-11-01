@@ -62,6 +62,11 @@ async function wasm(assetBase: string, build: string): Promise<WasmModule> {
   return modulePromise;
 }
 
+function recordCounters(value: SearchSnapshot) {
+  return { expanded: value.expanded, candidates: value.candidates,
+    verifiedCandidates: value.verifiedCandidates, pruned: value.pruned };
+}
+
 function readSnapshot(full = false): SearchSnapshot | null {
   if (!engine) return null;
   const compact = JSON.parse(engine.snapshot_compact()) as SearchSnapshot;
@@ -87,7 +92,7 @@ function readSnapshot(full = false): SearchSnapshot | null {
       // This is a selected certificate archive. Its aggregate search snapshot
       // is unrelated to that selection and would repeat other routes' replays.
       delete data.snapshot;
-      send({ type: 'bag-record', runId, candidate: record, data });
+      send({ type: 'bag-record', runId, candidate: record, data, counters: recordCounters(compact) });
     }
   }
   bagRecordVersions = retained;
@@ -122,7 +127,7 @@ function retainIncumbent(value: SearchSnapshot) {
     incumbentId = value.best.id;
     // The archive includes full frames even if this worker only sends compact
     // routine updates. Retain complete results across a worker failure.
-    send({ type: 'incumbent', runId, candidate: data.candidate, data });
+    send({ type: 'incumbent', runId, candidate: data.candidate, data, counters: recordCounters(value) });
   }
 }
 

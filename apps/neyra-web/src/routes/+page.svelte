@@ -4,7 +4,8 @@
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
   import { SearchClient, spinsPerBag, probabilityAdjustedSpinsPerBag, workerLimit, randomSeed, MAX_WORKERS } from '$lib/engine';
-  import { ContributionClient, type ContributionState } from '$lib/contributions';
+  import { ContributionClient, CONTRIBUTION_CONSENT_KEY, hasContributionConsent,
+    contributionConsentValue, type ContributionState } from '$lib/contributions';
   import { contributionConfig } from '$lib/contribution-config';
   import { encodeBuildDocument } from '$lib/exportFormats';
   import { createPiecePlayback } from '$lib/buildDocument';
@@ -31,7 +32,7 @@
   let notice = '';
   let availableWorkers = 1;
   let contributions: ContributionClient;
-  let contributionState: ContributionState = { enabled: true, phase: 'ready', queued: 0, acknowledged: 0, dropped: 0 };
+  let contributionState: ContributionState = { enabled: false, phase: 'disabled', queued: 0, acknowledged: 0, dropped: 0 };
   $: contributionLabel = !contributionState.enabled ? '자료 제공 꺼짐' :
     contributionState.phase === 'unavailable' ? '자료 전송 연결을 확인하고 있어요.' :
     contributionState.phase === 'sending' ? '확정 필드를 보내고 있어요.' :
@@ -187,10 +188,16 @@
         if (validateConfig(merged) === '') config = merged;
       }
     } catch { /* A fresh configuration remains usable when storage is unavailable. */ }
-    try { contributions.setEnabled(localStorage.getItem('neyra-data-sharing-v1') !== 'off'); }
-    catch { /* Contribution defaults on when preference storage is unavailable. */ }
+    try { applyDataSharing(hasContributionConsent(localStorage.getItem(CONTRIBUTION_CONSENT_KEY))); }
+    catch { /* Explicit permission is required; unavailable storage leaves collection off. */ }
     const online = () => contributions.retry();
+    const consentChanged = (event: StorageEvent) => {
+      if (event.key === CONTRIBUTION_CONSENT_KEY || event.key === null) {
+        applyDataSharing(hasContributionConsent(event.newValue));
+      }
+    };
     window.addEventListener('online', online);
+    window.addEventListener('storage', consentChanged);
     previousTick = performance.now();
     const clock = window.setInterval(() => {
       const now = performance.now();
@@ -206,6 +213,7 @@
       rejectDocument('화면을 닫아 문서 준비를 멈췄어요.');
       window.clearInterval(clock);
       window.removeEventListener('online', online);
+      window.removeEventListener('storage', consentChanged);
       client.dispose();
       contributions.dispose();
     };
@@ -289,10 +297,13 @@
     draft.seed = randomSeed();
   }
   function setDataSharing(enabled: boolean) {
-    contributions?.setEnabled(enabled);
-    try { localStorage.setItem('neyra-data-sharing-v1', enabled ? 'on' : 'off'); }
+    applyDataSharing(enabled);
+    try { localStorage.setItem(CONTRIBUTION_CONSENT_KEY, contributionConsentValue(enabled)); }
     catch { /* The current tab still applies the choice. */ }
-    if (enabled) for (const field of client?.trainingFields() ?? []) contributions.enqueue(field);
+  }
+  function applyDataSharing(enabled: boolean) {
+    client?.setContributionEnabled(enabled);
+    contributions?.setEnabled(enabled);
   }
   function rejectDocument(message: string) {
     if (!pendingDocument) return;
@@ -490,7 +501,7 @@
         <p class="verified-progress">검증 통과 최대 {snapshot?.qualifiedSpins ?? 0}스핀<span>{snapshot?.workers ?? 0}개 동시 탐색</span></p>
         <section class="contribution-status" aria-label="CNN 학습 자료 제공">
           <div><label><input type="checkbox" checked={contributionState.enabled} onchange={(event) => setDataSharing(event.currentTarget.checked)} />학습 자료 제공</label><span>학습 OFF</span></div>
-          <p>탐색은 기존 알고리즘으로 진행해요. 확정 필드·시드·탐색 설정을 CNN 학습 자료로 보냅니다.</p>
+          <p>기본은 꺼짐입니다. 직접 켜면 이후의 실제 탐색 과정과 확정 필드·시드·탐색 설정을 CNN 학습 자료로 보내요. 탐색은 기존 알고리즘으로 진행합니다.</p>
           <div class="contribution-progress" role="status"><span>{contributionLabel}{#if contributionState.queued > 0} · 대기 {contributionState.queued}개{/if}</span>{#if contributionState.phase === 'paused'}<button class="text-button" onclick={() => contributions.retry()}>다시 전송</button>{/if}</div>
           {#if contributionState.dropped > 0}<small>전송하지 못한 필드 {contributionState.dropped}개 · 보관된 경로는 아래에서 파일로 저장할 수 있어요.</small>{/if}
         </section>
@@ -616,7 +627,7 @@
   <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 2가방부터는 확률 완화 최소 스핀에 못 미치는 가방에 100%를 요구합니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
   <p>첫 가방은 스핀 수보다 작업 공간과 후속 스핀을 위한 기반의 품질로 비교합니다. 2가방 이상 검증한 경로가 있으면 그 경로들을 우선하며, 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
   <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
-  <p>이 화면은 기존 알고리즘으로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 켜져 있고, 확정 필드와 시드·탐색 설정을 보내 개발자 전용 학습 화면의 후속 스핀 평가에 사용합니다. 이 설정은 언제든 끌 수 있습니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
+  <p>이 화면은 기존 알고리즘으로 탐색하며 CNN 학습은 실행하지 않습니다. <strong>학습 자료 제공</strong>은 기본으로 꺼져 있습니다. 직접 켜면 이후의 실제 탐색 과정과 확정 필드·시드·탐색 설정을 개발자 전용 CNN 학습 화면에 보냅니다. 이전 버전의 켜짐 설정은 동의로 사용하지 않습니다. 끄면 새 자료 수집과 전송을 멈추고 대기 자료를 지웁니다. <strong>학습 필드 저장</strong>으로 보관된 실제 가방 경계를 파일로 받을 수도 있습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

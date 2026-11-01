@@ -1,5 +1,6 @@
 //! Native JSONL data collection. No GPU, network or browser runtime required.
 use neyra_core::search::labels::{collect_board_label, BoardSample, LabelConfig};
+use neyra_core::exploration::{collect_exploration_label, ExplorationConfig};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
@@ -7,10 +8,11 @@ fn run() -> Result<(), String> {
     let mut input = None;
     let mut output = None;
     let mut config = LabelConfig::default();
+    let mut exploration: Option<ExplorationConfig> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            println!("neyra-label [--input boards.jsonl] [--output labels.jsonl] [--config config.json]\nOmitted input/output use stdin/stdout. Requires nonempty post-clear fields after at least two completed bags.\nConfig: horizonBags (2 or 3), workBudget, beamWidth, profile, seed, maxNodes, attemptsPerNode, sourceRevision.\nV2 spin-only labels contain no Terrain teacher or opener prior. They are censored budgeted observations, not impossibility or completion certificates.");
+            println!("neyra-label [--input boards.jsonl] [--output labels.jsonl] [--config config.json] [--exploration exploration.json]\nOmitted input/output use stdin/stdout. Requires nonempty post-clear fields after at least two completed bags.\nConfig: horizonBags (2 or 3), workBudget, beamWidth, profile, seed, maxNodes, attemptsPerNode, sourceRevision.\nOptional private exploration: {{\"schemaVersion\":1,\"seed\":UINT32,\"ordinal\":UINT32}}. The explicit executed seed varies existing proposal ordering only; output has a separate exploration policy and cannot replace fixed-policy labels. The same exploration settings apply to each supplied board.\nV2 spin-only labels contain no Terrain teacher or opener prior. They are censored budgeted observations, not impossibility or completion certificates.");
             return Ok(());
         }
         let value = args.next().ok_or_else(|| format!("Missing value for {arg}"))?;
@@ -19,6 +21,8 @@ fn run() -> Result<(), String> {
             "--output" => output = Some(value),
             "--config" => config = serde_json::from_reader(File::open(&value).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("Invalid config: {e}"))?,
+            "--exploration" => exploration = Some(serde_json::from_reader(File::open(&value).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("Invalid exploration metadata: {e}"))?),
             _ => return Err(format!("Unknown option: {arg}")),
         }
     }
@@ -37,9 +41,15 @@ fn run() -> Result<(), String> {
         if value.trim().is_empty() { continue; }
         let sample: BoardSample = serde_json::from_str(&value)
             .map_err(|e| format!("Line {}: invalid board sample: {e}", line + 1))?;
-        let label = collect_board_label(sample, config.clone())
-            .map_err(|e| format!("Line {}: {e}", line + 1))?;
-        serde_json::to_writer(&mut writer, &label).map_err(|e| e.to_string())?;
+        if let Some(exploration) = &exploration {
+            let label = collect_exploration_label(sample, config.clone(), exploration.clone())
+                .map_err(|e| format!("Line {}: {e}", line + 1))?;
+            serde_json::to_writer(&mut writer, &label).map_err(|e| e.to_string())?;
+        } else {
+            let label = collect_board_label(sample, config.clone())
+                .map_err(|e| format!("Line {}: {e}", line + 1))?;
+            serde_json::to_writer(&mut writer, &label).map_err(|e| e.to_string())?;
+        }
         writer.write_all(b"\n").map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())?;
     }

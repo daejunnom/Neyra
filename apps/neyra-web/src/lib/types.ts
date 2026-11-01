@@ -69,7 +69,43 @@ export interface TrainingField {
       beamWidth: number;
     };
   };
+  /** Opt-in observation only; never an input feature or an authoritative training label. */
+  trace?: RetainedSearchTrace;
 }
+
+export interface SearchRecordCounters {
+  expanded: number;
+  candidates: number;
+  verifiedCandidates: number;
+  pruned: number;
+}
+
+export interface RetainedSearchTrace {
+  schemaVersion: 1;
+  kind: 'retained-path';
+  prefixOmittedBags: number;
+  start: { rows: number[]; spins: number; placed: number };
+  steps: Pick<BoardFrame, 'piece' | 'rows' | 'spins' | 'placed' | 'lines' | 'spin'>[];
+  evaluation: {
+    kind: 'heuristic';
+    rawQuality: number | null;
+    rankingScore: number | null;
+    forecastSpins: number | null;
+    forecastSpinsByBag: number[];
+    forecastPlacements: number | null;
+  };
+  search: {
+    scope: 'worker-total-at-record';
+    budgetStart: number;
+    expanded: number | null;
+    candidates: number | null;
+    verifiedCandidates: number | null;
+    pruned: number | null;
+  };
+  outcome: { spins: number; placed: number; bagCount: number; countedProbability: number };
+}
+
+export type TrainingContribution = TrainingField & { trace: RetainedSearchTrace };
 
 export interface Candidate {
   id: string;
@@ -150,8 +186,8 @@ export type EngineEvent =
   | { type: 'status'; runId: string; status: RunStatus; message?: string }
   | { type: 'error'; runId: string; message: string }
   | { type: 'warning'; runId: string; message: string }
-  | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown }
-  | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown }
+  | { type: 'incumbent'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
+  | { type: 'bag-record'; runId: string; candidate: Candidate; data: unknown; counters?: SearchRecordCounters }
   | { type: 'detail'; runId: string; requestId: string; snapshot: SearchSnapshot }
   | { type: 'export'; runId: string; requestId: string; data: unknown; snapshot?: SearchSnapshot }
   | { type: 'export-error'; runId: string; requestId: string; message: string };

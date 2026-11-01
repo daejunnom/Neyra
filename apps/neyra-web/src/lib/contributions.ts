@@ -1,4 +1,4 @@
-import type { TrainingField } from './types';
+import type { TrainingContribution } from './types';
 
 export type ContributionPhase = 'ready' | 'sending' | 'retrying' | 'paused' | 'disabled' | 'unavailable';
 export interface ContributionState {
@@ -9,11 +9,27 @@ export interface ContributionState {
   dropped: number;
 }
 
-type Pending = { field: TrainingField; key: string; order: number };
+type Pending = { field: TrainingContribution; key: string; order: number };
 type PublicIngestion = { url: string; anonKey: string };
+export const CONTRIBUTION_CONSENT_KEY = 'neyra-contribution-consent-v2';
+
+/** Earlier default-on preferences are not explicit consent to this collection. */
+export function hasContributionConsent(stored: string | null): boolean {
+  try {
+    const value = stored === null ? null : JSON.parse(stored);
+    return value?.version === 2 && value?.scope === 'verified-search-process' && value?.decision === 'allow';
+  } catch { return false; }
+}
+
+export function contributionConsentValue(enabled: boolean): string {
+  return JSON.stringify({ version: 2, scope: 'verified-search-process', decision: enabled ? 'allow' : 'deny' });
+}
+
 const MAX_QUEUE = 128;
 const MAX_BATCH = 8;
-const MAX_BODY_BYTES = 32 * 1024;
+// Leave room for Postgres JSONB whitespace and the service RPC wrapper.
+const MAX_BODY_BYTES = 24 * 1024;
+const MAX_FIELD_BYTES = 6144;
 const MAX_SEEN = 4096;
 const MAX_ATTEMPTS = 6;
 const FLUSH_DELAY = 3000;
@@ -37,7 +53,7 @@ export class ContributionClient {
   private dropped = 0;
   private order = 0;
   private attempts = 0;
-  private enabled = true;
+  private enabled = false;
   private disposed = false;
   private generation = 0;
   private inFlight: AbortController | null = null;
@@ -73,13 +89,19 @@ export class ContributionClient {
     this.publish();
   }
 
-  enqueue(field: TrainingField) {
+  enqueue(field: TrainingContribution) {
     if (this.disposed || !this.enabled || !this.configured) return;
-    // These are inputs only. Remote training must derive new labels rather
-    // than trust any browser's certificate or previous board evaluation.
-    const key = `${field.source.runId}:${field.source.bagBoundary}:${field.rows.join(',')}`;
+    // Traces are untrusted observations, separate from labels and inference inputs.
+    // Distinct retained paths can share a board without sharing a search history.
+    const key = `${field.id}:${field.source.bagBoundary}:${field.rows.join(',')}`;
     if (this.seen.has(key)) return;
-    const copy = JSON.parse(JSON.stringify(field)) as TrainingField;
+    const serialized = JSON.stringify(field);
+    if (!field.trace || new TextEncoder().encode(serialized).byteLength > MAX_FIELD_BYTES) {
+      this.dropped++;
+      this.publish();
+      return;
+    }
+    const copy = JSON.parse(serialized) as TrainingContribution;
     const entry = { field: copy, key, order: this.order++ };
     this.seen.set(key, true);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.keys().next().value!);
@@ -128,7 +150,9 @@ export class ContributionClient {
     const encoder = new TextEncoder();
     let body = '';
     for (const entry of this.queue.slice(0, MAX_BATCH)) {
-      const trial = JSON.stringify({ schemaVersion: 2, fields: [...entries, entry].map((item) => item.field) });
+      const trial = JSON.stringify({ schemaVersion: 3,
+        consent: { version: 2, scope: 'verified-search-process', decision: 'allow' },
+        fields: [...entries, entry].map((item) => item.field) });
       if (encoder.encode(trial).byteLength > MAX_BODY_BYTES) break;
       entries.push(entry);
       body = trial;

@@ -1,5 +1,6 @@
 pub mod physics;
 pub mod evaluator;
+pub mod exploration;
 pub mod search;
 mod srs_plus;
 mod structure;
@@ -49,6 +50,28 @@ pub fn label_board(sample_json: &str, config_json: &str) -> Result<String, JsVal
     let config: search::labels::LabelConfig = serde_json::from_str(config_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid learning budget: {e}")))?;
     let label = search::labels::collect_board_label(sample, config)
+        .map_err(|e| JsValue::from_str(&e))?;
+    serde_json::to_string(&label).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Privately vary existing proposal ordering with an explicit reproducible seed.
+/// The returned policy is separate from fixed-policy training observations.
+#[wasm_bindgen]
+pub fn label_board_exploration(
+    sample_json: &str,
+    config_json: &str,
+    exploration_json: &str,
+) -> Result<String, JsValue> {
+    if sample_json.len() > 65_536 || config_json.len() > 4096 || exploration_json.len() > 1024 {
+        return Err(JsValue::from_str("Learning input is too large"));
+    }
+    let sample: search::labels::BoardSample = serde_json::from_str(sample_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid learning board: {e}")))?;
+    let config: search::labels::LabelConfig = serde_json::from_str(config_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid learning budget: {e}")))?;
+    let exploration: exploration::ExplorationConfig = serde_json::from_str(exploration_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid exploration metadata: {e}")))?;
+    let label = exploration::collect_exploration_label(sample, config, exploration)
         .map_err(|e| JsValue::from_str(&e))?;
     serde_json::to_string(&label).map_err(|e| JsValue::from_str(&e.to_string()))
 }

@@ -38,7 +38,8 @@
   adopting it; worker-local caches do not imply a global shared search DAG.
 - Public Pages always uses the existing structural search evaluator. Accept the
   old cnn_evaluation setting for compatibility but ignore it in ranking. Public
-  learning-data sharing defaults on with opt-out; learning stays off. Generate a
+  learning-data sharing defaults off and requires explicit versioned consent;
+  legacy default-on settings are not consent. Learning stays off. Generate a
   fresh nonzero random seed on page entry, then honor the user's manual seed.
   Preserve physics, probability, necessary bounds and supply certificates.
 - The CPU CNN v2 learns current occupancy only and predicts bounded-search spin
@@ -65,6 +66,30 @@
   acknowledge only stored or explicitly excluded inputs, and preserve source
   groups across descendants. Never expose privileged keys in browser bundles,
   logs or commits, or allow anonymous access to private labels or model writes.
+- Capture public search traces only after explicit consent, using existing
+  retained frames and worker totals. No retrospective upload or extra search
+  sampling is permitted. Keep heuristic scores and bounded path observations
+  in separate untrusted trace records, never in the CNN's supervised targets.
+  Reject old default-on ingress envelopes. Deduplicate trace identity separately
+  from training occupancy so different runs of a known board retain evidence.
+- Preserve the released v2 checkpoint and fixed-policy collector. Private seeded
+  exploration changes proposal ordering only, within the same declared budget;
+  store its seed, ordinal and distinct policy. Its certified child boards may
+  enter fixed-policy collection, but stochastic labels must not silently mix
+  with the fixed-policy training set. Pin the served champion independently of
+  newer private candidates; training never promotes a checkpoint automatically.
+- Limit private CNN decision capture to the supplied board and one selected
+  successor. Keep predicted values, allocated work, consumed work and measured
+  outcomes distinct. Ancestor feedback needs an exact physical certified bridge
+  and witness references; it is a censored path lower bound, not a replacement
+  for the original two-bag label. Do not fabricate remaining-to-40 or completion
+  cost labels from unfinished searches. Adaptive budgets and new cost heads need
+  separate policy evidence before activation. Keep the current mino controls.
+- Export complete immutable private snapshots separately from bounded training
+  samples, with cursor/count/hash checks and atomic local latest-pointer updates.
+  Preserve earlier snapshots. Fine-tuning requires the retained parent model and
+  parent dataset provenance, stable family/reflection splits, and validation-only
+  checkpoint selection with the unchanged parent as an eligible candidate.
 - The overall construction-success threshold defaults to 100%; preserve
   explicit saved user settings. The independent per-bag floor defaults to 100%
   and applies from bag two; the first-bag floor is separate, as below.

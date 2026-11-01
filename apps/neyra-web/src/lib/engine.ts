@@ -1,4 +1,5 @@
-import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RunStatus, SearchConfig, SearchSnapshot, TrainingField } from './types';
+import type { BagCandidates, Candidate, CandidateView, EngineCommand, EngineEvent, RetainedSearchTrace, RunStatus,
+  SearchConfig, SearchRecordCounters, SearchSnapshot, TrainingContribution, TrainingField } from './types';
 import { base } from '$app/paths';
 import { version } from '$app/environment';
 
@@ -140,9 +141,15 @@ export class SearchClient {
   private selectedArchive: ArchivedCandidate | null = null;
   private bestSpinsByBag = Array<number>(101).fill(0);
   private shareSpinBenchmarks = true;
+  private contributionEnabled = false;
 
   constructor(private receive: (event: EngineEvent) => void,
-    private contribute: (field: TrainingField) => void = () => {}) {}
+    private contribute: (field: TrainingContribution) => void = () => {}) {}
+
+  /** Collection starts with future record events; existing UI archives are not backfilled. */
+  setContributionEnabled(enabled: boolean) {
+    this.contributionEnabled = enabled;
+  }
 
   start(config: SearchConfig) {
     this.dispose();
@@ -330,11 +337,59 @@ export class SearchClient {
     } };
   }
 
-  private contributeRecord(record: OwnedCandidate) {
+  private retainedTrace(record: OwnedCandidate, counters?: SearchRecordCounters): RetainedSearchTrace | null {
+    const candidate = record.candidate;
+    const frames = candidate.frames;
+    const integer = (value: unknown, max: number): value is number =>
+      typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= max;
+    const rows = (value: number[]) => value.length === 24 && value.every((row) => integer(row, 1022));
+    // Public search begins at the empty root. A full frame history must prove
+    // that origin before an empty start can be used for the first two bags.
+    if (!this.runConfig || frames.length !== candidate.placed || frames[0]?.placed !== 1 ||
+        candidate.placed % 7 !== 0 || !integer(candidate.placed, 700) ||
+        !integer(candidate.spins, 40) || !integer(candidate.bagCount, 100) || candidate.bagCount < 1) return null;
+    const offset = Math.max(0, frames.length - 14);
+    const preceding = offset > 0 ? frames[offset - 1] : null;
+    const start = preceding ? { rows: [...preceding.rows], spins: preceding.spins, placed: preceding.placed }
+      : { rows: Array<number>(24).fill(0), spins: 0, placed: 0 };
+    if (!rows(start.rows) || start.placed !== offset || !integer(start.spins, 40)) return null;
+    let previousSpins = start.spins;
+    const steps: RetainedSearchTrace['steps'] = [];
+    for (const frame of frames.slice(offset)) {
+      if (!/^[IJLOSTZ]$/.test(frame.piece) || !rows(frame.rows) || !integer(frame.spins, 40) ||
+          frame.placed !== start.placed + steps.length + 1 || !integer(frame.lines, 1) ||
+          typeof frame.spin !== 'boolean' || (frame.lines === 1 && (!frame.spin || frame.piece === 'O')) ||
+          frame.spins !== previousSpins + (frame.spin ? frame.lines : 0)) return null;
+      steps.push({ piece: frame.piece, rows: [...frame.rows], spins: frame.spins,
+        placed: frame.placed, lines: frame.lines, spin: frame.spin });
+      previousSpins = frame.spins;
+    }
+    const last = steps.at(-1);
+    if (!last || last.spins !== candidate.spins || last.placed !== candidate.placed ||
+        last.rows.some((row, y) => row !== candidate.rows[y])) return null;
+    const finite = (value: number | undefined) => typeof value === 'number' && Number.isFinite(value) ? value : null;
+    const count = (value: number | undefined) => integer(value, Number.MAX_SAFE_INTEGER) ? value : null;
+    const forecastByBag = candidate.forecastSpinsByBag ?? [];
+    return { schemaVersion: 1, kind: 'retained-path', prefixOmittedBags: offset / 7, start, steps,
+      evaluation: { kind: 'heuristic', rawQuality: finite(candidate.fieldQuality), rankingScore: finite(candidate.rankingScore),
+        forecastSpins: integer(candidate.forecastSpins, 6) ? candidate.forecastSpins : null,
+        forecastSpinsByBag: forecastByBag.length <= 2 && forecastByBag.every((value) => integer(value, 6)) ? [...forecastByBag] : [],
+        forecastPlacements: integer(candidate.forecastPlacements, 14) ? candidate.forecastPlacements : null },
+      search: { scope: 'worker-total-at-record', budgetStart: this.runConfig.budget_start,
+        expanded: count(counters?.expanded), candidates: count(counters?.candidates),
+        verifiedCandidates: count(counters?.verifiedCandidates), pruned: count(counters?.pruned) },
+      outcome: { spins: candidate.spins, placed: candidate.placed, bagCount: candidate.bagCount,
+        countedProbability: candidate.probability } };
+  }
+
+  private contributeRecord(record: OwnedCandidate, counters?: SearchRecordCounters) {
+    if (!this.contributionEnabled) return;
     const field = this.trainingField(record);
     if (!field) return;
+    const trace = this.retainedTrace(record, counters);
+    if (!trace) return;
     // Data transport is optional and must never interrupt search or alter a record.
-    try { this.contribute(field); } catch { /* The transport reports its own state. */ }
+    try { this.contribute({ ...field, trace }); } catch { /* The transport reports its own state. */ }
   }
 
   dispose() {
@@ -374,11 +429,11 @@ export class SearchClient {
       if (complete(message.candidate) &&
           (!slot.incumbent || betterComplete(message.candidate, slot.incumbent.candidate))) {
         slot.incumbent = { candidate: message.candidate, data: message.data };
-        this.contributeRecord({ slot, candidate: message.candidate });
+        this.contributeRecord({ slot, candidate: message.candidate }, message.counters);
       }
       this.publishProgress();
     } else if (message.type === 'bag-record') {
-      this.retainBagRecord(slot, message.candidate, message.data);
+      this.retainBagRecord(slot, message.candidate, message.data, message.counters);
       this.publishProgress();
     } else if (message.type === 'error') {
       this.failed(slot, message.message);
@@ -485,7 +540,7 @@ export class SearchClient {
     return this.bagRecords.get(item.candidate.bagCount)?.find(matches) ?? null;
   }
 
-  private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown) {
+  private retainBagRecord(slot: WorkerSlot, candidate: Candidate, data: unknown, counters?: SearchRecordCounters) {
     const exported = (data as { candidate?: Candidate } | null)?.candidate;
     if (!candidate.verified || !candidate.qualified || candidate.complete ||
         !Number.isInteger(candidate.bagCount) || candidate.bagCount < 1 || candidate.bagCount > 100 ||
@@ -507,7 +562,7 @@ export class SearchClient {
     // Full certificate ownership remains separate even when two workers find
     // similar boards. Keep just the two displayed records, plus one user pin.
     this.bagRecords.set(candidate.bagCount, records.slice(0, 2));
-    if (records.slice(0, 2).includes(record)) this.contributeRecord(record);
+    if (records.slice(0, 2).includes(record)) this.contributeRecord(record, counters);
   }
 
   private publishedBagRecords(): BagCandidates[] {

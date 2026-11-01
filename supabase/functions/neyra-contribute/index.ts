@@ -1,4 +1,4 @@
-/** Bounded public board-input ingress. Training data is remeasured privately. */
+/** Explicit-consent board and search-trace ingress. Labels are remeasured privately. */
 const ALLOWED_ORIGIN = 'https://daejunnom.github.io';
 const RULES = 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
 const MAX_BODY = 32 * 1024;
@@ -30,9 +30,70 @@ function bool(value: unknown): boolean {
 function onlyKeys(value: ObjectValue, allowed: string[]) {
   if (Object.keys(value).some(key => !allowed.includes(key))) throw new Rejection(400, 'Unexpected input field');
 }
+function board(value: unknown): number[] {
+  if (!Array.isArray(value) || value.length !== 24) throw new Rejection(400, 'Invalid trace board');
+  return value.map(row => number(row, 0, 1022, true));
+}
+function nullableNumber(value: unknown, min: number, max: number, integer = false): number | null {
+  return value === null ? null : number(value, min, max, integer);
+}
+function mass(rows: number[]): number {
+  return rows.reduce((total, row) => { while (row) { total++; row &= row - 1; } return total; }, 0);
+}
+function equalRows(a: number[], b: number[]): boolean { return a.every((row, i) => row === b[i]); }
+function cleanTrace(value: unknown, endRows: number[], bagDepth: number, probability: number) {
+  const t = object(value);
+  onlyKeys(t, ['schemaVersion', 'kind', 'prefixOmittedBags', 'start', 'steps', 'evaluation', 'search', 'outcome']);
+  if (t.schemaVersion !== 1 || t.kind !== 'retained-path') throw new Rejection(400, 'Invalid trace version');
+  const omitted = number(t.prefixOmittedBags, 0, 99, true);
+  const start = object(t.start); onlyKeys(start, ['rows', 'spins', 'placed']);
+  const first = {rows: board(start.rows), spins: number(start.spins, 0, 40, true), placed: number(start.placed, 0, 700, true)};
+  if (first.placed !== omitted * 7 || first.spins > first.placed ||
+      (omitted === 0 && (first.spins !== 0 || first.rows.some(Boolean)))) throw new Rejection(400, 'Invalid trace origin');
+  if (!Array.isArray(t.steps) || ![7, 14].includes(t.steps.length)) throw new Rejection(400, 'Invalid trace window');
+  let previous = first;
+  const steps = t.steps.map(raw => {
+    const step = object(raw); onlyKeys(step, ['piece', 'rows', 'spins', 'placed', 'lines', 'spin']);
+    const piece = text(step.piece, 1); if (!'IOTSZJL'.includes(piece)) throw new Rejection(400, 'Invalid trace piece');
+    const current = {piece, rows: board(step.rows), spins: number(step.spins, 0, 40, true),
+      placed: number(step.placed, 1, 700, true), lines: number(step.lines, 0, 1, true), spin: bool(step.spin)};
+    if (current.placed !== previous.placed + 1 || current.spins !== previous.spins + current.lines ||
+        (current.lines === 1 && (!current.spin || piece === 'O')) ||
+        mass(current.rows) !== mass(previous.rows) + 4 - 10 * current.lines) throw new Rejection(400, 'Inconsistent trace transition');
+    previous = current; return current;
+  });
+  if (previous.placed !== bagDepth * 7 || !equalRows(previous.rows, endRows) ||
+      omitted !== Math.max(0, bagDepth - 2)) throw new Rejection(400, 'Trace endpoint mismatch');
+  const o = object(t.outcome); onlyKeys(o, ['spins', 'placed', 'bagCount', 'countedProbability']);
+  if (o.spins !== previous.spins || o.placed !== previous.placed || o.bagCount !== bagDepth ||
+      o.countedProbability !== probability) throw new Rejection(400, 'Trace outcome mismatch');
+  const e = object(t.evaluation);
+  onlyKeys(e, ['kind', 'rawQuality', 'rankingScore', 'forecastSpins', 'forecastSpinsByBag', 'forecastPlacements']);
+  if (e.kind !== 'heuristic' || !Array.isArray(e.forecastSpinsByBag) || e.forecastSpinsByBag.length > 2) throw new Rejection(400, 'Invalid trace evaluator');
+  const evaluation = {kind: 'heuristic', rawQuality: nullableNumber(e.rawQuality, -1e12, 1e12),
+    rankingScore: nullableNumber(e.rankingScore, -1e12, 1e12), forecastSpins: nullableNumber(e.forecastSpins, 0, 12, true),
+    forecastSpinsByBag: e.forecastSpinsByBag.map(v => number(v, 0, 6, true)),
+    forecastPlacements: nullableNumber(e.forecastPlacements, 0, 14, true)};
+  const s = object(t.search); onlyKeys(s, ['scope', 'budgetStart', 'expanded', 'candidates', 'verifiedCandidates', 'pruned']);
+  if (s.scope !== 'worker-total-at-record') throw new Rejection(400, 'Invalid trace work scope');
+  const search = {scope: s.scope, budgetStart: number(s.budgetStart, 0, 700, true),
+    expanded: nullableNumber(s.expanded, 0, Number.MAX_SAFE_INTEGER, true),
+    candidates: nullableNumber(s.candidates, 0, Number.MAX_SAFE_INTEGER, true),
+    verifiedCandidates: nullableNumber(s.verifiedCandidates, 0, Number.MAX_SAFE_INTEGER, true),
+    pruned: nullableNumber(s.pruned, 0, Number.MAX_SAFE_INTEGER, true)};
+  return {schemaVersion: 1, kind: 'retained-path', prefixOmittedBags: omitted, start: first, steps, evaluation, search,
+    outcome: {spins: previous.spins, placed: previous.placed, bagCount: bagDepth, countedProbability: probability}};
+}
+// jsonb text has separator spaces. Check that size before submitting the RPC,
+// so a valid HTTP batch cannot fail later merely because storage adds spaces.
+function storageJson(value: unknown): string {
+  if (Array.isArray(value)) return '[' + value.map(storageJson).join(', ') + ']';
+  if (value && typeof value === 'object') return '{' + Object.entries(value).map(([key, v]) => JSON.stringify(key) + ': ' + storageJson(v)).join(', ') + '}';
+  return JSON.stringify(value) ?? 'null';
+}
 function cleanInput(value: unknown) {
   const field = object(value);
-  onlyKeys(field, ['schemaVersion', 'id', 'rows', 'source']);
+  onlyKeys(field, ['schemaVersion', 'id', 'rows', 'source', 'trace']);
   if (field.schemaVersion !== 1) throw new Rejection(400, 'Invalid input version');
   if (!Array.isArray(field.rows) || field.rows.length !== 24 || !field.rows.some(row => row !== 0)) {
     throw new Rejection(400, 'A nonempty completed board is required');
@@ -53,7 +114,7 @@ function cleanInput(value: unknown) {
   onlyKeys(c, ['minSuccessPercent', 'bagMinSuccessPercent', 'firstBagMinSuccessPercent',
     'riskMinSpinsPerBag', 'pieceGoal', 'maxPieces', 'beamWidth']);
   if (![16, 32, 64, 128].includes(c.beamWidth as number)) throw new Rejection(400, 'Invalid beam width');
-  return {schemaVersion: 1, id: text(field.id), rows, source: {
+  const result = {schemaVersion: 1, id: text(field.id), rows, source: {
     kind: 'search', family: source.family, reference: source.reference, runId, candidateId,
     bagBoundary: number(source.bagBoundary, 1, 128, true),
     probability: number(source.probability, 0, 1),
@@ -70,7 +131,10 @@ function cleanInput(value: unknown) {
       pieceGoal: number(c.pieceGoal, 1, 1000, true), maxPieces: number(c.maxPieces, 1, 700, true),
       beamWidth: number(c.beamWidth, 16, 128, true)
     }
-  }};
+  }, trace: cleanTrace(field.trace, rows, number(source.bagBoundary, 1, 100, true), number(source.probability, 0, 1))};
+  if (new TextEncoder().encode(JSON.stringify(result)).length > 6144 ||
+      new TextEncoder().encode(storageJson(result)).length > 8192) throw new Rejection(413, 'Contribution exceeds storage limit');
+  return result;
 }
 async function digest(value: string): Promise<string> {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))),
@@ -170,14 +234,21 @@ Deno.serve(async (request: Request) => {
       }
       throw new Rejection(400, 'Unknown consumer action');
     }
-    onlyKeys(body, ['schemaVersion', 'fields']);
-    if (body.schemaVersion !== 2 || !Array.isArray(body.fields) || !body.fields.length || body.fields.length > 8) {
+    onlyKeys(body, ['schemaVersion', 'consent', 'fields']);
+    if (body.schemaVersion !== 3 || !Array.isArray(body.fields) || !body.fields.length || body.fields.length > 8) {
       throw new Rejection(400, 'Invalid contribution batch');
+    }
+    const consent = object(body.consent); onlyKeys(consent, ['version', 'scope', 'decision']);
+    if (consent.version !== 2 || consent.scope !== 'verified-search-process' || consent.decision !== 'allow') {
+      throw new Rejection(400, 'Explicit current contribution consent required');
     }
     const records = await Promise.all(body.fields.map(async value => {
       const input = cleanInput(value);
-      return {board_key: await digest(JSON.stringify(input.rows)), bag_depth: input.source.bagBoundary, input};
+      // Retain distinct run/path observations, including known geometry. D1
+      // separately deduplicates occupancy; public traces keep their identity.
+      return {board_key: await digest(input.id + ':' + input.rows.join(',')), bag_depth: input.source.bagBoundary, input};
     }));
+    if (new TextEncoder().encode(storageJson(records)).length > MAX_BODY) throw new Rejection(413, 'Batch exceeds storage limit');
     const response = await rest('rpc/neyra_admit_contributions', {method: 'POST', body: JSON.stringify({p_records: records})});
     return respond(await response.json());
   } catch (error) {

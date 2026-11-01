@@ -14,6 +14,7 @@ import struct
 
 TASK = "naga-spin-observations-v2"
 POLICY = "neyra-fixed-bag-continuation-v2"
+EXPLORATION_POLICY = "neyra-seeded-bag-continuation-v2"
 ARCHITECTURE = {"name": "neyra-spin-cnn-v2", "input": [1, 24, 10],
                 "channels": [24, 32, 48], "kernel": 3, "padding": 1,
                 "poolOutput": [4, 2], "poolKernel": [6, 5],
@@ -110,7 +111,19 @@ def validate_label(value):
     if not isinstance(value, dict) or value.get("schemaVersion") != 2 or value.get("task") != TASK:
         raise ValueError("Only newly collected spin-only schemaVersion 2 labels are accepted")
     reject_legacy(value)
-    if value.get("policy") != POLICY:
+    if value.get("policy") == POLICY:
+        if "exploration" in value:
+            raise ValueError("A fixed-policy label cannot carry an exploration seed")
+    elif value.get("policy") == EXPLORATION_POLICY:
+        exploration = value.get("exploration")
+        if not isinstance(exploration, dict) or set(exploration) != {"schemaVersion", "seed", "ordinal", "scope"}:
+            raise ValueError("Seeded observations require the exact exploration metadata")
+        integer(exploration["schemaVersion"], "exploration.schemaVersion", 1, 1)
+        if exploration["scope"] != "proposal-order-only":
+            raise ValueError("Unsupported exploration semantics")
+        integer(exploration["seed"], "exploration.seed", 0, 2**32 - 1)
+        integer(exploration["ordinal"], "exploration.ordinal", 0, 2**32 - 1)
+    else:
         raise ValueError("Wrong measured-spin policy")
     validate_sample(value.get("input"))
     config = validate_config(value.get("config"))
@@ -189,10 +202,23 @@ def validate_model(value):
         raise ValueError("A trained CPU model is required")
     if value.get("architecture") != ARCHITECTURE:
         raise ValueError("Unexpected v2 architecture")
+    if value.get("outputNames") != ["foundSpinLogit", "observedSpinsScaled"] or value.get("countScale") != 6:
+        raise ValueError("Unexpected v2 output semantics")
+    if value.get("searchOrderingEnabled") is not False:
+        raise ValueError("Private checkpoints cannot enable public search ordering")
     text_value(value.get("modelId"), "modelId", 128)
     for key in ("datasetSha256", "weightsSha256"):
         if not isinstance(value.get(key), str) or not HASH.fullmatch(value[key]):
             raise ValueError(f"Invalid {key}")
+    if value.get("datasetHashAlgorithm", "sha256-raw-jsonl-v1") not in {
+            "sha256-raw-jsonl-v1", "sha256-neyra-canonical-projected-records-v1"}:
+        raise ValueError("Unsupported dataset hash algorithm")
+    lineage = value.get("trainingDatasetLineage")
+    if lineage is not None:
+        if (not isinstance(lineage, list) or not 1 <= len(lineage) <= 256
+                or any(not isinstance(item, str) or not HASH.fullmatch(item) for item in lineage)
+                or len(set(lineage)) != len(lineage) or value["datasetSha256"] not in lineage):
+            raise ValueError("Invalid training dataset lineage")
     if value.get("weightsSha256Algorithm") != WEIGHTS_HASH_ALGORITHM:
         raise ValueError("Wrong weights hash algorithm")
     if weights_hash(value.get("weights")) != value["weightsSha256"]:

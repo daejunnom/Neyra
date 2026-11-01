@@ -1,7 +1,9 @@
--- Public Pages only submit untrusted board inputs through an Edge Function.
+-- Public Pages submit untrusted inputs and bounded machine traces after opt-in.
 -- The owner-private Site imports this queue into D1 and generates fresh labels.
 -- No browser role can read or write these tables or call the service RPC.
 create table public.neyra_contribution_queue (
+  -- Legacy column name: schema-3 keys hash the contribution ID and occupancy,
+  -- preserving distinct run/path traces. D1 deduplicates training geometry.
   board_key text primary key check (board_key ~ '^[0-9a-f]{64}$'),
   input jsonb not null check (jsonb_typeof(input) = 'object' and octet_length(input::text) <= 8192),
   bag_depth smallint not null check (bag_depth between 1 and 128),
@@ -86,4 +88,4 @@ $$;
 revoke all on function public.neyra_admit_contributions(jsonb) from public, anon, authenticated;
 grant execute on function public.neyra_admit_contributions(jsonb) to service_role;
 
-comment on table public.neyra_contribution_queue is 'Untrusted current-board inputs only. Relabel in the private Site; never accept contributed predictions, teacher scores or supply proofs.';
+comment on table public.neyra_contribution_queue is 'Untrusted board inputs and machine traces after explicit consent. Relabel privately; trace scores are not supervised CNN targets or trusted supply proofs.';

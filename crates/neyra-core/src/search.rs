@@ -4960,6 +4960,13 @@ impl SearchSession {
         if let serde_json::Value::Object(extra) = ordering_metadata {
             selective_search.as_object_mut().expect("object literal").extend(extra);
         }
+        if self.ga_weights.is_some() {
+            selective_search["proposalScope"] = "CanonicalReachableLocks;FittedGaOrdering;BoundedMultipathSelection;NotExhaustiveSequences".into();
+        }
+        if self.config.probability_frontier {
+            selective_search["probabilityBudgetPacingEnabled"] = false.into();
+            selective_search["certainPrefixPolicy"] = "PeriodicExactAllBag5040PrefixDispatch;BoundedLiveArchive;SelectiveProposalsRemain;NotCompleteSearch".into();
+        }
         selective_search["foundationPolicy"] = serde_json::json!({
             "ranking": "AllNonterminalFirstBagPrefixesAndBoundariesUseQualityBeforeActualSpins",
             "terrainWeightsByLock": [0.06, 0.06, 0.06, 0.12, 0.18, 0.24, 0.30],
@@ -4974,7 +4981,9 @@ impl SearchSession {
             "cavityPreparation": "OneGoalFreeStepPerSegment;ActualZeroLinePlacement;NoExtraInventory",
             "deepExploration": "OneOfFourExplorationPhases;EligibleCertifiedDepthAtLeastTwoBags"
         });
-        selective_search["fieldModel"] = serde_json::json!(if self.evaluator.is_some() {
+        selective_search["fieldModel"] = serde_json::json!(if self.ga_weights.is_some() {
+            "FrozenGa24FeaturePlacementScoreTimes40;PhysicalRulesAndP7ProofIndependent"
+        } else if self.evaluator.is_some() {
             "OccupancyOnlyV5;CompletedBoundariesFromBagTwo;FoundationsAndUnfinishedPrefixesStructural"
         } else {
             "ConnectedCavityResidual;ImmediateWitness;WitnessedOutwardBanks;StrongPreparedAndGoalRelativeRoof;SymmetricGoalWorkspace;StrongCurledWorkspaceRoof;StraightWorkspaceWindowCost;AllAdjacentHeightDependence;SuspendedRoofStepRelief;LowOneCellNotch;OneMinoRoofOrLevelRepair"
@@ -4984,7 +4993,10 @@ impl SearchSession {
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
             "learnedOrdering": self.evaluator_status,
-            "learnedBoundaryFormula": "120*(predictedOneBagSpins+0.05*foundSpinLikelihood);noHeuristicBlend;fromBagTwo",
+            "learnedBoundaryFormula": if self.ga_weights.is_some() { Some("40*GaPlacementFeatureDotProduct;BoundedSearchOrderingOnly") }
+                else if self.evaluator.is_some() { Some("120*(predictedOneBagSpins+0.05*foundSpinLikelihood);noHeuristicBlend;fromBagTwo") }
+                else { None },
+            "verificationGuide": self.guide_status,
             "candidate": archive.map(|a| a.for_snapshot(true)), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
@@ -5000,8 +5012,12 @@ impl SearchSession {
             "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
             "displayPartialRanking": "ProductiveStageOverFoundation;oneBag:FieldQuality,StartProbability,CountedProbability,Spins,FewerLocks;later:spins*CountedProbability/max(7,placed),Probability,MoreBags,Spins,FieldQuality,FewerLocks",
             "bagRecords": "TwoQualifiedVerifiedWholeBagPartialsPerDepth;SamePartialComparator;DistinctPlanIds;IndependentCertificateChains;CandidateIdSelection",
-            "bagProbabilityScope": "IndependentFloorAfterFirstBag;BelowActualBagSpinThresholdRequires100Percent;FirstBagUsesItsOwnFloor;DisplayedBagsUseFullCertifiedCoverage",
-            "probabilityBudget": archive.filter(|a| a.summary.verified).map(|a| {
+            "bagProbabilityScope": if self.config.probability_frontier {
+                "AllBagsIncluded;PositiveConstructionCoverage;All5040QuietSafe;NoConstructionProbabilityBudget;TerminalCostCdfMeasured"
+            } else { "IndependentFloorAfterFirstBag;BelowActualBagSpinThresholdRequires100Percent;FirstBagUsesItsOwnFloor;DisplayedBagsUseFullCertifiedCoverage" },
+            "probabilityFrontierMode": self.config.probability_frontier,
+            "frontierMeaning": "IndependentFixedPlanFullConstructionProbability;LowerTargetsAreFirstHitLowerBounds;TerminalGoalHasMeasuredCostCdf;NoUnionOrGlobalOptimalityClaim",
+            "probabilityBudget": archive.filter(|a| a.summary.verified && !self.config.probability_frontier).map(|a| {
                 let chance = a.summary.probability;
                 let floor = self.config.min_success_percent / 100.0;
                 serde_json::json!({

@@ -17,6 +17,13 @@ POLICY = "neyra-fixed-bag-continuation-v2"
 EXPLORATION_POLICY = "neyra-seeded-bag-continuation-v2"
 NEXT_BAG_TASK = "naga-next-bag-spin-v3"
 NEXT_BAG_POLICY = "bounded-next-bag-spin-v3"
+REFINED_TASK = "naga-next-bag-spin-v4"
+CONCENTRATED_POLICY = "concentrated-next-bag-spin-v4"
+REFINED_TARGET_POLICY = "best-replayed-next-bag-v1"
+TARGET_DERIVATION = {"schemaVersion": 1, "policy": REFINED_TARGET_POLICY,
+                     "sourceObservationVersion": 4, "sourcePolicy": CONCENTRATED_POLICY,
+                     "targetHorizonBags": 1}
+REFINED_DATA_HASH = "sha256-neyra-refined-records-v1"
 ARCHITECTURE = {"name": "neyra-spin-cnn-v2", "input": [1, 24, 10],
                 "channels": [24, 32, 48], "kernel": 3, "padding": 1,
                 "poolOutput": [4, 2], "poolKernel": [6, 5],
@@ -100,7 +107,7 @@ def validate_config(config, observation_version=2):
         raise ValueError("Missing labeling config")
     required = {"horizonBags", "workBudget", "beamWidth", "profile", "seed",
                 "maxNodes", "attemptsPerNode", "sourceRevision"}
-    if observation_version == 3:
+    if observation_version in (3, 4):
         required.add("observationVersion")
     if set(config) != required or config.get("observationVersion", 2) != observation_version:
         raise ValueError("Labeling policy must declare its exact versioned budget fields")
@@ -112,6 +119,8 @@ def validate_config(config, observation_version=2):
     integer(config["maxNodes"], "maxNodes", 1, 256)
     if observation_version == 3 and config["maxNodes"] < config["horizonBags"]:
         raise ValueError("Continuation node capacity must cover its requested horizon")
+    if observation_version == 4 and (config["horizonBags"] != 2 or config["maxNodes"] < 4 or config["workBudget"] < 1024):
+        raise ValueError("V4 requires two measured bags, at least four nodes and 1024 work units")
     integer(config["attemptsPerNode"], "attemptsPerNode", 1, 16)
     text_value(config["sourceRevision"], "sourceRevision", 256)
     return config
@@ -122,6 +131,8 @@ def validate_label(value):
         text_value(value["measurementGroup"], "measurementGroup", 256)
     if isinstance(value, dict) and value.get("schemaVersion") == 3:
         return validate_next_bag_label(value)
+    if isinstance(value, dict) and value.get("schemaVersion") == 4:
+        return validate_next_bag_label(value, concentrated=True)
     return validate_v2_label(value)
 
 
@@ -250,14 +261,15 @@ def validate_frames(frames, targets, start_rows, start_spins, prior_bags, count)
     return board, spins, deleted
 
 
-def validate_next_bag_label(value):
-    if (value.get("schemaVersion") != 3 or value.get("task") != NEXT_BAG_TASK
-            or value.get("policy") != NEXT_BAG_POLICY or value.get("targetHorizonBags") != 1
+def validate_next_bag_label(value, *, concentrated=False):
+    version = 4 if concentrated else 3
+    if (value.get("schemaVersion") != version or value.get("task") != (REFINED_TASK if concentrated else NEXT_BAG_TASK)
+            or value.get("policy") != (CONCENTRATED_POLICY if concentrated else NEXT_BAG_POLICY) or value.get("targetHorizonBags") != 1
             or "exploration" in value):
         raise ValueError("V3 requires its separate fixed one-bag target policy")
     reject_legacy(value)
     validate_sample(value.get("input"))
-    config = validate_config(value.get("config"), 3)
+    config = validate_config(value.get("config"), version)
     targets, measured = value.get("targets"), value.get("measured")
     if not isinstance(targets, dict) or set(targets) != {"foundSpin", "observedSpins"}:
         raise ValueError("One-bag targets are foundSpin and observedSpins only")
@@ -270,7 +282,8 @@ def validate_next_bag_label(value):
     work = integer(measured.get("workUsed"), "workUsed", 0, config["workBudget"])
     generation = integer(measured.get("generationWork"), "generationWork", 0, work)
     verification = integer(measured.get("verificationWork"), "verificationWork", 0, work)
-    if generation + verification != work:
+    dependency = integer(measured.get("dependencyWork"), "dependencyWork", 0, work) if concentrated else 0
+    if generation + verification + dependency != work:
         raise ValueError("Continuation work accounting does not sum to its total")
     if (value.get("certifiedWitnesses") != [] or measured.get("maxCertifiedObservedSpins") is not None
             or any(measured.get(key) != 0 for key in ("certifiedWholeBagChains", "productiveCertifiedWholeBagChains",
@@ -282,7 +295,8 @@ def validate_next_bag_label(value):
             or lookahead.get("reachableWholeBagChains") != len(witnesses)):
         raise ValueError("Lookahead evidence does not match its separate measurement horizon")
     capacity = integer(lookahead.get("witnessCapacity"), "witness capacity", 1, 32)
-    if len(witnesses) > capacity or verification != len(witnesses) * 7:
+    if (len(witnesses) > capacity or (not concentrated and verification != len(witnesses) * 7)
+            or concentrated and capacity != min(config["maxNodes"], 32)):
         raise ValueError("Retained whole-bag witnesses disagree with replay capacity/work")
     by_id, deepest = {}, 0
     for witness in witnesses:
@@ -314,13 +328,15 @@ def validate_next_bag_label(value):
         board, end_spins, deleted = validate_frames(witness.get("frames"), witness.get("targets"), start, start_spins, prior_bags, 7)
         if ([PIECES[q] for q in queue] != [frame["piece"] for frame in witness["frames"]]
                 or witness.get("endRows") != board or witness.get("endSpins") != end_spins
-                or witness.get("deletedRows") != deleted or end_spins > maximum):
+                or witness.get("deletedRows") != deleted or end_spins > maximum
+                or concentrated and (bags == 1 and end_spins > spins
+                    or any(frame["piece"] == "O" and frame["spin"] for frame in witness["frames"]))):
             raise ValueError("Reachable endpoint, queue or deletion context disagrees with its frames")
         deepest = max(deepest, bags); by_id[identity] = witness
 
     def prefix(raw, target=False):
         if raw is None:
-            if target and spins:
+            if target and spins or concentrated and lookahead.get("deepestReachedPlacements", 0) > 0:
                 raise ValueError("Positive one-bag target needs its physical prefix")
             return 0, 0
         if not isinstance(raw, dict) or raw.get("certifiedParentId") is not None:
@@ -346,7 +362,7 @@ def validate_next_bag_label(value):
     if (lookahead.get("deepestCompletedBag") != deepest
             or lookahead.get("deepestReachedPlacements") != max(deepest * 7, reached)):
         raise ValueError("Observed continuation depth disagrees with retained physical evidence")
-    integer(lookahead.get("deepestAttemptedBag"), "deepest attempted bag", deepest, config["horizonBags"])
+    integer(lookahead.get("deepestAttemptedBag"), "deepest attempted bag", max(1, deepest) if concentrated else deepest, config["horizonBags"])
     for key in ("capacityDrops", "duplicateContinuations"):
         integer(lookahead.get(key), key, 0, 2**53 - 1)
     best = lookahead.get("bestTwoBagPath")
@@ -378,7 +394,294 @@ def validate_next_bag_label(value):
             raise ValueError("Per-depth counts mix reachable observations with certification")
     if measured.get("productiveGeometricWholeBagChains") != sum(w["endSpins"] > 0 for w in witnesses):
         raise ValueError("Productive continuation count is inconsistent")
+    if concentrated:
+        validate_refinement(value, by_id)
     return value
+
+
+def exact_object(value, keys, name):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise ValueError(f"{name} has unexpected or missing fields")
+    return value
+
+
+def validate_local_prefix(value, start):
+    if value is None:
+        return 0, 0
+    exact_object(value, ("placements", "observedSpins", "deletedRows", "targets", "representativeQueue",
+                         "representativeInputs", "frames", "trust"), "local prefix")
+    count = integer(value["placements"], "local placements", 1, 7)
+    queue, inputs = value["representativeQueue"], value["representativeInputs"]
+    if (value["trust"] != "input-reachable" or not isinstance(queue, list) or len(queue) != count
+            or len({integer(q, "local piece", 0, 6) for q in queue}) != count
+            or not isinstance(inputs, list) or len(inputs) != count):
+        raise ValueError("Local evidence requires distinct typed pieces and physical input paths")
+    for path in inputs:
+        if (not isinstance(path, list) or not 1 <= len(path) <= 256 or path[-1] != "hard_drop"
+                or "hard_drop" in path[:-1] or any(not isinstance(action, str) or action not in ACTIONS for action in path)):
+            raise ValueError("Invalid local physical input path")
+    _, spins, deleted = validate_frames(value["frames"], value["targets"], start, 0, 0, count)
+    if (value["observedSpins"] != spins or value["deletedRows"] != deleted
+            or [PIECES[q] for q in queue] != [frame["piece"] for frame in value["frames"]]
+            or any(frame["piece"] == "O" and frame["spin"] for frame in value["frames"])):
+        raise ValueError("Local one-bag evidence disagrees with its physical frames")
+    return count, spins
+
+
+def validate_refined_search(value, start, quota, attempts_limit):
+    exact_object(value, ("allocatedWork", "workUsed", "generationWork", "verificationWork", "attempts", "targets",
+                         "targetWitness", "deepestWitness", "deepestReachedPlacements", "completedWholeBagCandidates",
+                         "distinctWholeBagCandidates", "censored", "stopReason"), "local observation")
+    used = integer(value["workUsed"], "local work", 0, quota)
+    generation = integer(value["generationWork"], "local generation", 0, used)
+    verification = integer(value["verificationWork"], "local verification", 0, used)
+    attempts = integer(value["attempts"], "local attempts", 0, attempts_limit)
+    targets = exact_object(value["targets"], ("foundSpin", "observedSpins"), "local targets")
+    spins = integer(targets["observedSpins"], "local spins", 0, 6)
+    reached = integer(value["deepestReachedPlacements"], "local reached", 0, 7)
+    completed = integer(value["completedWholeBagCandidates"], "local completed", 0, 2**53 - 1)
+    integer(value["distinctWholeBagCandidates"], "local distinct", 0, completed)
+    if (value["allocatedWork"] != quota or used != generation + verification or targets["foundSpin"] is not (spins > 0)
+            or value["censored"] is not True or completed > 0 and reached != 7 or used > 0 and attempts == 0):
+        raise ValueError("Local quotas, actual progress or targets disagree")
+    text_value(value["stopReason"], "local stop reason", 100)
+    target_count, target_spins = validate_local_prefix(value["targetWitness"], start)
+    deepest_count, deepest_spins = validate_local_prefix(value["deepestWitness"], start)
+    if (target_spins != spins or target_count > reached or deepest_count != reached or deepest_spins > spins
+            or reached > 0 and target_count == 0):
+        raise ValueError("Local best/deepest physical prefixes disagree with the target")
+    return used, generation, verification, target_count + deepest_count
+
+
+def validate_component_dependency(value, witness):
+    exact_object(value, ("schemaVersion", "policy", "connectivity", "scope", "maxOrdersPerComponent", "workUsed",
+                         "totalOrders", "testedOrders", "successfulOrders", "components"), "component dependency")
+    if (value["schemaVersion"] != 1 or value["policy"] != "touching-components-origin-only-v1"
+            or value["connectivity"] != "orthogonal-logical-target-cells" or value["maxOrdersPerComponent"] != 64
+            or not isinstance(value["components"], list) or not 1 <= len(value["components"]) <= 7):
+        raise ValueError("Unsupported dependency approximation")
+    text_value(value["scope"], "dependency scope", 1000)
+    targets = witness["targets"]
+    adjacent = [set() for _ in targets]
+    for i, a in enumerate(targets):
+        for j, b in enumerate(targets[i + 1:], i + 1):
+            if any(abs(x[0] - y[0]) + abs(x[1] - y[1]) == 1 for x in a["cells"] for y in b["cells"]):
+                adjacent[i].add(j); adjacent[j].add(i)
+    remaining, expected = set(range(len(targets))), []
+    while remaining:
+        stack, group = [remaining.pop()], []
+        while stack:
+            at = stack.pop(); group.append(targets[at]["piece"])
+            following = adjacent[at] & remaining
+            remaining -= following; stack.extend(following)
+        expected.append(tuple(sorted(group)))
+    actual, total, tested, success, work = [], 0, 0, 0, 0
+    for component in value["components"]:
+        exact_object(component, ("pieces", "totalOrders", "testedOrders", "successfulOrders", "interruptedOrders",
+                                 "workUsed", "exhaustive"), "dependency component")
+        pieces = component["pieces"]
+        if (not isinstance(pieces, list) or not pieces or any(p not in PIECES for p in pieces)
+                or len(set(pieces)) != len(pieces)):
+            raise ValueError("Invalid dependency component pieces")
+        factorial = math.factorial(len(pieces))
+        n = integer(component["testedOrders"], "component tested orders", 0, min(64, factorial))
+        s = integer(component["successfulOrders"], "component successful orders", 0, n)
+        integer(component["interruptedOrders"], "component interrupted orders", 0, 64)
+        w = integer(component["workUsed"], "component work", 0, 4096)
+        if component["totalOrders"] != factorial or component["exhaustive"] is not (n == factorial):
+            raise ValueError("Component observation coverage is incoherent")
+        actual.append(tuple(sorted(pieces))); total += factorial; tested += n; success += s; work += w
+    if (sorted(actual) != sorted(expected) or value["totalOrders"] != total or value["testedOrders"] != tested
+            or value["successfulOrders"] != success or value["workUsed"] != work):
+        raise ValueError("Dependency components must match actual touching targets and their independent totals")
+    return work
+
+
+def validate_refinement(label, by_id):
+    refinement = exact_object(label.get("refinement"), ("schemaVersion", "policy", "selectionSeed", "selectionScoreMin",
+        "selectionScoreMax", "selectionBandCount", "candidatePoolCapacity", "candidatePoolSize", "candidatePoolDrops",
+        "candidateDuplicates", "armLimit", "armQuota", "dependencyWorkBudget", "dependencyWorkUsed", "proofCapacity",
+        "proofCapacityDrops", "root", "candidates", "arms"), "refinement")
+    config, measured = label["config"], label["measured"]
+    dependency_budget = min(4096, config["workBudget"] // 32)
+    quota = (config["workBudget"] - dependency_budget) // 4
+    if (type(refinement["schemaVersion"]) is not int or refinement["schemaVersion"] != 1 or refinement["policy"] != "uniform-score-band-three-arm-equal-quota-v1"
+            or refinement["armLimit"] != 3 or refinement["armQuota"] != quota
+            or refinement["dependencyWorkBudget"] != dependency_budget
+            or refinement["dependencyWorkUsed"] != measured["dependencyWork"]
+            or refinement["proofCapacity"] != min(config["maxNodes"], 32)):
+        raise ValueError("Refinement policy or reserved work differs from its fixed contract")
+    integer(refinement["selectionSeed"], "selection seed", 0, 2**32 - 1)
+    integer(refinement["dependencyWorkUsed"], "dependency work", 0, dependency_budget)
+    capacity = integer(refinement["candidatePoolCapacity"], "candidate pool capacity", 1, 4096)
+    pool = integer(refinement["candidatePoolSize"], "candidate pool size", 0, capacity)
+    low, high = refinement["selectionScoreMin"], refinement["selectionScoreMax"]
+    if (any(type(n) not in (float, int) or not math.isfinite(n) for n in (low, high)) or low > high
+            or refinement["selectionBandCount"] != (1 if low == high else 4) or not pool and (low != 0 or high != 0)):
+        raise ValueError("Invalid score-band sampling metadata")
+    for key in ("candidatePoolDrops", "candidateDuplicates", "proofCapacityDrops"):
+        integer(refinement[key], key, 0, 2**53 - 1)
+    candidates, arms = refinement["candidates"], refinement["arms"]
+    if (not isinstance(candidates, list) or len(candidates) != len(by_id) or not isinstance(arms, list)
+            or len(arms) > min(3, pool)):
+        raise ValueError("Retained candidates and local observation arms disagree")
+    root = refinement["root"]
+    used, generation, verification, prefix_work = validate_refined_search(root, label["input"]["rows"], quota, config["attemptsPerNode"])
+    if root["targets"] != label["targets"] or verification != 7 * sum(w["parentId"] is None for w in by_id.values()) + prefix_work:
+        raise ValueError("Root targets or input verification work disagree")
+    selected = set()
+    phase_best = {None: root["targets"]["observedSpins"]}
+    for arm in arms:
+        exact_object(arm, ("candidateWitnessId", "selectionStratum", "selectionStrata", "selectionPoolSize", "selectionIndex", "observation"), "refinement arm")
+        identity = integer(arm["candidateWitnessId"], "arm candidate", 1, 2**53 - 1)
+        candidate = by_id.get(identity)
+        if candidate is None or candidate["bags"] != 1 or not any(candidate["endRows"]) or identity in selected:
+            raise ValueError("Each local arm must start from a distinct actual first-bag endpoint")
+        strata = integer(arm["selectionStrata"], "arm strata", 1, 4)
+        integer(arm["selectionStratum"], "arm stratum", 0, strata - 1)
+        size = integer(arm["selectionPoolSize"], "arm selection pool", 1, pool)
+        integer(arm["selectionIndex"], "arm selection index", 0, size - 1)
+        if strata != refinement["selectionBandCount"]:
+            raise ValueError("Arm sampling does not match the recorded score bands")
+        u, g, v, prefix_work = validate_refined_search(arm["observation"], candidate["endRows"], quota, config["attemptsPerNode"])
+        if u == 0 or v != 7 * sum(w["parentId"] == identity for w in by_id.values()) + prefix_work:
+            raise ValueError("An arm must have actual work and matching retained input evidence")
+        phase_best[identity] = candidate["endSpins"] + arm["observation"]["targets"]["observedSpins"]
+        if any(w["parentId"] == identity and w["endSpins"] > phase_best[identity] for w in by_id.values()):
+            raise ValueError("An arm's local best cannot be below its retained whole-bag child gains")
+        used += u; generation += g; verification += v; selected.add(identity)
+    deepest = label.get("reachableWitness")
+    if deepest is not None:
+        parent = deepest.get("reachableParentId")
+        if parent not in phase_best or deepest["observedSpins"] > phase_best[parent]:
+            raise ValueError("The global deepest prefix cannot exceed its corresponding local phase best")
+    dependency, seen = 0, set()
+    for candidate in candidates:
+        exact_object(candidate, ("witnessId", "structuralQuality", "dependency"), "refinement candidate")
+        identity = integer(candidate["witnessId"], "candidate id", 1, 2**53 - 1)
+        quality = candidate["structuralQuality"]
+        if identity not in by_id or identity in seen or type(quality) not in (int, float) or not math.isfinite(quality):
+            raise ValueError("Invalid current-field sampling metadata")
+        seen.add(identity)
+        if candidate["dependency"] is not None:
+            if identity not in selected or by_id[identity]["bags"] != 1:
+                raise ValueError("Only selected first-bag candidates carry dependency diagnostics")
+            dependency += validate_component_dependency(candidate["dependency"], by_id[identity])
+    if (dependency != refinement["dependencyWorkUsed"] or used + dependency != measured["workUsed"]
+            or generation != measured["generationWork"] or verification != measured["verificationWork"]):
+        raise ValueError("Refinement work totals do not sum to the original bounded observation")
+
+
+def validate_refined_record(value):
+    """Validate the compact projection; evidence must also be resolved before fitting.
+
+    The ID is an immutable Site identity, not a claim that Python reproduces
+    JavaScript locale collation or floating-point JSON spellings. Download page
+    hashes and the original proof independently protect the exact data used.
+    """
+    exact_object(value, ("schemaVersion", "kind", "id", "task", "policy", "targetHorizonBags", "input", "config",
+                         "targets", "measurementScope", "measured", "evidence"), "refined target")
+    reject_legacy(value)
+    if (type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1 or value["kind"] != "refined-next-bag-target" or value["task"] != REFINED_TASK
+            or value["policy"] != REFINED_TARGET_POLICY or value["targetHorizonBags"] != 1
+            or not isinstance(value["id"], str) or not HASH.fullmatch(value["id"])):
+        raise ValueError("Invalid versioned refined target identity")
+    validate_sample(value["input"]); config = validate_config(value["config"], 4)
+    source = value["input"]["source"]
+    text_value(source.get("group"), "refined source group", 256)
+    if source.get("split") not in {"train", "validation", "test"}:
+        raise ValueError("Refined targets require their actual immutable source split")
+    target = exact_object(value["targets"], ("foundSpin", "observedSpins"), "refined targets")
+    scope = exact_object(value["measurementScope"], ("kind", "allocatedWork", "workUnit"), "refined scope")
+    measured = exact_object(value["measured"], ("workUsed", "generationWork", "verificationWork", "deepestReachedPlacements",
+        "completedWholeBagCandidates", "distinctWholeBagCandidates", "attempts", "censored", "stopReason"), "refined measurement")
+    evidence = exact_object(value["evidence"], ("observationId", "observationPolicy", "artifact", "candidateWitnessId",
+        "armIndex", "targetPath", "measurementGroup", "trust"), "refined evidence")
+    spins = integer(target["observedSpins"], "refined spins", 0, 6)
+    allocated = integer(scope["allocatedWork"], "refined allocation", 1, config["workBudget"])
+    used = integer(measured["workUsed"], "refined actual work", 1, allocated)
+    reached = integer(measured["deepestReachedPlacements"], "refined reached", 0, 7)
+    if (target["foundSpin"] is not (spins > 0) or spins > reached or measured["censored"] is not True
+            or scope["workUnit"] != "bounded-generation-and-input-verification-v4" or scope["kind"] not in {"root", "candidate-arm"}
+            or integer(measured["generationWork"], "refined generation", 0, used)
+               + integer(measured["verificationWork"], "refined verification", 0, used) != used):
+        raise ValueError("Refined local one-bag target or measured work is incoherent")
+    completed = integer(measured["completedWholeBagCandidates"], "refined completed", 0, 2**53 - 1)
+    integer(measured["distinctWholeBagCandidates"], "refined distinct", 0, completed)
+    integer(measured["attempts"], "refined attempts", 1, 2**53 - 1)
+    text_value(measured["stopReason"], "refined stop reason", 100)
+    if completed > 0 and reached != 7:
+        raise ValueError("A completed candidate requires an actually reached whole inventory")
+    identity = evidence["observationId"]
+    if (not isinstance(identity, str) or not HASH.fullmatch(identity) or evidence["observationPolicy"] != CONCENTRATED_POLICY
+            or evidence["artifact"] != "observations/" + identity + ".json" or evidence["measurementGroup"] != source["group"]
+            or evidence["trust"] not in {"client-reported", "owner-cpu-observation"}):
+        raise ValueError("Refined target is missing its original observation provenance")
+    if scope["kind"] == "root":
+        if evidence["candidateWitnessId"] is not None or evidence["armIndex"] is not None or evidence["targetPath"] != "refinement.root.targetWitness":
+            raise ValueError("Refined root evidence path is invalid")
+    else:
+        integer(evidence["candidateWitnessId"], "refined candidate witness", 1, 2**53 - 1)
+        index = integer(evidence["armIndex"], "refined arm index", 0, 2)
+        if evidence["targetPath"] != f"refinement.arms[{index}].observation.targetWitness":
+            raise ValueError("Refined arm evidence path is invalid")
+    return value
+
+
+def validate_refined_evidence(record, label):
+    """Resolve a validated target to a validated, physically oriented raw proof."""
+    if label["schemaVersion"] != 4 or record["config"] != label["config"]:
+        raise ValueError("Refined target and its raw observation policy disagree")
+    evidence, source = record["evidence"], record["input"]["source"]
+    origin = label["input"]["source"]
+    if source["family"] != origin["family"] or any(key in origin and source.get(key) != origin[key] for key in ("group", "split", "runId")):
+        raise ValueError("Refined target cannot change its raw measurement lineage or split")
+    expected_trust = "client-reported" if label.get("measurementTrust") == "client-reported" else "owner-cpu-observation"
+    if evidence["trust"] != expected_trust:
+        raise ValueError("Refined target trust differs from its original observation")
+    index = evidence["armIndex"]
+    if index is None:
+        observation, rows, boundary = label["refinement"]["root"], label["input"]["rows"], origin["bagBoundary"]
+    else:
+        arms = label["refinement"]["arms"]
+        if index >= len(arms) or arms[index]["candidateWitnessId"] != evidence["candidateWitnessId"]:
+            raise ValueError("Refined target points to a different local arm")
+        witness = next((w for w in label["reachableWholeBagWitnesses"] if w["id"] == evidence["candidateWitnessId"]), None)
+        if witness is None or witness["bags"] != 1:
+            raise ValueError("Refined arm has no actual first-bag starting board")
+        observation, rows, boundary = arms[index]["observation"], witness["endRows"], origin["bagBoundary"] + 1
+    if (record["input"]["rows"] != rows or source["bagBoundary"] != boundary or record["targets"] != observation["targets"]
+            or record["measurementScope"]["allocatedWork"] != observation["allocatedWork"]
+            or any(observation.get(key) != value for key, value in record["measured"].items())):
+        raise ValueError("Refined target must preserve the exact measured local scope and physical board")
+    return record
+
+
+def refined_selection_key(record):
+    return (canonical_rows(record["input"]["rows"]), record["policy"],
+            json.dumps(record["config"], sort_keys=True, separators=(",", ":")),
+            json.dumps(record["measurementScope"], sort_keys=True, separators=(",", ":")))
+
+
+def refined_rank(record):
+    measured = record["measured"]
+    return (record["targets"]["observedSpins"], measured["deepestReachedPlacements"],
+            measured["completedWholeBagCandidates"], measured["distinctWholeBagCandidates"])
+
+
+def read_proofs(path):
+    records = read_jsonl(path, kind="proofs")
+    by_id = {}
+    for record in records:
+        exact_object(record, ("id", "label"), "observation index")
+        identity = record["id"]
+        if not isinstance(identity, str) or not HASH.fullmatch(identity) or identity in by_id:
+            raise ValueError("Proof index identities must be unique immutable observation digests")
+        validate_label(record["label"])
+        if record["label"]["schemaVersion"] != 4:
+            raise ValueError("The refinement proof index contains a different observation task")
+        by_id[identity] = record["label"]
+    return by_id
 
 
 def weights_hash(weights):
@@ -399,10 +702,13 @@ def weights_hash(weights):
 def validate_model(value):
     if not isinstance(value, dict):
         raise ValueError("Missing spin-only model")
-    next_bag = value.get("schemaVersion") == 3
-    if (next_bag and (value.get("task") != NEXT_BAG_TASK or value.get("targetHorizonBags") != 1)
+    refined = value.get("schemaVersion") == 4
+    next_bag = refined or value.get("schemaVersion") == 3
+    if (next_bag and (value.get("task") != (REFINED_TASK if refined else NEXT_BAG_TASK) or value.get("targetHorizonBags") != 1)
             or not next_bag and (value.get("schemaVersion") != 2 or value.get("task") != TASK)):
         raise ValueError("Model schema, task and prediction horizon disagree")
+    if refined and value.get("targetDerivation") != TARGET_DERIVATION:
+        raise ValueError("V4 must name the separate replayed one-bag target derivation")
     reject_legacy(value)
     if value.get("trained") is not True or value.get("device") != "cpu":
         raise ValueError("A trained CPU model is required")
@@ -416,8 +722,10 @@ def validate_model(value):
     for key in ("datasetSha256", "weightsSha256"):
         if not isinstance(value.get(key), str) or not HASH.fullmatch(value[key]):
             raise ValueError(f"Invalid {key}")
-    if value.get("datasetHashAlgorithm", "sha256-raw-jsonl-v1") not in {
-            "sha256-raw-jsonl-v1", "sha256-neyra-canonical-projected-records-v1"}:
+    algorithms = {"sha256-raw-jsonl-v1", "sha256-neyra-canonical-projected-records-v1"}
+    if refined:
+        algorithms.add(REFINED_DATA_HASH)
+    if value.get("datasetHashAlgorithm", "sha256-raw-jsonl-v1") not in algorithms:
         raise ValueError("Unsupported dataset hash algorithm")
     lineage = value.get("trainingDatasetLineage")
     if lineage is not None:
@@ -429,7 +737,7 @@ def validate_model(value):
         raise ValueError("Wrong weights hash algorithm")
     if weights_hash(value.get("weights")) != value["weightsSha256"]:
         raise ValueError("Model weights hash mismatch")
-    config = validate_config(value.get("labelConfig"), 3 if next_bag else 2)
+    config = validate_config(value.get("labelConfig"), 4 if refined else 3 if next_bag else 2)
     if value.get("horizonBags") != config["horizonBags"] or value.get("workBudget") != config["workBudget"]:
         raise ValueError("Model scope disagrees with its labeling policy")
     if not next_bag and value.get("targetHorizonBags", config["horizonBags"]) != config["horizonBags"]:
@@ -439,7 +747,7 @@ def validate_model(value):
 
 def prediction_horizon(model):
     """Keep measurement depth distinct from the model's supervised horizon."""
-    return 1 if model["schemaVersion"] == 3 else model["horizonBags"]
+    return 1 if model["schemaVersion"] in (3, 4) else model["horizonBags"]
 
 
 def reject_constant(value):
@@ -466,6 +774,13 @@ def read_jsonl(path, kind="labels"):
         if len(line.encode()) > MAX_RECORD_BYTES:
             raise ValueError(f"Line {line_number} exceeds the record limit")
         value = json.loads(line, object_pairs_hook=unique_keys, parse_constant=reject_constant)
-        validate_label(value) if kind == "labels" else validate_sample(value)
+        if kind == "labels":
+            validate_label(value)
+        elif kind == "refined" or kind == "training" and isinstance(value, dict) and value.get("kind") == "refined-next-bag-target":
+            validate_refined_record(value)
+        elif kind == "training":
+            validate_label(value)
+        elif kind != "proofs":
+            validate_sample(value)
         records.append(value)
     return records

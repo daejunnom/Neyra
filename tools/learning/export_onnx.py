@@ -57,7 +57,9 @@ def main():
                                            "neyra.weightsSha256": checkpoint["weightsSha256"],
                                            "neyra.task": checkpoint["task"],
                                            "neyra.targetHorizonBags": str(prediction_horizon(checkpoint)),
-                                           "neyra.inputEncoding": "canonical-reflection-bottom-up-f32"})
+                                           "neyra.inputEncoding": "canonical-reflection-bottom-up-f32",
+                                           **({"neyra.targetDerivation": json.dumps(checkpoint["targetDerivation"], sort_keys=True, separators=(",", ":"))}
+                                              if checkpoint["schemaVersion"] == 4 else {})})
         onnx.checker.check_model(graph, full_check=True)
         onnx.save(graph, staged)
         if staged.stat().st_size > MAX_RECORD_BYTES:
@@ -72,8 +74,10 @@ def main():
                     "runtime": {"torch": torch.__version__, "onnx": onnx.__version__, "onnxruntime": ort.__version__,
                                 "opset": 18, "exporter": "torch.onnx dynamo", "cpuThreads": args.threads},
                     "scope": "Optional fixed-model inference. Rust search and training are unchanged; no public promotion."}
-        if checkpoint["schemaVersion"] == 3:
+        if checkpoint["schemaVersion"] in (3, 4):
             manifest["targetHorizonBags"] = 1
+        if checkpoint["schemaVersion"] == 4:
+            manifest["targetDerivation"] = checkpoint["targetDerivation"]
         staged_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
         runtime = SpinInference(staged, threads=args.threads)
         errors = []

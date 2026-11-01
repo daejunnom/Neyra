@@ -23,6 +23,15 @@ type ArchivedCandidate = OwnedCandidate & { data: unknown };
 const NEW_DEPLOYMENT_NOTICE = '새 버전이 배포되어 현재 페이지가 이전 버전이에요. 필요한 결과가 있다면 먼저 저장한 뒤 페이지를 새로고침하고 탐색을 다시 시작해 주세요.';
 
 export const MAX_WORKERS = 128;
+export const MAX_FOCUSED_JOBS = 3;
+
+function sameSource(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>, right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && sameSource(left[key], right[key]));
+}
 
 /** The browser can expose fewer logical processors than the operating system. */
 export function workerLimit(hardware = typeof navigator === 'undefined' ? 1 : navigator.hardwareConcurrency): number {
@@ -216,6 +225,7 @@ export class SearchClient {
     this.dispose();
     this.runId = crypto.randomUUID();
     this.runConfig = { ...config, cnn_evaluation: false };
+    this.focusedFrontier.setSeed(config.seed);
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
@@ -403,7 +413,7 @@ export class SearchClient {
         riskMinSpinsPerBag: config.risk_min_spins_per_bag,
         pieceGoal: config.piece_goal, maxPieces: config.max_pieces, beamWidth: config.beam_width
       }
-    } };
+    }, trace: this.retainedTrace(record) ?? undefined };
   }
 
   private retainedTrace(record: OwnedCandidate, counters?: SearchRecordCounters): RetainedSearchTrace | null {
@@ -459,7 +469,7 @@ export class SearchClient {
     if (!trace) return;
     // Data transport is optional and must never interrupt search or alter a record.
     try { this.contribute({ ...field, trace }); } catch { /* The transport reports its own state. */ }
-    const origin = focusedRoot(field);
+    const origin = focusedRoot({ ...field, trace });
     if (origin) this.focusedFrontier.add(origin);
     this.scheduleFocused();
   }
@@ -477,12 +487,12 @@ export class SearchClient {
 
   private scheduleFocused() {
     if (!this.contributionEnabled || this.intent !== 'running' || !this.runId) return;
-    let occupied = Math.max(this.awaitingObservations.size, this.observationTransportPending) +
-      this.slots.filter((slot) => slot.focusedJob !== null).length;
+    let active = this.slots.filter((slot) => slot.focusedJob !== null).length;
+    let occupied = Math.max(this.awaitingObservations.size, this.observationTransportPending) + active;
     const available = this.slots.filter((slot) => slot.status === 'running');
     for (const slot of available) {
       if (slot.focusedJob || !this.observationTransportReady ||
-          occupied >= MAX_PENDING_OBSERVATIONS || this.observationSequence >= 1_000_000) continue;
+          active >= MAX_FOCUSED_JOBS || occupied >= MAX_PENDING_OBSERVATIONS || this.observationSequence >= 1_000_000) continue;
       const origin = this.focusedFrontier.take();
       if (!origin) break;
       const sequence = ++this.observationSequence;
@@ -492,6 +502,7 @@ export class SearchClient {
       this.focusedDisplay = { id, origin, observedSpins: null };
       this.deepestFocusedOrigin = Math.max(this.deepestFocusedOrigin, origin.input.source.bagBoundary);
       occupied++;
+      active++;
       slot.worker.postMessage({ type: 'observe', runId: this.runId, observationId: id, input: origin.input } satisfies EngineCommand);
     }
     for (const slot of available) {
@@ -517,9 +528,7 @@ export class SearchClient {
         label.input?.id !== job.origin.input.id ||
         label.input.rows.length !== job.origin.input.rows.length ||
         label.input.rows.some((row, y) => row !== job.origin.input.rows[y]) ||
-        Object.keys(label.input.source).length !== Object.keys(job.origin.input.source).length ||
-        Object.entries(job.origin.input.source).some(([key, value]) =>
-          (label.input.source as unknown as Record<string, unknown>)[key] !== value)) {
+        !sameSource(label.input.source, job.origin.input.source)) {
       this.focusedFailed++;
     } else {
       this.focusedCompleted++;

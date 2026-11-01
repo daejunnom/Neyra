@@ -123,11 +123,25 @@ export interface FocusedInput {
     buildVersion: string;
     rules: 'neyra-srsplus-sonicdrop-clearonlyhold-v1';
     trust: 'client-reported';
+    /** Sampling provenance only; never a CNN feature or supervised target. */
+    selection?: FocusedSelection;
   };
 }
 
+export interface FocusedSelection {
+  policy: 'uniform-score-stratum-v1';
+  seed: number;
+  draw: number;
+  stratum: number;
+  strata: number;
+  poolSize: number;
+  evaluator: 'heuristic' | 'cnn' | 'unknown';
+  scoreMin: number | null;
+  scoreMax: number | null;
+}
+
 export interface FocusedLabelConfig {
-  observationVersion?: 2 | 3;
+  observationVersion?: 2 | 3 | 4;
   horizonBags: number;
   workBudget: number;
   beamWidth: number;
@@ -155,9 +169,9 @@ export interface FocusedWitness {
 }
 
 export interface FocusedSpinLabel {
-  schemaVersion: 2 | 3;
-  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3';
-  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3';
+  schemaVersion: 2 | 3 | 4;
+  task: 'naga-spin-observations-v2' | 'naga-next-bag-spin-v3' | 'naga-next-bag-spin-v4';
+  policy: 'neyra-fixed-bag-continuation-v2' | 'bounded-next-bag-spin-v3' | 'concentrated-next-bag-spin-v4';
   /** Prediction horizon. Actual follow-up measurement still spans >=2 bags. */
   targetHorizonBags?: 1;
   input: FocusedInput;

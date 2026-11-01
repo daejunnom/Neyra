@@ -17,11 +17,13 @@ It runs new continuation collection only when no received observations remain.
   bag depth, seeds, rules, settings and a separate retained-path trace. These
   trace scores describe the heuristic search and never become CNN targets.
 - With sharing on, selected verified boards after at least two bags seed the
-  versioned v3 collector. Each job attempts two further bags under
+  versioned v4 collector. Each job attempts two further bags under
   its fixed work budget. Input-replayed result boards enter a bounded global frontier
   ordered by depth, so origins can advance beyond the initial 2-to-4 window.
-  The existing selected worker pool performs this work; no extra worker pool is
-  created for public collection. Workers without an assigned collection job
+  At most three expensive collection jobs use the existing selected worker pool;
+  no extra public pool is created. At the deepest available depth, choose a
+  nonempty equal-width evaluation band uniformly, then a node within it. Keep
+  heuristic and CNN score units separate. Workers without an assigned collection job
   continue ordinary broad search, including while parent delivery is pending.
 - At origin bags two and three, each depth admits at most two broad roots and
   four total jobs per run, including recorded descendants. These limits survive
@@ -63,7 +65,7 @@ The studio imports full focused observations, queues them for analysis and uses
 those supplied results directly. It records CNN predictions and observed targets
 without relabeling every received board. Only an empty received queue and empty
 remote relay permit fallback collection. Fallback starts at an actual submitted
-result field or its input-reachable descendant, uses the explicit v3 collector, and
+result field or its input-reachable descendant, uses the explicit v4 collector, and
 continues from its deeper result fields. No opener/bootstrap/perturbation examples
 are automatically selected. Old seeded-order artifacts remain in historical
 exports, but are not mixed into the active fixed-policy training set.
@@ -78,7 +80,7 @@ when applying the migration. It does not manufacture sources for old examples.
 The CPU thread setting defaults to the browser's reported hardware concurrency
 and accepts a manual limit up to 128. A reusable worker pool runs received
 analysis and eligible fallback jobs in parallel. Analysis claims are batched up
-to eight and fallback claims up to the selected capacity; an atomic claim keeps
+to eight and expensive fallback claims are capped at three; an atomic claim keeps
 one job from being assigned twice. Received work retains priority. Independent
 workers retain separate engine instances and memories. Models and training data
 are installed once per worker
@@ -160,9 +162,78 @@ CUDA inference with the drain/fallback boundaries described below.
 Neither public search ordering nor its archive exports automatically invoke CNN
 evaluation. `learnedOrdering.enabled` remains false for compatibility.
 
-## Next-bag v3 observation contract
+## Concentrated v4 observations and refined targets
 
-New observations use schema 3, task `naga-next-bag-spin-v3`, policy
+New observations use schema 4, task `naga-next-bag-spin-v4`, policy
+`concentrated-next-bag-spin-v4` and `config.observationVersion=4`. This versions
+collection and preprocessing; it does **not** enlarge the CNN, change occupancy
+inputs or add output heads. The fixed policy requests two inventories, 131,072
+work units, beam 48, profile 0, seed 1, node cap 96 and at most sixteen attempts per phase.
+V4 rejects a requested third inventory instead of recording an unmeasured horizon.
+
+One observation concentrates on the supplied root and at most three first-bag
+result boards. Each phase receives the same declared quota; a separate bounded
+quota covers component-order diagnostics. Search candidates and the serialized
+32-witness store are independent, so a full wire-proof store does not end the
+remaining phase work. The bounded candidate reservoir retains distinct states
+without a top-score cutoff. Divide its current-board scores into up to four
+equal-width bands, draw a nonempty band uniformly and draw one node inside it.
+Selected nodes are removed before the next draw. Keep the actual best prefix
+separately from random proposals. Selection provenance and censoring counters
+make these finite measurements inspectable; they do not prove a global maximum.
+
+Each retained candidate has its exact oriented end field. A selected arm searches
+one **new** inventory from that end field. Its local best spin count, deepest
+prefix, queue, input paths, cleared rows, measured work and unfinished status are
+recorded in top-level `refinement.arms`. `refinement.root` records the same local
+information for the original input. `targets` remains the original root's one-bag
+value. A second-bag gain is never folded into that root target. The original
+two-bag path and zero-spin completed boundaries remain available for continuation.
+
+Only learning uses the `touching-components-origin-only-v1` diagnostic. It groups
+typed logical target cells by four-neighbor contact, then tests each component's
+internal orders against the origin while other current-bag minos are absent.
+`JO / TSZ / IL` therefore has at most `2! + 3! + 2! = 10` component orders. A larger
+component uses at most 64 spread permutations under the remaining budget. Record
+attempted/successful/interrupted orders and actual work. Their **sum is not P7 or
+construction probability**: SRS+ kicks, line removal and access can link separated
+components. This diagnostic cannot prune a physical path or become a CNN target.
+The target still comes from full-board input replay.
+
+Before fitting, turn each actually attempted root/arm into a
+`refined-next-bag-target` with policy `best-replayed-next-bag-v1`. Keep its raw
+observation ID, witness/arm reference, physical input, measurement group, exact
+collector config and allocated-work scope. An unvisited candidate creates no
+zero label. Within the same canonical board, policy and work scope, use the best
+eligible measured representative; retain all raw evidence. Alternative path
+counts are not summed, and heuristic quality or component scores never enter
+the two supervised targets. Legacy v2/v3 rows keep their original semantics.
+
+Training is a bounded replay cycle, not a whole-dataset fit for every arrival.
+The private API atomically prepares at most 16 fresh eligible train winners and
+48 random eligible historical train rows without replacement. At most 64 stable
+validation rows select between candidates and the unchanged parent; test rows
+are never sampled. First fitting needs four train rows and one validation row;
+later fitting waits for a batch of sixteen newly eligible winners. Exact selected
+IDs and order reproduce the chosen sample. The recorded seed controls training
+shuffle, not SQLite's random selection.
+
+Both preparation and completion recheck exclusions, split authority and parent
+lineage. New evidence does not silently overwrite previous proofs. If a trained
+ancestor later becomes ineligible, filtering the new batch cannot clean its
+weights: use an eligible ancestor or an honestly untrained initializer and keep
+the invalidated artifact for provenance. A v4 initializer may reuse the pinned
+v2 convolution/hidden tensors only with reset output tensors and explicit
+`targetDerivation` metadata. Actual grouped fitting is required before
+`trained=true`; no private result automatically replaces the public champion.
+
+Worker verification uses the agent's internal CPU workers and supported private
+Sites service access or managed preview. Keep owner-only access intact. The user's
+Chrome is a limited fallback only when internal access is unavailable.
+
+## Preserved next-bag v3 observation contract
+
+Historical v3 observations use schema 3, task `naga-next-bag-spin-v3`, policy
 `bounded-next-bag-spin-v3`, and `config.observationVersion=3`. The target horizon
 is explicitly `targetHorizonBags=1`. `config.horizonBags` and a model's
 `horizonBags` continue to describe the **actual measured lookahead**, two or
@@ -384,8 +455,33 @@ source/run groups. Full `labels.jsonl`, raw pages and received artifacts remain
 complete. V3 fixed-policy observations have their own `next-bag-fixed-labels.jsonl`
 file. It selects one eligible canonical representative per exact policy without
 discarding raw duplicate proofs; the receipt records those deduplicated counts.
+V4 snapshots additionally preserve refined targets, immutable replay attempts
+and the validation roster. The downloader verifies every derived target against
+its full admitted raw proof, applies exclusions before choosing best eligible
+representatives, and writes `refined-targets.jsonl` plus
+`observations-index.jsonl`. `concentrated-observations.jsonl` preserves the raw
+collection policy separately; raw v4 observations cannot be fitted directly.
 The receipt also records eligible/excluded counts and derived file hashes.
 Old snapshots without this optional exclusion list preserve their prior meaning.
+
+For a bounded offline v4 experiment with sufficient independent data:
+
+```sh
+python tools/learning/train.py \
+  --labels /path/outside/repository/refined-targets.jsonl \
+  --proofs /path/outside/repository/observations-index.jsonl \
+  --epochs 10 --threads 2 \
+  --model-output /path/outside/repository/private-v4-candidate.json \
+  --output /path/outside/repository/private-v4-training
+```
+
+The trainer samples at most 16 recent and 48 random historical train records,
+retains a stable validation roster up to 64, records exact record/proof identities
+and keeps held-out test evaluation separate from fitting and epoch selection.
+Repeated `--proofs` can supply earlier immutable evidence when resuming a
+compatible checkpoint. This explicit local invocation is not a Site replay
+lease. V4 candidates cannot bypass the private `training/prepare` and
+`training/complete` authority through the generic model-upload command.
 
 ### Reusing a retained checkpoint
 

@@ -5,10 +5,14 @@
 
 use super::{Plan, HEIGHT};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 const POLICY: &str = "neyra-exact-quiet-tt-v1";
 const CAPACITY: usize = 2048;
+const QUIET_REJECTION: u64 = 1;
+const GENERATION_MASK: u64 = (1 << 48) - 1;
 const MAX_BATCH: usize = 32;
 const MAX_WIRE_BYTES: usize = 16_384;
 const FIXED_BYTES: usize = 1 + HEIGHT * 4 + 2 + 5;
@@ -45,33 +49,66 @@ struct Batch {
 
 #[derive(Default)]
 pub(super) struct QuietTable {
-    keys: HashSet<Vec<u8>>,
-    age: VecDeque<Vec<u8>>,
-    outgoing: VecDeque<Vec<u8>>,
+    keys: HashMap<Rc<[u8]>, Entry>,
+    age: VecDeque<Rc<[u8]>>,
+    generation: u64,
+    outgoing: VecDeque<Rc<[u8]>>,
     pub hits: u64,
     pub stores: u64,
     pub imports: u64,
 }
 
+struct Entry {
+    // Bind the signature to proof kind, exact-key length and replacement age.
+    // Workers own these slots privately: this is not a racy shared-memory TT.
+    signature_xor_payload: u64,
+    payload: u64,
+}
+
+impl Entry {
+    fn matches(&self, key: &[u8], signature: u64) -> bool {
+        let payload = self.payload;
+        (self.signature_xor_payload ^ payload) == signature
+            && payload & 255 == QUIET_REJECTION
+            && ((payload >> 8) & 255) as usize == key.len()
+    }
+}
+
+fn signature(key: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl QuietTable {
     pub fn contains(&mut self, key: &[u8]) -> bool {
-        let found = self.keys.contains(key);
+        // HashMap first compares every exact context byte. Compute the XOR
+        // integrity check only on an exact-key hit, not on every failed probe.
+        let found = self.keys.get(key).is_some_and(|entry| entry.matches(key, signature(key)));
         self.hits += u64::from(found);
         found
     }
 
-    fn insert(&mut self, key: Vec<u8>) -> bool {
-        if self.keys.contains(&key) { return false; }
+    fn insert(&mut self, key: Vec<u8>) -> Option<Rc<[u8]>> {
+        if self.keys.contains_key(key.as_slice()) { return None; }
+        let signature = signature(&key);
+        // Preserve the accepted FIFO retention policy. Eviction loses reuse
+        // only; neither a hash collision nor a mismatched guard proves failure.
         if self.keys.len() == CAPACITY {
-            if let Some(old) = self.age.pop_front() { self.keys.remove(&old); }
+            if let Some(old) = self.age.pop_front() { self.keys.remove(old.as_ref()); }
         }
-        self.age.push_back(key.clone());
-        self.keys.insert(key);
-        true
+        self.generation = self.generation.wrapping_add(1) & GENERATION_MASK;
+        let payload = (self.generation << 16) | ((key.len() as u64) << 8) | QUIET_REJECTION;
+        // The table, age queue and unsent batch share one immutable allocation.
+        // postMessage still copies complete keys across independent workers.
+        let key: Rc<[u8]> = key.into();
+        self.age.push_back(Rc::clone(&key));
+        self.keys.insert(Rc::clone(&key), Entry { signature_xor_payload: signature ^ payload, payload });
+        Some(key)
     }
 
     pub fn reject(&mut self, key: Vec<u8>) {
-        if !self.insert(key.clone()) { return; }
+        let Some(key) = self.insert(key) else { return; };
         self.stores += 1;
         // Dropping an unsent entry only loses reuse. Workers never wait for a
         // peer result and can always perform their own exact verification.
@@ -84,7 +121,7 @@ impl QuietTable {
         let entries = self.outgoing.drain(..count).map(|key| {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut out = String::with_capacity(key.len() * 2);
-            for byte in key {
+            for &byte in key.iter() {
                 out.push(HEX[(byte >> 4) as usize] as char);
                 out.push(HEX[(byte & 15) as usize] as char);
             }
@@ -105,7 +142,7 @@ impl QuietTable {
         // channel is never a public certificate or a persisted remote input.
         let keys: Result<Vec<_>, _> = batch.entries.iter().map(|entry| decode(entry)).collect();
         for key in keys? {
-            if self.insert(key) { self.imports += 1; }
+            if self.insert(key).is_some() { self.imports += 1; }
         }
         Ok(())
     }

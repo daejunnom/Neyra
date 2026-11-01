@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 pub const MODEL_TASK: &str = "naga-spin-observations-v2";
 pub const NEXT_BAG_TASK: &str = "naga-next-bag-spin-v3";
+pub const REFINED_BAG_TASK: &str = "naga-next-bag-spin-v4";
 pub const MODEL_PARAMETERS: usize = 33_442;
 const MODEL_JSON: &str = include_str!("../models/naga-spin-cnn-v2.json");
 const MODEL_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -46,6 +47,16 @@ struct ObservationContract {
     work_budget: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TargetDerivation {
+    schema_version: u8,
+    policy: String,
+    source_observation_version: u8,
+    source_policy: String,
+    target_horizon_bags: u8,
+}
+
 /// Validated owner-produced weights. No search ranking or heuristic score is used.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +72,7 @@ pub struct SpinModel {
     work_budget: u32,
     label_config: Option<ObservationContract>,
     initialization: Option<Initialization>,
+    target_derivation: Option<TargetDerivation>,
     weights: HashMap<String, Vec<f32>>,
 }
 
@@ -75,8 +87,8 @@ pub struct BoardEvaluation {
     pub found_spin_likelihood: f64,
     pub observed_spins: f64,
     pub horizon_bags: u8,
-    /// V3 predicts one inventory while actual follow-up measurement spans two
-    /// or three. Absent on the unchanged historical v2 output contract.
+    /// V3/V4 predict one inventory while actual follow-up measurement spans
+    /// further bags. Absent on the unchanged historical v2 output contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_horizon_bags: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,27 +105,39 @@ impl SpinModel {
             .map_err(|e| format!("Invalid spin model JSON: {e}"))?;
         let a = &model.architecture;
         let next_bag = model.schema_version == 3 && model.task == NEXT_BAG_TASK
-            && model.target_horizon_bags == Some(1)
+            && model.target_horizon_bags == Some(1) && model.target_derivation.is_none()
             && model.label_config.as_ref().is_some_and(|config| {
                 config.observation_version == Some(3) && config.horizon_bags == model.horizon_bags
                     && config.work_budget == model.work_budget
             });
+        let refined_bag = model.schema_version == 4 && model.task == REFINED_BAG_TASK
+            && model.target_horizon_bags == Some(1) && model.horizon_bags == 2
+            && model.label_config.as_ref().is_some_and(|config| {
+                config.observation_version == Some(4) && config.horizon_bags == model.horizon_bags
+                    && config.work_budget == model.work_budget
+            })
+            && model.target_derivation.as_ref().is_some_and(|derivation| {
+                derivation.schema_version == 1 && derivation.policy == "best-replayed-next-bag-v1"
+                    && derivation.source_observation_version == 4
+                    && derivation.source_policy == "concentrated-next-bag-spin-v4"
+                    && derivation.target_horizon_bags == 1
+            });
         let legacy = model.schema_version == 2 && model.task == MODEL_TASK
-            && model.target_horizon_bags.is_none() && model.trained
+            && model.target_horizon_bags.is_none() && model.target_derivation.is_none() && model.trained
             && model.label_config.as_ref().is_none_or(|config| {
                 config.observation_version.is_none_or(|version| version == 2)
                     && config.horizon_bags == model.horizon_bags
                     && config.work_budget == model.work_budget
             });
-        let honest_initialization = next_bag && model.initialization.as_ref().is_some_and(|init| {
-            init.kind == "v2-feature-transfer-v3-head-reset"
+        let honest_initialization = (next_bag || refined_bag) && model.initialization.as_ref().is_some_and(|init| {
+            init.kind == (if refined_bag { "v2-feature-transfer-v4-head-reset" } else { "v2-feature-transfer-v3-head-reset" })
                 && !init.source_model_id.is_empty() && init.source_model_id.len() <= 128
                 && init.source_weights_sha256.len() == 64
                 && init.source_weights_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 && init.reused == ["conv1", "conv2", "conv3", "hidden"]
                 && init.reset == ["output"] && init.target_horizon_bags == 1
         });
-        if !(legacy || next_bag) || (!model.trained && !honest_initialization)
+        if !(legacy || next_bag || refined_bag) || (!model.trained && !honest_initialization)
             || model.device != "cpu" || model.model_id.is_empty() || model.model_id.len() > 128
             || !(2..=3).contains(&model.horizon_bags)
             || !(1..=4_194_304).contains(&model.work_budget)
@@ -197,10 +221,10 @@ impl SpinModel {
     pub fn evaluate_with_raw(&self, board: &Board) -> Option<([f32; 2], BoardEvaluation)> {
         let raw = self.raw_prediction(board)?;
         let logit = f64::from(raw[0]).clamp(-80.0, 80.0);
-        let next_bag = self.schema_version == 3;
+        let next_bag = self.schema_version >= 3;
         Some((raw, BoardEvaluation {
             schema_version: self.schema_version,
-            task: if next_bag { NEXT_BAG_TASK } else { MODEL_TASK }, model_id: self.model_id.clone(),
+            task: match self.schema_version { 4 => REFINED_BAG_TASK, 3 => NEXT_BAG_TASK, _ => MODEL_TASK }, model_id: self.model_id.clone(),
             found_spin_likelihood: 1.0 / (1.0 + (-logit).exp()),
             observed_spins: (f64::from(raw[1]) * 6.0).clamp(0.0,
                 f64::from(self.target_horizon_bags.unwrap_or(self.horizon_bags)) * 6.0),

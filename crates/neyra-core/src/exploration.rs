@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const EXPLORATION_POLICY: &str = "neyra-seeded-bag-continuation-v2";
 pub const NEXT_BAG_EXPLORATION_POLICY: &str = "seeded-next-bag-spin-v3";
+pub const REFINED_BAG_EXPLORATION_POLICY: &str = "seeded-concentrated-next-bag-spin-v4";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -51,9 +52,11 @@ pub fn collect_exploration_label(
     // actually used by this private observation. The distinct policy name
     // prevents a seeded observation being mistaken for a fixed-policy label.
     label.config = config;
-    label.policy = if label.schema_version == 3 {
-        NEXT_BAG_EXPLORATION_POLICY
-    } else { EXPLORATION_POLICY };
+    label.policy = match label.schema_version {
+        4 => REFINED_BAG_EXPLORATION_POLICY,
+        3 => NEXT_BAG_EXPLORATION_POLICY,
+        _ => EXPLORATION_POLICY,
+    };
     Ok(ExplorationLabel {
         label,
         exploration: ExplorationMetadata {

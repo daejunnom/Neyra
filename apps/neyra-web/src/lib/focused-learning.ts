@@ -6,6 +6,8 @@ export type FocusedOrigin = {
   parentObservationId: string | null;
   parentWitnessId: number | null;
   gain: number;
+  /** Evaluation orders sampling only. The same selector accepts future CNN scores. */
+  evaluation?: { kind: 'heuristic' | 'cnn'; score: number };
 };
 
 const sameRows = (a: number[], b: number[]) => a.length === b.length && a.every((row, y) => row === b[y]);
@@ -80,7 +82,9 @@ export function focusedRoot(field: TrainingField): FocusedOrigin | null {
     bagBoundary: source.bagBoundary, runId: source.runId, rootCandidateId: source.candidateId,
     rootBagBoundary: source.bagBoundary, rootSeed: source.seed, buildVersion: source.buildVersion,
     rules: source.rules, trust: 'client-reported'
-  } }, rootCandidateId: source.candidateId, parentObservationId: null, parentWitnessId: null, gain: 0 };
+  } }, rootCandidateId: source.candidateId, parentObservationId: null, parentWitnessId: null, gain: 0,
+  ...(Number.isFinite(field.trace?.evaluation.rawQuality) ?
+    { evaluation: { kind: 'heuristic' as const, score: field.trace!.evaluation.rawQuality! } } : {}) };
 }
 
 /** Read exact native evidence before using a result field as another origin. */
@@ -122,7 +126,7 @@ function certifiedChain(label: FocusedSpinLabel, last: FocusedWitness,
 
 export function focusedDescendants(observation: FocusedObservation): FocusedOrigin[] {
   const label = observation.label;
-  if (label.schemaVersion === 3) return reachableDescendants(observation);
+  if (label.schemaVersion === 3 || label.schemaVersion === 4) return reachableDescendants(observation);
   if (label.policy !== 'neyra-fixed-bag-continuation-v2' || label.schemaVersion !== 2 ||
       label.config.horizonBags < 2 || label.config.horizonBags > 3 || !label.certifiedWitnesses.length) return [];
   const byId = new Map(label.certifiedWitnesses.map(witness => [witness.id, witness]));
@@ -190,6 +194,7 @@ function reachableChain(label: FocusedSpinLabel, last: FocusedReachableWitness,
 /** Versioned observation shape, physical frame continuity and honest horizons.
  * This does not turn a client-reported input path into a P7 certificate. */
 export function validNextBagLabel(label: FocusedSpinLabel): boolean {
+  if (label.schemaVersion === 4) return validRefinedNextBagLabel(label);
   try {
     const witnesses = label.reachableWholeBagWitnesses, measured = label.measured;
     const config = label.config, lookahead = measured.lookahead;
@@ -257,12 +262,224 @@ export function validNextBagLabel(label: FocusedSpinLabel): boolean {
   } catch { return false; }
 }
 
+/** Local one-bag evidence carries its own queue and inputs. An arm starts from
+ * its candidate board, so its spins must never be added to the original target. */
+function refinedPrefix(value: unknown, start: number[]) {
+  if (!record(value) || value.trust !== 'input-reachable' || !integer(value.placements, 1, 7) ||
+    !integer(value.observedSpins, 0, 6) || !integer(value.deletedRows, 0, 0xffffffff) ||
+    !Array.isArray(value.frames) || value.frames.length !== value.placements ||
+    !Array.isArray(value.representativeQueue) || value.representativeQueue.length !== value.placements ||
+    !Array.isArray(value.representativeInputs) || value.representativeInputs.length !== value.placements ||
+    new Set(value.representativeQueue).size !== value.placements) return null;
+  const replay = reachableFrames(start, 0, 0, value.frames, value.targets);
+  if (!replay || replay.spins !== value.observedSpins || replay.deleted !== value.deletedRows) return null;
+  const pieces = ['I', 'J', 'L', 'O', 'S', 'T', 'Z'];
+  const inputs = new Set(['left', 'right', 'cw', 'ccw', 'half', 'sonic', 'hard_drop']);
+  for (let lock = 0; lock < value.placements; lock++) {
+    const piece = value.representativeQueue[lock], path = value.representativeInputs[lock];
+    if (!integer(piece, 0, 6) || value.frames[lock].piece !== pieces[piece] ||
+      !Array.isArray(path) || !path.length || path.length > 4096 ||
+      path.at(-1) !== 'hard_drop' || path.slice(0, -1).includes('hard_drop') ||
+      path.some(input => !inputs.has(input))) return null;
+  }
+  return { placements: value.placements, spins: value.observedSpins };
+}
+
+function refinedPhase(value: unknown, start: number[], quota: number, attempts: number,
+  retained: number) {
+  if (!record(value) || value.allocatedWork !== quota || value.censored !== true ||
+    !integer(value.workUsed, 1, quota) || !integer(value.generationWork, 1, value.workUsed) ||
+    !integer(value.verificationWork, 0, value.workUsed) ||
+    value.generationWork + value.verificationWork !== value.workUsed ||
+    !integer(value.attempts, 1, attempts) || !integer(value.deepestReachedPlacements, 0, 7) ||
+    !integer(value.completedWholeBagCandidates, 0, 0xffffffff) ||
+    !integer(value.distinctWholeBagCandidates, 0, value.completedWholeBagCandidates) ||
+    value.distinctWholeBagCandidates < retained || !record(value.targets) ||
+    !integer(value.targets.observedSpins, 0, 6) ||
+    value.targets.foundSpin !== (value.targets.observedSpins > 0) ||
+    !['generation_quota', 'attempt_limit'].includes(String(value.stopReason))) return null;
+  const target = value.targetWitness === null ? null : refinedPrefix(value.targetWitness, start);
+  const deepest = value.deepestWitness === null ? null : refinedPrefix(value.deepestWitness, start);
+  if ((value.targetWitness !== null && !target) || (value.deepestWitness !== null && !deepest) ||
+    (target?.spins ?? 0) !== value.targets.observedSpins ||
+    (deepest?.placements ?? 0) !== value.deepestReachedPlacements ||
+    (target === null) !== (deepest === null) || (target?.placements ?? 0) > (deepest?.placements ?? 0) ||
+    (deepest?.spins ?? 0) > value.targets.observedSpins ||
+    value.verificationWork !== retained * 7 + (target?.placements ?? 0) + (deepest?.placements ?? 0)) return null;
+  return { work: value.workUsed, generation: value.generationWork,
+    verification: value.verificationWork, spins: value.targets.observedSpins,
+    deepest: value.deepestReachedPlacements };
+}
+
+/** V4 is a separate collection contract. Legacy observations keep their
+ * original targets, evidence counts and horizon semantics. */
+function validRefinedNextBagLabel(label: FocusedSpinLabel): boolean {
+  try {
+    const config = label.config, measured = label.measured, refinement = label.refinement;
+    const witnesses = label.reachableWholeBagWitnesses;
+    if (label.task !== 'naga-next-bag-spin-v4' || label.policy !== 'concentrated-next-bag-spin-v4' ||
+      label.targetHorizonBags !== 1 || config.observationVersion !== 4 || config.horizonBags !== 2 ||
+      !integer(config.workBudget, 1024, 4194304) || !integer(config.beamWidth, 4, 128) ||
+      !integer(config.profile, 0, 3) || !integer(config.seed, 0, Number.MAX_SAFE_INTEGER) ||
+      !integer(config.maxNodes, 4, 256) || !integer(config.attemptsPerNode, 1, 16) ||
+      typeof config.sourceRevision !== 'string' || !config.sourceRevision ||
+      !rows(label.input.rows) || !integer(label.input.source.bagBoundary, 2, 510) ||
+      !Array.isArray(witnesses) || witnesses.length > Math.min(config.maxNodes, 32) ||
+      !Array.isArray(label.certifiedWitnesses) || label.certifiedWitnesses.length ||
+      !integer(label.targets.observedSpins, 0, 6) || label.targets.foundSpin !== (label.targets.observedSpins > 0) ||
+      !record(refinement) || refinement.schemaVersion !== 1 ||
+      refinement.policy !== 'uniform-score-band-three-arm-equal-quota-v1' ||
+      !integer(refinement.selectionSeed, 0, 0xffffffff) ||
+      typeof refinement.selectionScoreMin !== 'number' || !Number.isFinite(refinement.selectionScoreMin) ||
+      typeof refinement.selectionScoreMax !== 'number' || !Number.isFinite(refinement.selectionScoreMax) ||
+      refinement.selectionScoreMin > refinement.selectionScoreMax ||
+      !integer(refinement.selectionBandCount, 1, 4) || refinement.armLimit !== 3 ||
+      refinement.candidatePoolCapacity !== config.maxNodes ||
+      !integer(refinement.candidatePoolSize, 0, config.maxNodes) ||
+      !integer(refinement.candidatePoolDrops, 0, Number.MAX_SAFE_INTEGER) ||
+      !integer(refinement.candidateDuplicates, 0, Number.MAX_SAFE_INTEGER) ||
+      !integer(refinement.proofCapacityDrops, 0, Number.MAX_SAFE_INTEGER) ||
+      refinement.proofCapacity !== Math.min(config.maxNodes, 32) ||
+      !integer(refinement.armQuota, 1, config.workBudget) ||
+      !integer(refinement.dependencyWorkBudget, 0, config.workBudget) ||
+      refinement.dependencyWorkBudget !== Math.min(4096, Math.floor(config.workBudget / 32)) ||
+      refinement.armQuota !== Math.floor((config.workBudget - refinement.dependencyWorkBudget) / 4) ||
+      !integer(refinement.dependencyWorkUsed, 0, refinement.dependencyWorkBudget) ||
+      !Array.isArray(refinement.candidates) || refinement.candidates.length !== witnesses.length ||
+      !Array.isArray(refinement.arms) || refinement.arms.length > 3 ||
+      measured.censored !== true || !integer(measured.workUsed, 1, config.workBudget)) return false;
+    const byId = new Map(witnesses.map(witness => [witness.id, witness]));
+    if (byId.size !== witnesses.length || witnesses.some(witness => !integer(witness.id, 1, Number.MAX_SAFE_INTEGER) ||
+      !reachableChain(label, witness, byId))) return false;
+    const root = refinedPhase(refinement.root, label.input.rows, refinement.armQuota, config.attemptsPerNode,
+      witnesses.filter(witness => witness.bags === 1).length);
+    if (!root || root.spins !== label.targets.observedSpins ||
+      witnesses.some(witness => witness.bags === 1 && witness.endSpins > root.spins)) return false;
+    let totalWork = root.work + refinement.dependencyWorkUsed, generation = root.generation;
+    let verification = root.verification, dependencyWork = 0;
+    let maximum = root.spins, deepest = root.deepest;
+    const selected = new Set<number>();
+    const phaseMaxima = new Map<number, number>();
+    for (const arm of refinement.arms) {
+      if (!record(arm) || !integer(arm.candidateWitnessId, 1, Number.MAX_SAFE_INTEGER) ||
+        selected.has(arm.candidateWitnessId) || !integer(arm.selectionStrata, 1, 4) ||
+        arm.selectionStrata !== refinement.selectionBandCount ||
+        !integer(arm.selectionStratum, 0, arm.selectionStrata - 1) ||
+        !integer(arm.selectionPoolSize, 1, refinement.candidatePoolSize) ||
+        !integer(arm.selectionIndex, 0, arm.selectionPoolSize - 1)) return false;
+      const origin = byId.get(arm.candidateWitnessId);
+      if (!origin || origin.bags !== 1 || origin.parentId !== null || !rows(origin.endRows)) return false;
+      const phase = refinedPhase(arm.observation, origin.endRows, refinement.armQuota, config.attemptsPerNode,
+        witnesses.filter(witness => witness.parentId === origin.id).length);
+      if (!phase || witnesses.some(witness => witness.parentId === origin.id &&
+        witness.endSpins - origin.endSpins > phase.spins)) return false;
+      selected.add(origin.id); totalWork += phase.work; generation += phase.generation;
+      phaseMaxima.set(origin.id, phase.spins);
+      verification += phase.verification;
+      maximum = Math.max(maximum, origin.endSpins + phase.spins);
+      if (phase.deepest) deepest = Math.max(deepest, 7 + phase.deepest);
+    }
+    if (selected.size > Math.min(3, refinement.candidatePoolSize) ||
+      witnesses.some(witness => witness.bags === 2 && !selected.has(witness.parentId!))) return false;
+    const candidateIds = new Set<number>();
+    for (const candidate of refinement.candidates) {
+      if (!record(candidate) || !integer(candidate.witnessId, 1, Number.MAX_SAFE_INTEGER) ||
+        candidateIds.has(candidate.witnessId) || !byId.has(candidate.witnessId) ||
+        typeof candidate.structuralQuality !== 'number' || !Number.isFinite(candidate.structuralQuality)) return false;
+      candidateIds.add(candidate.witnessId);
+      const dependency = candidate.dependency;
+      if (dependency === null) { if (selected.has(candidate.witnessId)) return false; continue; }
+      if (!selected.has(candidate.witnessId) || !record(dependency) || dependency.schemaVersion !== 1 ||
+        dependency.policy !== 'touching-components-origin-only-v1' ||
+        dependency.connectivity !== 'orthogonal-logical-target-cells' ||
+        dependency.maxOrdersPerComponent !== 64 ||
+        !integer(dependency.workUsed, 0, refinement.dependencyWorkBudget) ||
+        !Array.isArray(dependency.components) || !dependency.components.length || dependency.components.length > 7) return false;
+      let total = 0, tested = 0, success = 0, work = 0;
+      const pieces = new Set<string>();
+      for (const component of dependency.components) {
+        if (!record(component) || !Array.isArray(component.pieces) || !component.pieces.length || component.pieces.length > 7 ||
+          new Set(component.pieces).size !== component.pieces.length ||
+          component.pieces.some(piece => typeof piece !== 'string' || !['I', 'J', 'L', 'O', 'S', 'T', 'Z'].includes(piece) || pieces.has(piece))) return false;
+        for (const piece of component.pieces) pieces.add(piece);
+        const orders = Array.from({ length: component.pieces.length }, (_, i) => i + 1).reduce((a, b) => a * b, 1);
+        if (component.totalOrders !== orders || !integer(component.testedOrders, 0, Math.min(64, orders)) ||
+          !integer(component.successfulOrders, 0, component.testedOrders) ||
+          !integer(component.interruptedOrders, 0, 1) ||
+          !integer(component.workUsed, 0, dependency.workUsed) ||
+          component.exhaustive !== (component.testedOrders === orders)) return false;
+        total += orders; tested += component.testedOrders; success += component.successfulOrders; work += component.workUsed;
+      }
+      if (pieces.size !== 7 || dependency.totalOrders !== total || dependency.testedOrders !== tested ||
+        dependency.successfulOrders !== success || dependency.workUsed !== work) return false;
+      dependencyWork += work;
+    }
+    const lookahead = measured.lookahead;
+    if (!record(lookahead) || lookahead.targetHorizonBags !== 1 || lookahead.requestedBags !== 2 ||
+      lookahead.deepestAttemptedBag !== (selected.size ? 2 : 1) ||
+      lookahead.deepestReachedPlacements !== deepest ||
+      lookahead.deepestCompletedBag !== Math.max(0, ...witnesses.map(witness => witness.bags)) ||
+      lookahead.witnessCapacity !== refinement.proofCapacity || lookahead.reachableWholeBagChains !== witnesses.length ||
+      measured.geometricWholeBagChains !== witnesses.length || measured.maxReachableObservedSpins !== maximum ||
+      measured.productiveGeometricWholeBagChains !== witnesses.filter(witness => witness.endSpins > 0).length ||
+      ['certifiedWholeBagChains', 'productiveCertifiedWholeBagChains', 'canonicalSuppliesChecked',
+        'quietPolicyRejections', 'supplyRejections', 'graphOverflows'].some(key => measured[key] !== 0) ||
+      measured.maxCertifiedObservedSpins !== null) return false;
+    const depths = measured.depths;
+    if (!Array.isArray(depths) || depths.length !== 2 || depths.some((depth, index) => {
+      const at = witnesses.filter(witness => witness.bags === index + 1);
+      return !record(depth) || depth.bags !== index + 1 || depth.geometricWholeBagChains !== at.length ||
+        depth.productiveGeometricWholeBagChains !== at.filter(witness => witness.endSpins > 0).length ||
+        depth.certifiedWholeBagChains !== 0 || depth.productiveCertifiedWholeBagChains !== 0 ||
+        depth.maxCertifiedSpins !== null || depth.maxGeometricWholeBagSpins !==
+          (at.length ? Math.max(...at.map(witness => witness.endSpins)) : null);
+    })) return false;
+    for (const [value, target] of [[label.targetWitness, true], [label.reachableWitness, false]] as const) {
+      if (value === null || value === undefined) { if (target ? root.deepest !== 0 : deepest !== 0) return false; continue; }
+      if (!record(value) || value.certifiedParentId !== null ||
+        !integer(value.completedParentBags, 0, 1) || !integer(value.additionalPlacements, 1, 7)) return false;
+      const parent = value.reachableParentId === null || value.reachableParentId === undefined
+        ? null : byId.get(value.reachableParentId as number);
+      if ((value.completedParentBags === 0) !== (parent === null) ||
+        (value.completedParentBags === 1 && (!parent || parent.bags !== 1 || !selected.has(parent.id))) ||
+        (target && value.completedParentBags !== 0)) return false;
+      const replay = reachableFrames(parent ? parent.endRows : label.input.rows,
+        parent ? parent.endSpins : 0, value.completedParentBags, value.frames, value.targets);
+      if (!replay || !Array.isArray(value.frames) || value.frames.length !== value.additionalPlacements ||
+        replay.spins > (parent ? parent.endSpins + phaseMaxima.get(parent.id)! : root.spins) ||
+        replay.spins !== value.observedSpins || (target ? value.observedSpins !== root.spins :
+          value.completedParentBags * 7 + value.additionalPlacements !== deepest)) return false;
+    }
+    const compensation = lookahead.bestTwoBagPath;
+    if (compensation === null) { if (witnesses.some(witness => witness.bags === 2)) return false; }
+    else {
+      if (!record(compensation)) return false;
+      const witness = byId.get(compensation.witnessId as number);
+      if (witness?.bags !== 2 || compensation.firstBagSpins !== witness.startSpins ||
+        compensation.secondBagSpins !== witness.endSpins - witness.startSpins || compensation.totalSpins !== witness.endSpins) return false;
+    }
+    return dependencyWork === refinement.dependencyWorkUsed && totalWork === measured.workUsed &&
+      generation === measured.generationWork && verification === measured.verificationWork &&
+      dependencyWork === measured.dependencyWork;
+  } catch { return false; }
+}
+
 function reachableDescendants(observation: FocusedObservation): FocusedOrigin[] {
   const label = observation.label, witnesses = label.reachableWholeBagWitnesses;
   if (!validNextBagLabel(label) || !witnesses) return [];
   const byId = new Map(witnesses.map(witness => [witness.id, witness]));
   if (byId.size !== witnesses.length) return [];
   const result: FocusedOrigin[] = [];
+  const refinement = record(label.refinement) ? label.refinement : null;
+  const qualities = new Map<number, number>();
+  if (refinement && Array.isArray(refinement.candidates)) {
+    for (const candidate of refinement.candidates) {
+      if (record(candidate) && typeof candidate.witnessId === 'number' &&
+        typeof candidate.structuralQuality === 'number' && Number.isFinite(candidate.structuralQuality)) {
+        qualities.set(candidate.witnessId, candidate.structuralQuality);
+      }
+    }
+  }
   for (const witness of witnesses) {
     const depth = label.input.source.bagBoundary + witness.bags;
     if (depth > 510 || !rows(witness.endRows) || !reachableChain(label, witness, byId)) continue;
@@ -271,7 +488,9 @@ function reachableDescendants(observation: FocusedObservation): FocusedOrigin[] 
       source: { ...label.input.source, bagBoundary: depth,
         reference: `neyra:observation:${observation.id}/reachable:${witness.id}` }
     }, rootCandidateId: observation.rootCandidateId, parentObservationId: observation.id,
-    parentWitnessId: witness.id, gain: witness.endSpins });
+    parentWitnessId: witness.id, gain: witness.endSpins,
+    ...(qualities.has(witness.id) ? { evaluation: { kind: 'heuristic' as const,
+      score: qualities.get(witness.id)! } } : {}) });
   }
   return result.sort(compareOrigins);
 }
@@ -291,6 +510,23 @@ export class FocusedFrontier {
   private seen = new Set<string>();
   private shallowJobs = new Map<number, number>();
   private shallowRoots = new Map<number, number>();
+  private seed = 1;
+  private randomState = 1;
+  private draws = 0;
+
+  setSeed(seed: number) {
+    this.seed = (seed >>> 0) || 1;
+    this.randomState = this.seed;
+    this.draws = 0;
+  }
+
+  private random() {
+    let value = this.randomState;
+    value ^= value << 13; value ^= value >>> 17; value ^= value << 5;
+    this.randomState = value >>> 0;
+    this.draws++;
+    return this.randomState / 0x100000000;
+  }
 
   get length() { return this.pending.length; }
 
@@ -305,9 +541,13 @@ export class FocusedFrontier {
     }
     this.pendingByKey.set(key, origin);
     this.pending.push(origin);
-    this.pending.sort(compareOrigins);
     if (this.pending.length > 128) {
-      const removed = this.pending.pop()!;
+      // Keep deep coverage without using a top-score cut to erase low-quality
+      // strata before they can be measured. Replacement within a depth is random.
+      const shallowest = Math.min(...this.pending.map(item => item.input.source.bagBoundary));
+      const replaceable = this.pending.filter(item => item.input.source.bagBoundary === shallowest);
+      const removed = replaceable[Math.floor(this.random() * replaceable.length)];
+      this.pending.splice(this.pending.indexOf(removed), 1);
       this.pendingByKey.delete(focusedBoardKey(removed.input.rows));
     }
   }
@@ -320,12 +560,43 @@ export class FocusedFrontier {
   }
 
   take() {
-    const origin = this.pending.shift();
-    if (!origin) return null;
+    if (!this.pending.length) return null;
+    const depth = Math.max(...this.pending.map(item => item.input.source.bagBoundary));
+    const pool = this.pending.filter(item => item.input.source.bagBoundary === depth);
+    // Scores from different evaluators have different units. Select a homogeneous
+    // score pool before drawing a quality stratum, then a node within that stratum.
+    const kind = (item: FocusedOrigin) => item.evaluation && Number.isFinite(item.evaluation.score)
+      ? item.evaluation.kind : 'unknown';
+    const kinds = [...new Set(pool.map(kind))].sort();
+    const evaluator = kinds[Math.floor(this.random() * kinds.length)];
+    const ranked = pool.filter(item => kind(item) === evaluator).sort((a, b) =>
+      (a.evaluation?.score ?? 0) - (b.evaluation?.score ?? 0) || a.input.id.localeCompare(b.input.id));
+    // Equal-width score bands give sparse quality ranges their own chance.
+    // Equal-population quantiles would reduce this to uniform node sampling.
+    const low = ranked[0].evaluation?.score ?? 0, high = ranked.at(-1)!.evaluation?.score ?? 0;
+    const bands: FocusedOrigin[][] = [[], [], [], []];
+    for (const item of ranked) {
+      const span = high - low;
+      const fraction = evaluator === 'unknown' || high <= low ? 0 : Number.isFinite(span)
+        ? (item.evaluation!.score - low) / span
+        : (item.evaluation!.score / 2 - low / 2) / (high / 2 - low / 2);
+      const band = evaluator === 'unknown' || high <= low ? 0 :
+        Math.min(3, Math.floor(fraction * 4));
+      bands[band].push(item);
+    }
+    const populated = bands.filter(band => band.length > 0), strata = populated.length;
+    const stratum = Math.floor(this.random() * strata), band = populated[stratum];
+    const selected = band[Math.floor(this.random() * band.length)];
+    const origin: FocusedOrigin = { ...selected, input: { ...selected.input, source: {
+      ...selected.input.source, selection: { policy: 'uniform-score-stratum-v1', seed: this.seed,
+        draw: this.draws, stratum, strata, poolSize: ranked.length, evaluator,
+        scoreMin: evaluator === 'unknown' ? null : band[0].evaluation!.score,
+        scoreMax: evaluator === 'unknown' ? null : band.at(-1)!.evaluation!.score }
+    } } };
+    this.pending.splice(this.pending.indexOf(selected), 1);
     const key = focusedBoardKey(origin.input.rows);
     this.pendingByKey.delete(key);
     this.seen.add(key);
-    const depth = origin.input.source.bagBoundary;
     if (depth === 2 || depth === 3) {
       this.shallowJobs.set(depth, (this.shallowJobs.get(depth) ?? 0) + 1);
       if (origin.parentObservationId === null) this.shallowRoots.set(depth, (this.shallowRoots.get(depth) ?? 0) + 1);

@@ -48,6 +48,10 @@
   released two-bag v2 checkpoint. Explicit v3 initialization may reuse its
   convolution/hidden features only with a reset output head and recorded source
   provenance; it must remain marked untrained until actual v3-only fitting.
+  The v4 refinement contract keeps the same occupancy tensor, architecture and
+  two one-bag heads. Give it distinct policy/derivation metadata and a reset
+  output head; never reinterpret v2/v3 targets or add heuristic/dependency values
+  as features or labels. Preserve raw evidence and exact source/weight hashes.
   Keep history, inventory, forecasts and opener identity out of inference inputs.
   Inspect actual accessible source before using another engine's board features;
   never infer closed-source evaluation or copy private reference implementation.
@@ -59,7 +63,7 @@
   P7/quiet-safe chains. Limited search is censored: a miss is not impossibility,
   and the discovery head is not construction probability. Split whole opener
   families and search runs; isolate identical and reflected boards across splits.
-  New v3 labels predict only the first new bag, with targetHorizonBags=1, while
+  V3 labels predict only the first new bag, with targetHorizonBags=1, while
   the collector still attempts at least two new inventories. Retain the actual
   reached depth, zero-spin endpoints, physical input witnesses and censored
   capacity/work limits. Do not apply peer score, completion pace, sibling
@@ -68,6 +72,23 @@
   Commit reusable collection/training/storage tools and the selected runtime
   model, but keep datasets, new tests, one-time experiments and result reports
   outside this repository. Record dataset, labeling-source and model hashes.
+- New v4 learning collection concentrates on a supplied root and at most three
+  selected next-bag result boards under declared equal phase quotas. Keep the
+  candidate search pool independent of serialized proof capacity. Preserve a
+  randomized quality spectrum instead of trimming all low-score proposals;
+  uniformly select a nonempty equal-width score band, then a random node in it.
+  Do not mix score units from heuristic and CNN evaluators. Keep actual best
+  prefixes separately, preserve zero-spin reachable boundaries and record
+  selection seeds, consumed work, capacity losses and unfinished phases.
+  V4 currently measures exactly two inventories and predicts one; it must reject
+  a requested third inventory rather than claiming it was measured.
+- Only the v4 learning path may use touching-component order approximations.
+  Partition typed logical target cells by orthogonal contact, then test each
+  component's internal orders against the origin with other current-bag minos
+  absent. Sum the component counters; never multiply them into supply odds.
+  SRS+ can create dependencies between disconnected components. This diagnostic
+  cannot prune a physical path or certify P7/quiet-safe construction. Supervised
+  targets still need actual full-board input replay.
 - The developer learning Site stays owner-private with sharing and learning on,
   without mode selectors. Analyze received fixed-policy observations first;
   do not rerun the collector to consume an already supplied observation. Only
@@ -84,9 +105,10 @@
 - Capture public search traces only after explicit consent, using existing
   retained frames and worker totals. Do not retrospectively upload old traces.
   With consent on, use a verified boundary of at least two bags as an origin
-  for the v3 fixed-policy collector, then prioritize deeper replayed result
+  for the v4 concentrated collector, then prioritize deeper replayed result
   fields, including zero-spin boundaries. Existing retained boards may seed new jobs.
-  Use the selected worker count, a bounded global frontier, and parent delivery
+  Use the selected worker pool, at most three active expensive collection jobs,
+  a bounded global frontier, and parent delivery
   acknowledgement before dispatching descendants. Keep queued observations
   under backpressure rather than evicting parents. With consent off, discard
   new collector outputs, stop new collection/upload and resume ordinary search.
@@ -122,6 +144,26 @@
   enter fixed-policy collection, but stochastic labels must not silently mix
   with the fixed-policy training set. Pin the served champion independently of
   newer private candidates; training never promotes a checkpoint automatically.
+- V4 preprocessing produces one local best-replayed next-bag target per actually
+  attempted root/arm. An arm's input is its own exact result board; its next-bag
+  gain is not added to the original root label. Keep work scope, raw observation,
+  witness and measurement-group references. Choose the strongest eligible
+  representative only within the same canonical board, policy and work scope.
+  V3's earliest-eligible representative rule remains its historical contract.
+  Private training uses bounded random replay, not a full-dataset fit for each
+  arrival: at most 16 fresh and 48 eligible historical train rows, plus a stable
+  validation roster of at most 64. Test rows never enter fitting or selection.
+  Record the exact selected IDs/order and distinguish random database selection
+  from the recorded training shuffle seed. Atomically prepare and complete each
+  attempt, rechecking parent lineage, exclusions and eligibility at both ends.
+  Removing a bad row from today's batch does not remove its influence from a
+  trained parent: invalidate that lineage and use an eligible ancestor or an
+  honestly untrained initializer. Preserve immutable historical memberships.
+- Verify workers in the agent's internal environment. Prefer the supported
+  private Sites service-access path and managed internal preview; never weaken
+  owner privacy for testing. Use the user's Chrome only as a limited fallback
+  after internal access has proved unavailable. Do not put service credentials
+  in browser code, command arguments, repository files or logs.
 - Retire old opener/bootstrap/perturbed examples from the active corpus. Keep
   immutable historical proofs/exports only for previous model provenance.
   Use corpus-qualified canonical board identity so old labels cannot silently

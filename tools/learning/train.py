@@ -13,13 +13,15 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import time
 
 import torch
 from torch import nn
-from spin_contract import (ARCHITECTURE, MAX_FILE_BYTES, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, TASK, NEXT_BAG_TASK, WEIGHTS_HASH_ALGORITHM,
+from spin_contract import (ARCHITECTURE, MAX_FILE_BYTES, MAX_RECORD_BYTES, POLICY, NEXT_BAG_POLICY, TASK, NEXT_BAG_TASK,
+                           REFINED_TASK, REFINED_TARGET_POLICY, TARGET_DERIVATION, WEIGHTS_HASH_ALGORITHM,
                            canonical_rows, read_jsonl, reject_constant, unique_keys,
-                           validate_model, weights_hash)
+                           validate_model, weights_hash, read_proofs, refined_selection_key, validate_refined_evidence)
 
 HEIGHT, WIDTH = 24, 10
 
@@ -47,14 +49,39 @@ def encode(rows):
     return [[[float(bool(rows[y] & (1 << x))) for x in range(WIDTH)] for y in range(HEIGHT)]]
 
 
-def read_data(path):
-    records = read_jsonl(path)
+def record_model_version(record):
+    return 4 if record.get("kind") == "refined-next-bag-target" else record["schemaVersion"]
+
+
+def tensor_data(records, *, require_test=True):
+    data = {}
+    for split in ("train", "validation", "test"):
+        chosen = [r for r in records if r["input"]["source"]["split"] == split]
+        if not chosen:
+            if split == "test" and not require_test:
+                continue
+            raise ValueError(f"Missing independent {split} split")
+        xs = [encode(r["input"]["rows"]) for r in chosen]
+        ys = [[float(r["targets"]["foundSpin"]), r["targets"]["observedSpins"] / 6.0] for r in chosen]
+        data[split] = (torch.tensor(xs, dtype=torch.float32, device="cpu"),
+                       torch.tensor(ys, dtype=torch.float32, device="cpu"), chosen)
+    return data
+
+
+def read_data(path, proofs=None, *, tensorize=True):
+    records = read_jsonl(path, kind="training")
     if not records:
         raise ValueError("No freshly measured spin labels")
-    groups, families, measurement_groups, boards, protocols = {}, {}, {}, set(), set()
+    groups, families, measurement_groups, boards, selections, protocols = {}, {}, {}, {}, set(), set()
     for record in records:
-        if record["policy"] not in {POLICY, NEXT_BAG_POLICY}:
-            raise ValueError("Exploration observations are excluded from fixed-policy fitting; measure their certified descendant boards with the fixed collector first")
+        refined = record_model_version(record) == 4 and record.get("kind") == "refined-next-bag-target"
+        if record["policy"] not in {POLICY, NEXT_BAG_POLICY, REFINED_TARGET_POLICY}:
+            raise ValueError("Raw v4 and exploration observations cannot be fitted directly; use measured, evidence-linked derived targets")
+        if refined:
+            identity = record["evidence"]["observationId"]
+            if proofs is None or identity not in proofs:
+                raise ValueError("V4 fitting requires --proofs with every selected target's complete original observation")
+            validate_refined_evidence(record, proofs[identity])
         source = record["input"]["source"]
         split = source.get("split")
         if split not in ("train", "validation", "test"):
@@ -62,37 +89,68 @@ def read_data(path):
         group = source.get("group", source["family"])
         if groups.setdefault(group, split) != split or families.setdefault(source["family"], split) != split:
             raise ValueError("A source family/run leaks across splits")
-        measured_group = record.get("measurementGroup", group)
+        measured_group = record["evidence"]["measurementGroup"] if refined else record.get("measurementGroup", group)
         if measurement_groups.setdefault(measured_group, split) != split:
             raise ValueError("A measurement run leaks across splits")
         board = canonical_rows(record["input"]["rows"])
-        if board in boards:
+        selection = refined_selection_key(record) if refined else board
+        if selection in selections:
             raise ValueError("Duplicate or reflected board; deduplicate before fitting")
-        boards.add(board)
+        selections.add(selection)
+        if boards.setdefault(board, split) != split:
+            raise ValueError("A reflected board leaks across splits or measurement scopes")
         protocols.add(json.dumps([record["schemaVersion"], record["task"], record["policy"], record["config"]],
                                  sort_keys=True, separators=(",", ":")))
     if len(protocols) != 1:
         raise ValueError("One model must use one fixed labeling policy")
-    data = {}
-    for split in ("train", "validation", "test"):
-        chosen = [r for r in records if r["input"]["source"]["split"] == split]
-        if not chosen:
-            raise ValueError(f"Missing independent {split} split")
-        xs = [encode(r["input"]["rows"]) for r in chosen]
-        ys = [[float(r["targets"]["foundSpin"]), r["targets"]["observedSpins"] / 6.0] for r in chosen]
-        data[split] = (torch.tensor(xs, dtype=torch.float32, device="cpu"),
-                       torch.tensor(ys, dtype=torch.float32, device="cpu"), chosen)
-    return records, data
+    return records, tensor_data(records, require_test=record_model_version(records[0]) != 4) if tensorize else None
 
 
-def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, records, history_paths=()):
+def bounded_refined_replay(records, seed, previous_selection=None):
+    """One explicit offline fitting invocation; never claim a Site replay lease.
+
+    Recent records are up to 16 items in the supplied immutable export order;
+    up to 48 other train records are sampled without replacement. Validation
+    membership uses a stable canonical/scope order, never training randomness.
+    The exact draw, not an assumed SQLite RNG equivalence, is the provenance.
+    """
+    train = [r for r in records if r["input"]["source"]["split"] == "train"]
+    if len(train) < 4:
+        raise ValueError("V4 replay requires at least four eligible train targets and an independent validation split")
+    fresh = train[-16:]
+    replay_pool = train[:-len(fresh)] if fresh else []
+    replay = random.Random(seed).sample(replay_pool, min(48, len(replay_pool)))
+    key_text = lambda r: json.dumps(refined_selection_key(r), separators=(",", ":"))
+    validation_pool = {key_text(r): r for r in records if r["input"]["source"]["split"] == "validation"}
+    roster = list((previous_selection or {}).get("validationKeys", []))
+    if (len(roster) > 64 or len(set(roster)) != len(roster) or any(not isinstance(key, str) for key in roster)):
+        raise ValueError("The retained offline validation roster is invalid")
+    # Retain prior membership when a better eligible measurement replaces an ID.
+    roster = [key for key in roster if key in validation_pool]
+    for key in sorted(validation_pool):
+        if key not in roster and len(roster) < 64:
+            roster.append(key)
+    validation = [validation_pool[key] for key in roster]
+    test = sorted((r for r in records if r["input"]["source"]["split"] == "test"), key=refined_selection_key)[:64]
+    selected = fresh + replay + validation + test
+    selection = {"schemaVersion": 1, "sampler": "python-seeded-without-replacement-v1", "seed": seed,
+                 "recentRecordIds": [r["id"] for r in fresh], "replayRecordIds": [r["id"] for r in replay],
+                 "validationRecordIds": [r["id"] for r in validation], "testRecordIds": [r["id"] for r in test],
+                 "validationKeys": roster,
+                 "orderedRecordIds": [r["id"] for r in selected],
+                 "observationIds": sorted({r["evidence"]["observationId"] for r in selected}),
+                 "scope": "Explicit bounded offline draw, not a durable Site prepare/complete replay attempt. Test rows receive no gradients or epoch selection."}
+    return tensor_data(selected, require_test=False), selection
+
+
+def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, records, history_paths=(), proofs=None):
     """Warm-start only with demonstrated compatible policy and split history."""
     with checkpoint_path.open("rb") as stream:
         raw = stream.read(MAX_RECORD_BYTES + 1)
     if len(raw) > MAX_RECORD_BYTES:
         raise ValueError("Initial checkpoint exceeds the bounded record limit")
     checkpoint = validate_model(json.loads(raw, object_pairs_hook=unique_keys, parse_constant=reject_constant))
-    if checkpoint["schemaVersion"] != records[0]["schemaVersion"] or checkpoint["task"] != records[0]["task"]:
+    if checkpoint["schemaVersion"] != record_model_version(records[0]) or checkpoint["task"] != records[0]["task"]:
         raise ValueError("Warm-start cannot reinterpret a retained checkpoint's prediction task")
     if checkpoint.get("datasetHashAlgorithm", "sha256-raw-jsonl-v1") != "sha256-raw-jsonl-v1":
         raise ValueError("Offline warm-start currently requires raw-JSONL training artifacts. Browser canonical projected-record hashes are distinct; retain the exported datasetSelection history and use the private Site to continue that candidate.")
@@ -107,7 +165,7 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest not in provided:
             provided[digest] = path
-            historical, _ = read_data(path)
+            historical, _ = read_data(path, proofs, tensorize=False)
             previous.extend(historical)
     if set(provided) != set(lineage):
         raise ValueError("Provide every checkpoint trainingDatasetLineage artifact using --initial-labels and --history-labels")
@@ -122,7 +180,7 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
         board = canonical_rows(record["input"]["rows"])
         if (families.setdefault(source["family"], split) != split
                 or groups.setdefault(group, split) != split or boards.setdefault(board, split) != split
-                or measurement_groups.setdefault(record.get("measurementGroup", group), split) != split):
+                or measurement_groups.setdefault(record.get("evidence", {}).get("measurementGroup", record.get("measurementGroup", group)), split) != split):
             raise ValueError("Warm-start cannot move a historical family, group or reflected board between splits")
     state = {key: torch.tensor(checkpoint["weights"][key], dtype=torch.float32, device="cpu").reshape(value.shape)
              for key, value in model.state_dict().items()}
@@ -130,6 +188,7 @@ def initialize_from_checkpoint(model, checkpoint_path, original_labels_path, rec
     return {"modelId": checkpoint["modelId"], "weightsSha256": checkpoint["weightsSha256"],
             "datasetSha256": checkpoint["datasetSha256"],
             "trainingDatasetLineage": lineage,
+            **({"datasetSelection": checkpoint.get("datasetSelection", {})} if checkpoint["schemaVersion"] == 4 else {}),
             "splitAudit": "Historical and new family/group/board assignments agree; only train rows receive gradients."}
 
 
@@ -286,6 +345,8 @@ class EpochRuntime:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", type=Path, required=True)
+    p.add_argument("--proofs", type=Path, action="append", default=[],
+                   help="V4 only: full immutable observations-index.jsonl exports; repeat for historical proofs")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--model-output", type=Path, required=True)
     p.add_argument("--epochs", type=int, default=300)
@@ -308,17 +369,32 @@ def main():
         p.error("--initial-model and --initial-labels must be supplied together")
     if a.history_labels and not a.initial_model:
         p.error("--history-labels requires --initial-model")
-    protected = [a.labels, a.initial_model, a.initial_labels, *a.history_labels]
+    protected = [a.labels, a.initial_model, a.initial_labels, *a.history_labels, *a.proofs]
     if any(path is not None and a.model_output.resolve() == path.resolve() for path in protected):
         p.error("The output checkpoint must not replace any input artifact")
     torch.set_num_threads(a.threads)
     torch.set_num_interop_threads(1)
     torch.random.default_generator.manual_seed(a.seed)
     torch.use_deterministic_algorithms(True)
-    records, data = read_data(a.labels)
+    if sum(path.stat().st_size for path in a.proofs) > MAX_FILE_BYTES:
+        p.error("Combined proof files exceed the bounded input limit")
+    proofs = {}
+    for path in a.proofs:
+        for identity, label in read_proofs(path).items():
+            if identity in proofs and proofs[identity] != label:
+                raise ValueError("An immutable observation identity has conflicting proofs")
+            proofs[identity] = label
+    records, _ = read_data(a.labels, proofs, tensorize=False)
     model = BoardCNN().to(device="cpu")
     assert sum(x.numel() for x in model.parameters()) == ARCHITECTURE["parameters"]
-    initial = initialize_from_checkpoint(model, a.initial_model, a.initial_labels, records, a.history_labels) if a.initial_model else None
+    initial = initialize_from_checkpoint(model, a.initial_model, a.initial_labels, records, a.history_labels, proofs) if a.initial_model else None
+    refined = record_model_version(records[0]) == 4
+    replay_selection = None
+    if refined:
+        data, replay_selection = bounded_refined_replay(records, a.seed, initial.get("datasetSelection") if initial else None)
+        replay_selection["proofFiles"] = [{"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size} for path in a.proofs]
+    else:
+        data = tensor_data(records)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
     compute = EpochRuntime(model, optimizer, gpu=a.gpu, control=a.gpu_control)
     best_loss, best_epoch, best_state, history = math.inf, 0, None, []
@@ -346,7 +422,7 @@ def main():
     model.load_state_dict(best_state)
     model.eval()
     config = records[0]["config"]
-    next_bag = records[0]["schemaVersion"] == 3
+    next_bag = refined or records[0]["schemaVersion"] == 3
     horizon = 1 if next_bag else config["horizonBags"]
     evaluation, predictions = {}, []
     mean = train_y.mean(0)
@@ -359,16 +435,17 @@ def main():
                                  "trainingMeanBaseline": metrics(baseline.expand_as(y), y, horizon)}
             for r, output, target in zip(chosen, pred.tolist(), y.tolist()):
                 predictions.append({"id": r["input"]["id"], "split": split,
+                                    **({"recordId": r["id"], "observationId": r["evidence"]["observationId"]} if refined else {}),
                                     "group": r["input"]["source"].get("group", r["input"]["source"]["family"]),
                                     "rows": r["input"]["rows"], "rawOutput": output, "target": target})
     weights = {key: value.detach().cpu().flatten().tolist() for key, value in model.state_dict().items()}
     weight_hash = weights_hash(weights)
     dataset_hash = hashlib.sha256(a.labels.read_bytes()).hexdigest()
     runtime = {
-        "schemaVersion": 3 if next_bag else 2, "task": NEXT_BAG_TASK if next_bag else TASK,
+        "schemaVersion": 4 if refined else 3 if next_bag else 2, "task": REFINED_TASK if refined else NEXT_BAG_TASK if next_bag else TASK,
         # A retained epoch-zero checkpoint can be evaluated against a new
         # dataset without overwriting the original immutable model artifact.
-        "modelId": ("naga-next-bag-v3-" if next_bag else "naga-spin-v2-") + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
+        "modelId": ("naga-next-bag-v4-" if refined else "naga-next-bag-v3-" if next_bag else "naga-spin-v2-") + weight_hash[:12] + ("-" + dataset_hash[:12] if initial else ""),
         # The artifact device describes portable inference, not the training host.
         "architecture": ARCHITECTURE, "trained": True, "device": "cpu",
         "datasetSha256": dataset_hash, "weightsSha256": weight_hash,
@@ -382,6 +459,9 @@ def main():
     }
     if next_bag:
         runtime["targetHorizonBags"] = 1
+    if refined:
+        runtime["targetDerivation"] = TARGET_DERIVATION
+        runtime["datasetSelection"] = replay_selection
     if initial:
         runtime["trainingDatasetLineage"] = sorted(set(initial["trainingDatasetLineage"]) | {dataset_hash})
     validate_model(runtime)
@@ -397,6 +477,7 @@ def main():
         "torch": torch.__version__, "seed": a.seed, "threads": a.threads,
         "initialization": "Compatible same-task checkpoint; policy and historical splits audited" if initial else "Fresh random weights; no legacy checkpoint or score supervision",
         "initialCheckpoint": initial,
+        **({"datasetSelection": replay_selection, "targetDerivation": TARGET_DERIVATION} if refined else {}),
         "epochsRun": len(history), "selectedEpoch": best_epoch,
         "selection": "Validation loss only; held-out test evaluated once after fitting.",
         "seconds": time.monotonic() - started, "optimizer": "AdamW",
@@ -420,6 +501,9 @@ def main():
     }
     if next_bag:
         report["targetHorizonBags"] = 1
+    if refined:
+        report["targetDerivation"] = TARGET_DERIVATION
+        report["datasetSelection"] = replay_selection
     (a.output / "training-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     (a.output / "predictions.json").write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n")
     (a.output / "model-card.json").write_text(json.dumps({

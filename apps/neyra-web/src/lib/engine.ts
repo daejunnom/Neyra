@@ -18,6 +18,7 @@ type WorkerSlot = {
 };
 type OwnedCandidate = { slot: WorkerSlot; candidate: Candidate };
 type ArchivedCandidate = OwnedCandidate & { data: unknown };
+const NEW_DEPLOYMENT_NOTICE = '새 버전이 배포되어 현재 페이지가 이전 버전이에요. 필요한 결과가 있다면 먼저 저장한 뒤 페이지를 새로고침하고 탐색을 다시 시작해 주세요.';
 
 export const MAX_WORKERS = 128;
 
@@ -156,6 +157,9 @@ export class SearchClient {
   private focusedDisplay: { id: string; origin: FocusedOrigin; observedSpins: number | null } | null = null;
   private observationTransportPending = 0;
   private observationTransportReady = true;
+  private startupVersionCheck: Promise<boolean> | null = null;
+  private startupCheckAbort: AbortController | null = null;
+  private startupVersionMismatch = false;
 
   constructor(private receive: (event: EngineEvent) => void,
     private contribute: (field: TrainingContribution) => void = () => {},
@@ -261,6 +265,7 @@ export class SearchClient {
       this.receive({ type: 'status', runId, status: 'loading' });
       if (creationFailure) this.receive({ type: 'warning', runId, message: `일부 탐색기를 시작하지 못해 ${this.slots.length}개로 진행합니다.` });
     }
+    if (creationFailure) this.checkStartupVersion();
   }
 
   pause() {
@@ -289,6 +294,8 @@ export class SearchClient {
 
   cancel() {
     this.intent = 'cancelled';
+    this.startupCheckAbort?.abort();
+    this.startupCheckAbort = null;
     this.focusedFrontier.clear(false);
     this.awaitingObservations.clear();
     for (const slot of this.slots) slot.focusedJob = null;
@@ -531,6 +538,10 @@ export class SearchClient {
   dispose() {
     clearTimeout(this.progressTimer);
     this.progressTimer = undefined;
+    this.startupCheckAbort?.abort();
+    this.startupCheckAbort = null;
+    this.startupVersionCheck = null;
+    this.startupVersionMismatch = false;
     for (const slot of this.slots) slot.worker.terminate();
     this.slots = [];
     this.pendingExports.clear();
@@ -617,9 +628,12 @@ export class SearchClient {
 
   private failed(slot: WorkerSlot, message: string) {
     if (slot.status === 'failed') return;
+    const startupFailure = slot.snapshot === null;
     slot.status = 'failed';
     if (slot.focusedJob) this.focusedFailed++;
     slot.focusedJob = null;
+    slot.worker.onmessage = null;
+    slot.worker.onerror = null;
     slot.worker.terminate();
     for (const [requestId, request] of this.pendingExports) {
       if (request.owner === slot.id) {
@@ -630,13 +644,44 @@ export class SearchClient {
     }
     if (this.slots.every((candidate) => candidate.status === 'failed')) {
       this.status = 'failed';
-      this.receive({ type: 'error', runId: this.runId, message });
+      this.receive({ type: 'error', runId: this.runId,
+        message: startupFailure && this.startupVersionMismatch ? NEW_DEPLOYMENT_NOTICE : message });
     } else {
-      this.receive({ type: 'warning', runId: this.runId, message: '한 탐색기가 중단되어 남은 탐색기로 계속 진행합니다.' });
+      this.receive({ type: 'warning', runId: this.runId,
+        message: startupFailure && this.startupVersionMismatch ? NEW_DEPLOYMENT_NOTICE : '한 탐색기가 중단되어 남은 탐색기로 계속 진행합니다.' });
       this.publishStatus();
     }
     this.publishProgress(true);
     this.scheduleFocused();
+    if (startupFailure) this.checkStartupVersion();
+  }
+
+  private checkStartupVersion() {
+    if (this.startupVersionCheck || this.intent === 'cancelled') return;
+    const runId = this.runId;
+    const controller = new AbortController();
+    this.startupCheckAbort = controller;
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    // An old open page can request a worker removed by a new Pages deployment.
+    // Check only after startup failure, once per run; normal search sends no check.
+    const check = (async () => {
+      try {
+        const response = await fetch(`${base}/_app/version.json`, { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) return false;
+        const deployed = await response.json() as { version?: unknown } | null;
+        return typeof deployed?.version === 'string' && deployed.version.trim().length > 0 && deployed.version !== version;
+      } catch { return false; }
+      finally {
+        clearTimeout(timeout);
+        if (this.startupCheckAbort === controller) this.startupCheckAbort = null;
+      }
+    })();
+    this.startupVersionCheck = check;
+    void check.then((changed) => {
+      if (!changed || this.runId !== runId || this.intent === 'cancelled' || this.startupVersionCheck !== check) return;
+      this.startupVersionMismatch = true;
+      this.receive({ type: this.slots.every((slot) => slot.status === 'failed') ? 'error' : 'warning', runId, message: NEW_DEPLOYMENT_NOTICE });
+    });
   }
 
   private publishStatus() {

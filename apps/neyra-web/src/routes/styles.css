@@ -66,6 +66,7 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .goal-summary span{color:#829b7e;font-size:10px}
 .goal-summary strong{font-size:19px;font-weight:550;letter-spacing:-.7px;font-variant-numeric:tabular-nums}
 .goal-summary small{font-size:10px;font-weight:400;letter-spacing:0;color:#94ac88}
+.bag-floor-summary{font-size:9px;color:#8da580;line-height:1.5;margin:-7px 0 13px}
 .run-actions{display:flex;gap:8px}
 .button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:41px;padding:0 18px;border:1px solid transparent;border-radius:6px;font-size:12px;font-weight:650;letter-spacing:-.15px}
 .button.primary{background:#b5eb89;color:#1e361b;border-color:#b5eb89}
@@ -92,6 +93,8 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .best-card{display:block;width:100%;border:1px solid #648d47;border-radius:7px;background:#a5d7750b;margin-top:15px;text-align:left;padding:14px 15px;color:#deefcc}
 .best-card:hover{background:#a5d77515;border-color:#8db465}
 .best-card>div{display:flex;align-items:center;justify-content:space-between}
+.efficiency-caption{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:9px;color:#a3bc90;margin-bottom:6px}
+.efficiency-caption small{font-size:9px;color:#8ea77e;font-weight:400}
 .best-card-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:10px;flex-shrink:0}
 .field-evaluation{font-size:10px;line-height:1.2;color:#9fb98d;white-space:nowrap}
 .field-evaluation b{font-weight:550;font-variant-numeric:tabular-nums;color:#d3e4c5;margin-left:3px}
@@ -100,6 +103,13 @@ h1{margin:0;font-size:24px;font-weight:550;letter-spacing:-1px;line-height:1.35}
 .best-card strong span{font-size:11px;font-weight:450;letter-spacing:0;color:#a2bc8d}
 .verified-tag{display:flex;align-items:center;gap:4px;font-size:9px;color:#b6dd94}
 .best-card p{font-size:10px;color:#a3c083;display:flex;justify-content:space-between;align-items:center;margin:10px 0 0}
+.bag-chances{margin-top:12px}
+.bag-chances h4{font-size:10px;font-weight:500;color:#a2b996;margin:0 0 7px}
+.bag-chances ol{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(76px,1fr));gap:5px;max-height:108px;overflow:auto;scrollbar-width:thin;scrollbar-color:#506744 transparent}
+.bag-chances li{display:flex;flex-direction:column;justify-content:center;gap:4px;border:1px solid #354d32;border-radius:4px;padding:6px 8px;background:#15251b80;min-height:39px}
+.bag-chances li>span{display:flex;align-items:center;justify-content:space-between;gap:3px;font-size:9px;color:#8da77c}
+.bag-chances li small{font-size:8px;color:#829477;white-space:nowrap}
+.bag-chances li strong{font-size:11px;font-weight:550;font-variant-numeric:tabular-nums;color:#d1e4bf}
 .secondary-result{display:flex;justify-content:space-between;margin-top:14px;font-size:10px;color:#d8c48f}
 .secondary-result strong{font-weight:550}
 .verification-note{font-size:9px;color:#9aaf88;margin:13px 0 0;line-height:1.5;min-height:27px}

@@ -52,6 +52,15 @@ export function spinsPerBag(candidate: Candidate): number {
   return candidate.spins * 7 / countedPieces(candidate);
 }
 
+function probabilityFactor(candidate: Candidate): number {
+  return Number.isFinite(candidate.probability) ? Math.max(0, Math.min(1, candidate.probability)) : 0;
+}
+
+/** Use the already verified counted probability, including the chosen opening scope. */
+export function probabilityAdjustedSpinsPerBag(candidate: Candidate): number {
+  return spinsPerBag(candidate) * probabilityFactor(candidate);
+}
+
 function fieldQuality(candidate: Candidate): number {
   return Number.isFinite(candidate.fieldQuality) ? candidate.fieldQuality : -Infinity;
 }
@@ -63,11 +72,14 @@ function sameForecast(a: Candidate, b: Candidate): boolean {
     aBags.length === bBags.length && aBags.every((spins, bag) => spins === bBags[bag]);
 }
 
-/** Compare the displayed efficiency record without floating-point division. */
+/** Compare actual spin efficiency after charging spent construction probability. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
-  const aRate = a.spins * countedPieces(b);
-  const bRate = b.spins * countedPieces(a);
+  const aProbability = probabilityFactor(a);
+  const bProbability = probabilityFactor(b);
+  const aRate = a.spins * aProbability * countedPieces(b);
+  const bRate = b.spins * bProbability * countedPieces(a);
   if (aRate !== bRate) return aRate > bRate;
+  if (aProbability !== bProbability) return aProbability > bProbability;
   if (a.bagCount !== b.bagCount) return a.bagCount > b.bagCount;
   if (a.spins !== b.spins) return a.spins > b.spins;
   if (a.bagCount === 1 && b.bagCount === 1) {
@@ -79,10 +91,17 @@ export function betterPartial(a: Candidate, b: Candidate): boolean {
   return a.placed < b.placed || (a.placed === b.placed && a.probability > b.probability);
 }
 
+function sameBagProbabilities(a: Candidate, b: Candidate): boolean {
+  const aBags = a.bagProbabilities ?? [];
+  const bBags = b.bagProbabilities ?? [];
+  return aBags.length === bBags.length && aBags.every((probability, bag) => probability === bBags[bag]);
+}
+
 /** A plan ID alone cannot distinguish an improved record from its old export. */
 function samePartialRecord(a: Candidate, b: Candidate): boolean {
   return a.id === b.id && a.spins === b.spins && a.placed === b.placed && a.bagCount === b.bagCount &&
     fieldQuality(a) === fieldQuality(b) && sameForecast(a, b) && a.probability === b.probability &&
+    sameBagProbabilities(a, b) &&
     a.firstBagProbability === b.firstBagProbability && a.firstBagSymmetry === b.firstBagSymmetry &&
     a.firstBagSymmetryAssumed === b.firstBagSymmetryAssumed && a.frameCount === b.frameCount &&
     a.rows.length === b.rows.length && a.rows.every((row, y) => row === b.rows[y]);
@@ -92,7 +111,7 @@ function partialArchiveKey(item: OwnedCandidate): string {
   const value = item.candidate;
   return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, value.bagCount, fieldQuality(value),
     value.forecastSpins, value.forecastSpinsByBag, value.forecastPlacements,
-    value.probability, value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
+    value.probability, value.bagProbabilities ?? [], value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
     value.frameCount, value.rows]);
 }
 
@@ -117,6 +136,7 @@ export class SearchClient {
   private pendingPartialArchive: { requestId: string; owner: number; key: string } | null = null;
   private rejectedPartialArchives = new Set<string>();
   private bestSpinsByBag = Array<number>(101).fill(0);
+  private shareSpinBenchmarks = true;
 
   constructor(private receive: (event: EngineEvent) => void) {}
 
@@ -126,6 +146,7 @@ export class SearchClient {
     const runId = this.runId;
     this.intent = 'running';
     this.status = 'loading';
+    this.shareSpinBenchmarks = config.min_success_percent === 100;
     this.currentOwner = null;
     this.nextFocusAt = 0;
     this.lastProgressAt = 0;
@@ -433,7 +454,9 @@ export class SearchClient {
         changed = true;
       }
     }
-    if (!changed || this.intent === 'cancelled') return;
+    // Raw spin maxima remain useful progress, but cannot compare the probability
+    // spent by different routes when a run permits construction failures.
+    if (!changed || !this.shareSpinBenchmarks || this.intent === 'cancelled') return;
     // Share only a small monotonic scheduling benchmark. Each worker keeps
     // its own boards, plans, supply probabilities and replay certificates.
     for (const slot of this.slots) {

@@ -1,5 +1,7 @@
 export interface SearchConfig {
   min_success_percent: number;
+  /** Minimum success of each bag after the independently filtered opening. */
+  bag_min_success_percent: number;
   ignore_first_bag_probability: boolean;
   /** Independent setup filter. Zero leaves the first-bag chance unrestricted. */
   first_bag_min_success_percent: number;
@@ -36,6 +38,8 @@ export interface Candidate {
   spins: number;
   placed: number;
   probability: number;
+  /** Certified effective model chance of each bag, including the opening. */
+  bagProbabilities?: number[];
   /** First-bag chance under the selected symmetry policy, even when excluded. */
   firstBagProbability?: number | null;
   firstBagSymmetry?: boolean;
@@ -112,10 +116,11 @@ export type EngineCommand =
 
 export const defaultConfig: SearchConfig = {
   min_success_percent: 100,
+  bag_min_success_percent: 100,
   ignore_first_bag_probability: true,
   first_bag_min_success_percent: 80,
   piece_goal: 119,
-  max_pieces: 140,
+  max_pieces: 126,
   budget_start: 0,
   seed: 1,
   beam_width: 64,

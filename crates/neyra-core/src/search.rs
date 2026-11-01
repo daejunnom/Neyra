@@ -41,10 +41,13 @@ const PACE_REFERENCE: [u8; 18] = [0, 0, 2, 4, 8, 10, 12, 15, 17, 19, 22, 25, 28,
 pub struct SearchConfig {
     #[serde(alias = "minSuccessPercent")]
     pub min_success_percent: f64,
+    /// Independent floor for every bag after the separately configured start.
+    #[serde(alias = "bagMinSuccessPercent")]
+    pub bag_min_success_percent: f64,
     #[serde(alias = "ignoreFirstBagProbability")]
     pub ignore_first_bag_probability: bool,
     /// Independent start filter. Zero removes this floor, never the need for
-    /// at least one constructible supply. Later bags use min_success_percent.
+    /// at least one constructible supply. Later bags also use their own floor.
     #[serde(alias = "firstBagMinSuccessPercent")]
     pub first_bag_min_success_percent: f64,
     #[serde(alias = "pieceGoal")]
@@ -69,10 +72,11 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             min_success_percent: 100.0,
+            bag_min_success_percent: 100.0,
             ignore_first_bag_probability: true,
             first_bag_min_success_percent: 80.0,
             piece_goal: 119,
-            max_pieces: 140,
+            max_pieces: 126,
             budget_start: 0,
             seed: 1,
             beam_width: 64,
@@ -89,12 +93,19 @@ impl SearchConfig {
             || self.min_success_percent <= 0.0
             || self.min_success_percent > 100.0
         {
-            return Err("최소 성공률은 0% 초과 100% 이하여야 합니다.".into());
+            return Err("전체 성공률은 0% 초과 100% 이하여야 합니다.".into());
         }
         if (self.min_success_percent * 100.0 - (self.min_success_percent * 100.0).round()).abs()
             > 1e-7
         {
             return Err("성공률은 소수 둘째 자리까지 입력해 주세요.".into());
+        }
+        if !self.bag_min_success_percent.is_finite()
+            || self.bag_min_success_percent <= 0.0 || self.bag_min_success_percent > 100.0
+            || (self.bag_min_success_percent * 100.0
+                - (self.bag_min_success_percent * 100.0).round()).abs() > 1e-7
+        {
+            return Err("가방별 성공률은 0% 초과 100% 이하, 소수 둘째 자리까지 입력해 주세요.".into());
         }
         if !self.first_bag_min_success_percent.is_finite()
             || !(0.0..=100.0).contains(&self.first_bag_min_success_percent)
@@ -104,7 +115,7 @@ impl SearchConfig {
             return Err("첫 가방 최소 성공률은 0–100%, 소수 둘째 자리까지 입력해 주세요. 0은 제한 없음입니다.".into());
         }
         if self.max_pieces == 0 || self.max_pieces > 700 || self.piece_goal == 0 {
-            return Err("미노 상한은 1–700, 목표는 1 이상이어야 합니다.".into());
+            return Err("탐색 상한은 1–700, 미노 제한은 1 이상이어야 합니다.".into());
         }
         if self.budget_start > self.max_pieces
             || !(4..=256).contains(&self.beam_width)
@@ -217,6 +228,21 @@ impl CandidateSummary {
     }
 }
 
+/// Snapshot metadata is derived from retained certificates so compact progress,
+/// full detail and exports cannot disagree about the earlier bags' coverage.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateSnapshot {
+    #[serde(flatten)]
+    pub summary: CandidateSummary,
+    pub bag_probabilities: Vec<f64>,
+}
+
+impl std::ops::Deref for CandidateSnapshot {
+    type Target = CandidateSummary;
+    fn deref(&self) -> &Self::Target { &self.summary }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressSnapshot {
@@ -234,9 +260,9 @@ pub struct ProgressSnapshot {
     pub failed: u16,
     pub frontier: usize,
     pub finished: bool,
-    pub current: Option<CandidateSummary>,
-    pub best: Option<CandidateSummary>,
-    pub best_partial: Option<CandidateSummary>,
+    pub current: Option<CandidateSnapshot>,
+    pub best: Option<CandidateSnapshot>,
+    pub best_partial: Option<CandidateSnapshot>,
     pub duplicates: u64,
     /// Selective productivity/terrain cuts, never exact P7 failures.
     pub selective_pruned: u64,
@@ -2650,6 +2676,18 @@ struct Archived {
     forecast_debt: CellMask,
 }
 
+impl Archived {
+    fn for_snapshot(&self, include_frames: bool) -> CandidateSnapshot {
+        CandidateSnapshot {
+            summary: self.summary.for_snapshot(include_frames),
+            // A pending bag stays unknown; only the proven prefix is listed.
+            bag_probabilities: self.certificates.iter()
+                .map(|certificate| f64::from(certificate.effective_success) / P7_COUNT as f64)
+                .collect(),
+        }
+    }
+}
+
 struct Random(u64);
 impl Random {
     fn next(&mut self) -> u64 {
@@ -2945,6 +2983,19 @@ fn scheduling_rank(spins: u8, pieces: u16, quality: f64) -> f64 {
     spin_rank(spins, quality) * 7.0 / f64::from(productive_locks(pieces))
 }
 
+/// Probability is a consumed resource. Shift the bounded signed rank before
+/// weighting, so even a zero-spin negative field cannot benefit from more risk.
+/// P=1 takes the original path exactly, without extra floating-point rounding.
+fn probability_scheduling_rank(spins: u8, pieces: u16, quality: f64, chance: f64) -> f64 {
+    if chance == 1.0 { return scheduling_rank(spins, pieces, quality); }
+    ((spin_rank(spins, quality) + 0.95) * bounded_probability(chance) - 0.95)
+        * 7.0 / f64::from(productive_locks(pieces))
+}
+
+fn bounded_probability(chance: f64) -> f64 {
+    if chance.is_finite() { chance.clamp(0.0, 1.0) } else { 0.0 }
+}
+
 /// Expected spins as a rational with denominator 40 * horizon. Map a user
 /// horizon onto 17 reference bags; interpolate without rounding per-mino quotas.
 fn pace_reference_numerator(pieces: u16, goal: u8, budget: u16) -> u64 {
@@ -3152,7 +3203,7 @@ impl SearchSession {
                 let pieces = job.plan.start_pieces + job.plan.targets.len() as u16;
                 if !job.plan.terminal && selective_reason(
                     job.plan.expected.cell_count(), 0, pieces, job.plan.expected_spins,
-                    self.best_spins_by_bag[pieces as usize / 7], self.goal, self.proposal_budget(job.plan.pace_fallback),
+                    self.selective_spin_reference(pieces as usize / 7), self.goal, self.proposal_budget(job.plan.pace_fallback),
                 ).is_some() {
                     // A newer peer result may invalidate the search lease,
                     // but unexamined supplies remain unknown, never failures.
@@ -3189,7 +3240,7 @@ impl SearchSession {
             if let Some(mut job) = self.generation.take() {
                 // Imported or newly verified maxima take effect on the next
                 // work slice, including a generation already in flight.
-                job.best_bag_spins = self.best_spins_by_bag[(job.start_pieces as usize / 7) + 1];
+                job.best_bag_spins = self.selective_spin_reference((job.start_pieces as usize / 7) + 1);
                 job.set_prune_budget(self.goal, self.proposal_budget(job.pace_fallback));
                 let prior_pruned = job.pruned;
                 let prior_duplicates = job.duplicates;
@@ -3229,7 +3280,7 @@ impl SearchSession {
                                 boundary_obstruction(&state.board, &state.future),
                                 pieces,
                                 state.spins,
-                                self.best_spins_by_bag[pieces as usize / 7],
+                                self.selective_spin_reference(pieces as usize / 7),
                                 self.goal,
                                 job.prune_budget,
                             )
@@ -3353,7 +3404,7 @@ impl SearchSession {
                 boundary_obstruction(&plan.expected, &plan.future),
                 pieces,
                 plan.expected_spins,
-                self.best_spins_by_bag[pieces as usize / 7],
+                self.selective_spin_reference(pieces as usize / 7),
                 self.goal,
                 self.proposal_budget(plan.pace_fallback),
             ).is_some()
@@ -3386,7 +3437,8 @@ impl SearchSession {
     /// This is a selective futility comparison, not alpha-beta dominance:
     /// different boards can still have very different longer continuations.
     fn quality_dominator(&self, pieces: u16, spins: u8, quality: f64) -> Option<u8> {
-        if pieces <= 7 || pieces % 7 != 0 || spins >= self.goal || !quality.is_finite() {
+        if self.config.min_success_percent < 100.0
+            || pieces <= 7 || pieces % 7 != 0 || spins >= self.goal || !quality.is_finite() {
             return None;
         }
         let references = self.best_quality_by_bag.get(pieces as usize / 7)?;
@@ -3456,7 +3508,7 @@ impl SearchSession {
             node.obstructed_mass,
             node.pieces,
             node.spins,
-            self.best_spins_by_bag[node.pieces as usize / 7],
+            self.selective_spin_reference(node.pieces as usize / 7),
             self.goal,
             self.active_budget,
         )
@@ -3490,9 +3542,35 @@ impl SearchSession {
         counts.first().is_none_or(|&count| count >= self.first_bag_minimum())
     }
 
+    fn bag_minimum(&self) -> u16 {
+        let basis_points = (self.config.bag_min_success_percent * 100.0).round() as u32;
+        (basis_points * P7_COUNT as u32).div_ceil(10_000).max(1) as u16
+    }
+
+    fn next_bag_minimum(&self, counts: &[u16]) -> u16 {
+        if counts.is_empty() {
+            self.first_bag_minimum().max(if self.config.ignore_first_bag_probability { 1 }
+                else { required_success(&[], self.config.min_success_percent) })
+        } else {
+            self.bag_minimum().max(required_success(self.counted_counts(counts), self.config.min_success_percent))
+        }
+    }
+
     fn path_qualifies(&self, counts: &[u16]) -> bool {
         self.start_qualifies(counts)
+            && counts.iter().skip(1).all(|&count| count >= self.bag_minimum())
             && threshold_met(self.counted_counts(counts), self.config.min_success_percent)
+    }
+
+    /// Raw cross-path maxima carry no probability resource. Keep them as
+    /// progress, but do not let a riskier path prune a safer one.
+    fn selective_spin_reference(&self, depth: usize) -> u8 {
+        if self.config.min_success_percent == 100.0 { self.best_spins_by_bag[depth] } else { 0 }
+    }
+
+    fn node_scheduling_rank(&self, index: usize, quality: f64) -> f64 {
+        let node = &self.tree[index];
+        probability_scheduling_rank(node.spins, node.pieces, quality, self.path_probability(&node.counts))
     }
 
     fn node_rounds(&self, index: usize, stale: u32) -> u32 {
@@ -3506,6 +3584,7 @@ impl SearchSession {
     /// Peers share only verified performance benchmarks. These selective hints
     /// never manufacture local progress, a board, or a supply certificate.
     pub fn observe_benchmarks(&mut self, values: &[u8]) {
+        if self.config.min_success_percent < 100.0 { return; }
         let mut changed = false;
         for (depth, &spins) in values.iter().take(self.best_spins_by_bag.len()).enumerate().skip(1) {
             if spins > self.goal || usize::from(spins) * 10 > depth * 28 { continue; }
@@ -3523,17 +3602,18 @@ impl SearchSession {
     fn best_waiting_plan(&self, parent: Option<usize>) -> Option<usize> {
         self.waiting_plans.iter().enumerate()
             .filter(|(_, (p, _))| parent.is_none_or(|parent| parent == *p))
-            .max_by(|(_, (_, a)), (_, (_, b))| {
-                let priority = |plan: &Plan| {
+            .max_by(|(_, (a_parent, a)), (_, (b_parent, b))| {
+                let priority = |parent: usize, plan: &Plan| {
                     // The completed boundary score already distinguishes
                     // central working pockets from charged cavity history.
                     // Reuse it instead of reinstating raw-hole penalties or
                     // flooding each waiting board during every comparison.
                     let quality = plan.quality;
-                    scheduling_rank(plan.expected_spins,
-                        plan.start_pieces + plan.targets.len() as u16, quality)
+                    probability_scheduling_rank(plan.expected_spins,
+                        plan.start_pieces + plan.targets.len() as u16, quality,
+                        self.path_probability(&self.tree[parent].counts))
                 };
-                priority(a).total_cmp(&priority(b)).then_with(|| b.id.cmp(&a.id))
+                priority(*a_parent, a).total_cmp(&priority(*b_parent, b)).then_with(|| b.id.cmp(&a.id))
             }).map(|(index, _)| index)
     }
 
@@ -3550,7 +3630,7 @@ impl SearchSession {
             .max_by(|&a, &b| {
                 let priority = |i: usize| {
                     let n = &self.tree[i];
-                    scheduling_rank(n.spins, n.pieces, n.quality)
+                    self.node_scheduling_rank(i, n.quality)
                         + 0.002 * self.dispatches.saturating_sub(n.last_selected).min(128) as f64
                         - 0.05 * f64::from(n.attempts)
                 };
@@ -3588,7 +3668,14 @@ impl SearchSession {
         else if phase == 1 {
             (1..self.tree.len()).filter(|&i| eligible(i) && self.tree[i].pieces == 7
                 && self.tree[i].attempts == 0)
-                .max_by(|&a, &b| self.tree[a].quality.total_cmp(&self.tree[b].quality))
+                .max_by(|&a, &b| {
+                    if self.config.min_success_percent == 100.0 {
+                        self.tree[a].quality.total_cmp(&self.tree[b].quality)
+                    } else {
+                        self.node_scheduling_rank(a, self.tree[a].quality)
+                            .total_cmp(&self.node_scheduling_rank(b, self.tree[b].quality))
+                    }
+                })
         } else { None };
         // Oldest eligible deeper nodes also get service; a short early burst
         // must not make all lower-efficiency continuations wait forever.
@@ -3609,10 +3696,7 @@ impl SearchSession {
 
     fn begin_generation_with_pace(&mut self, parent: usize, pace_fallback: bool) {
         let attempt = self.tree[parent].attempts;
-        let minimum = if parent == 0 {
-            self.first_bag_minimum().max(if self.config.ignore_first_bag_probability { 1 }
-                else { required_success(&[], self.config.min_success_percent) })
-        } else { required_success(self.counted_counts(&self.tree[parent].counts), self.config.min_success_percent) };
+        let minimum = self.next_bag_minimum(&self.tree[parent].counts);
         let stale = attempt.saturating_sub(self.tree[parent].last_improved_attempt);
         // Failed attempts alone do not earn a wider retry. Fresh productive
         // boundaries keep the full width; stale ones retain only a narrow probe.
@@ -3638,11 +3722,13 @@ impl SearchSession {
             self.config.search_lanes,
         );
         generation.best_bag_spins =
-            self.best_spins_by_bag[(self.tree[parent].pieces as usize / 7) + 1];
-        generation.bag_alpha = self.best_quality_by_bag[(self.tree[parent].pieces as usize / 7) + 1]
-            .iter().enumerate().filter(|(_, quality)| quality.is_finite())
-            .map(|(spins, &quality)| spin_rank(spins as u8, quality))
-            .fold(f64::NEG_INFINITY, f64::max);
+            self.selective_spin_reference((self.tree[parent].pieces as usize / 7) + 1);
+        generation.bag_alpha = if self.config.min_success_percent == 100.0 {
+            self.best_quality_by_bag[(self.tree[parent].pieces as usize / 7) + 1]
+                .iter().enumerate().filter(|(_, quality)| quality.is_finite())
+                .map(|(spins, &quality)| spin_rank(spins as u8, quality))
+                .fold(f64::NEG_INFINITY, f64::max)
+        } else { f64::NEG_INFINITY };
         generation.hard_piece_cap = self.cost_cap();
         generation.set_prune_budget(self.goal, self.proposal_budget(pace_fallback));
         generation.pace_fallback = pace_fallback;
@@ -3651,7 +3737,10 @@ impl SearchSession {
         generation.first_bag_symmetry = parent == 0;
         generation.relaxed_setup = parent == 0;
         if parent == 0 {
-            generation.continuation_minimum_success = required_success(&[], self.config.min_success_percent);
+            // Later unknown bag chances are never assumed to improve the
+            // parent's probability. This remains an optimistic necessary floor.
+            generation.continuation_minimum_success = self.bag_minimum()
+                .max(required_success(&[], self.config.min_success_percent));
         }
         self.generation = Some(generation);
         self.tree[parent].attempts += 1;
@@ -3880,7 +3969,7 @@ impl SearchSession {
                             - ((node.attempts + 1) as f64).log2() * 32.0
                             - bound.saturating_sub(self.active_budget) as f64 * 2.0
                             - bound.saturating_sub(self.config.piece_goal) as f64 * 0.8;
-                    scheduling_rank(node.spins, node.pieces, quality)
+                    self.node_scheduling_rank(i, quality)
                 };
                 priority(a).total_cmp(&priority(b))
             })
@@ -4196,7 +4285,7 @@ impl SearchSession {
                 let improved = summary.spins > *best || quality > *quality_reference;
                 *best = (*best).max(summary.spins);
                 *quality_reference = quality_reference.max(quality);
-                if improved {
+                if improved && self.config.min_success_percent == 100.0 {
                     self.benchmark_epoch += 1;
                     self.focus = None;
                 }
@@ -4319,7 +4408,14 @@ impl SearchSession {
             self.tree[i].pieces == 7 && self.tree[i].attempts == 0
                 && self.node_selective_reason(i).is_none()
         }).collect();
-        foundations.sort_by(|&a, &b| self.tree[b].quality.total_cmp(&self.tree[a].quality));
+        foundations.sort_by(|&a, &b| {
+            if self.config.min_success_percent == 100.0 {
+                self.tree[b].quality.total_cmp(&self.tree[a].quality)
+            } else {
+                self.node_scheduling_rank(b, self.tree[b].quality)
+                    .total_cmp(&self.node_scheduling_rank(a, self.tree[a].quality))
+            }
+        });
         foundations.truncate((self.config.beam_width / 4).clamp(2, 8));
         let replaceable = |i: usize| {
             i != parent && self.focus != Some(i) && self.tree[i].children.is_empty()
@@ -4332,7 +4428,7 @@ impl SearchSession {
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    scheduling_rank(n.spins, n.pieces, n.quality)
+                    self.node_scheduling_rank(i, n.quality)
                 };
                 let eligible = |i| self.can_expand(i) && self.node_selective_reason(i).is_none();
                 eligible(*a).cmp(&eligible(*b)).then_with(|| score(*a).total_cmp(&score(*b)))
@@ -4384,15 +4480,15 @@ impl SearchSession {
             current: self
                 .current
                 .as_ref()
-                .map(|a| a.summary.for_snapshot(include_frames)),
+                .map(|a| a.for_snapshot(include_frames)),
             best: self
                 .best
                 .as_ref()
-                .map(|a| a.summary.for_snapshot(include_frames)),
+                .map(|a| a.for_snapshot(include_frames)),
             best_partial: self
                 .best_partial
                 .as_ref()
-                .map(|a| a.summary.for_snapshot(include_frames)),
+                .map(|a| a.for_snapshot(include_frames)),
             duplicates: self.duplicates,
             selective_pruned: self.selective_pruned,
             best_spins_by_bag: self.best_spins_by_bag.clone(),
@@ -4439,7 +4535,7 @@ impl SearchSession {
                 "continuationFinishTail": CONTINUATION_FINISH_WORK,
                 "forecastPriority": "120*CoherentCount+24*Earliness+48*RawField/(120+AbsRawField)",
                 "forecastCountScope": "OneGeometricWitness;NotVerifiedProgressOrP7",
-                "schedulerQuality": "SpinRankNumeratorTimes7OverProductiveLocks;PublicEfficiencyUnchanged",
+                "schedulerQuality": "((SpinRank+0.95)*VerifiedPrefixProbability-0.95)*7/ProductiveLocks;ExactOriginalAtP1",
         });
         let mut selective_search = serde_json::json!({
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
@@ -4470,6 +4566,8 @@ impl SearchSession {
                 "equalSpinSiblingQualityMargin": 24,
                 "proposalScope": "FastSurfaceAndWitnessedSingles;periodicBroadSonicLocks;notExhaustive",
                 "qualityReferencesSurviveBudgetWidening": true,
+                "crossPathSpinQualityCutsEnabled": self.config.min_success_percent == 100.0,
+                "rawPeerBenchmarksEnabled": self.config.min_success_percent == 100.0,
                 "qualityPreparationRounds": 1,
                 "preferredPaceBudget": self.preferred_pace_budget(),
                 "longHorizonProbeInterval": LONG_HORIZON_PROBE_INTERVAL,
@@ -4483,7 +4581,7 @@ impl SearchSession {
             "format": "neyra", "schemaVersion": 3, "engineVersion": env!("CARGO_PKG_VERSION"),
             "rules": { "width": 10, "height": HEIGHT, "rotation": "SRS+", "spin": "All-mini+", "oSpin": false, "ceiling": "ActualCellDeath24", "movement": "SonicDropOnly", "supply": "UniformP7ClearOnlyHold", "runtimeReplayVerified": false },
             "config": self.config, "snapshot": self.snapshot(),
-            "candidate": archive.map(|a| &a.summary), "bags": certificates,
+            "candidate": archive.map(|a| a.for_snapshot(true)), "bags": certificates,
             "pendingPlan": archive.and_then(|a| a.pending_plan.as_ref()),
             "successBitsEncoding": "hex-u64-lsb0; word=floor(P7rank/64), bit=P7rank%64",
             "interchange": false, "globalOptimalityProven": false,
@@ -4496,18 +4594,37 @@ impl SearchSession {
             "firstBagSymmetryAssumed": archive.is_some_and(|a| a.summary.first_bag_symmetry_assumed),
             "mirroredInputsVerified": false,
             "costsMeaning": "0=canonicalQueueNotEvaluated;1..7=shortestInCanonicalLanguage;255=noPathInCanonicalLanguage;symmetryCosts=exactMinimumInAssumedReflectionModel",
-            "displayPartialRanking": "spins/max(7,placed);thenMoreBags;thenSpins;oneBagThenStartProbability;thenFieldQuality;thenFewerLocks;thenProbability",
+            "displayPartialRanking": "spins*CountedProbability/max(7,placed);thenProbability;thenMoreBags;thenSpins;oneBagThenStartProbability;thenFieldQuality;thenFewerLocks",
+            "bagProbabilityScope": "IndependentFloorAfterFirstBag;FirstBagUsesItsOwnFloor;DisplayedBagsUseFullCertifiedCoverage",
+            "probabilityBudget": archive.filter(|a| a.summary.verified).map(|a| {
+                let chance = a.summary.probability;
+                let floor = self.config.min_success_percent / 100.0;
+                serde_json::json!({
+                    "overallFloor": floor,
+                    "perBagFloor": self.config.bag_min_success_percent / 100.0,
+                    "countedProbability": chance,
+                    "requiredFutureProduct": if chance > 0.0 { Some(floor / chance) } else { None },
+                    "spentLogBudgetFraction": if floor < 1.0 && chance > 0.0 { Some(chance.ln() / floor.ln()) }
+                        else if chance == 1.0 { Some(0.0) } else { None },
+                    "meaning": "AlreadyVerifiedProbabilityResource;FutureProductIsRequirementNotPrediction"
+                })
+            }),
             "selectiveSearch": selective_search
         }).to_string()
     }
 }
 
 fn better_partial(a: &CandidateSummary, b: &CandidateSummary) -> bool {
-    // The public record includes the setup bag. Only scheduling uses
-    // productive_locks; a quality tie must be able to replace an older field.
-    let lhs = u32::from(a.spins) * u32::from(b.placed.max(7));
-    let rhs = u32::from(b.spins) * u32::from(a.placed.max(7));
-    lhs.cmp(&rhs)
+    // Actual spin efficiency is discounted by already consumed probability.
+    // Include the setup bag; equal efficiency preserves the larger chance
+    // budget before depth/terrain ties. This is an ordering score, not an
+    // expected completion-time or expected partial-spin certificate.
+    let a_chance = bounded_probability(a.probability);
+    let b_chance = bounded_probability(b.probability);
+    let lhs = (f64::from(a.spins) * a_chance) * f64::from(b.placed.max(7));
+    let rhs = (f64::from(b.spins) * b_chance) * f64::from(a.placed.max(7));
+    lhs.total_cmp(&rhs)
+        .then_with(|| a_chance.total_cmp(&b_chance))
         .then_with(|| a.bag_count.cmp(&b.bag_count))
         .then_with(|| a.spins.cmp(&b.spins))
         .then_with(|| {

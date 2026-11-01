@@ -33,7 +33,12 @@
 - Use explicit static board features and structural obligations for evaluation.
   Do not introduce NNUE, training data dependencies, or learned evaluation.
 - The overall construction-success threshold defaults to 100%; preserve
-  explicit saved user settings. The first-bag floor is separate, as below.
+  explicit saved user settings. The independent per-bag floor defaults to 100%
+  and applies from bag two; the first-bag floor is separate, as below.
+  Default the hard search cap to 126 pieces and keep the preferred goal at 119.
+  Admission must satisfy every bag floor and the exact cumulative product,
+  including the terminal cost CDF. Remaining probability requirements must
+  increase after probability has already been consumed.
   Independent worker profiles must keep separate certificates.
   Combining their displayed results does not combine their P7 success sets.
 - Each fixed plan must be quiet-safe for all 5,040 model supplies, regardless
@@ -54,7 +59,7 @@
   unfinished preparation goal is not an executed spin witness. A canonical
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
-- Within the same bag depth, search ranking must preserve the bounded spin contract: field quality
+- Within the same bag depth and probability resource, search ranking must preserve the bounded spin contract: field quality
   can reverse a one-spin difference, never a two-spin difference. Keep composite
   forecast/terrain quality separate from the actual-spin rank; apply that rank
   normalization once and add no bonuses afterwards.
@@ -62,8 +67,13 @@
   locks, so its influence does not grow with bag depth. Explicit exploration
   age/attempt preferences remain scheduling choices, not field evidence.
   Temporary scheduling cooldowns must not change the archived best route.
-- The displayed partial record uses spins/max(7, placed), then more bags and
-  more total spins. For two one-bag records with equal spins, higher first-bag
+- The displayed partial record uses spins*countedProbability/max(7, placed),
+  then higher counted probability, more bags and more total spins.
+  This is a selection score, not an expected completion-time certificate.
+  Scheduling uses ((spinRank+0.95)*countedProbability-0.95)*7/productiveLocks;
+  preserve the original arithmetic exactly at probability one. Pending plans
+  use their verified parent's probability, never invented future coverage.
+  For two one-bag records with equal spins, higher first-bag
   construction probability precedes raw field quality. Otherwise use raw field
   quality, fewer locks and higher effective probability for remaining ties.
   Include the setup bag in every public efficiency value; only internal
@@ -92,6 +102,11 @@
   Partition retained first placements into worker lanes after the mirror cut,
   and account for symmetry skips separately from failed supplies or bounds.
 - Share only monotonic verified same-depth spin benchmarks between workers.
+  Enable those raw cross-path spin/quality cuts and peer hints only when the
+  overall success threshold is 100%. Under a relaxed threshold, keep raw maxima
+  as progress without letting riskier paths prune safer probability resources.
+  Physical/material cuts, absolute pace, bounded beam and same-parent comparison
+  remain separate. Never combine worker success sets into one certificate.
   Imported hints never create local progress or supply certificates. New
   benchmarks revoke old scheduling leases; backpropagation must not refill
   ancestor budgets. Reserve exploration for fresh starts, untried foundations
@@ -210,6 +225,10 @@
 - Default to the latest retained route and render Clearra piece colors without
   column numbers or per-bag spin-gain decoration. Playback steps through the
   actual representative piece frames; do not imply that order is universal.
+  Keep playback on the retained best route; the current-search tab shows only
+  its final board and has no autoplay or replay controls. Show all certified
+  per-bag construction probabilities on the best route, including 100%, and
+  identify the first bag when excluded from the counted cumulative probability.
   The compact best-route field evaluation displays that route's final raw
   fieldQuality, not normalized rankingScore or the currently replayed frame.
   Same-ID quality improvements must update it; missing values remain unknown.

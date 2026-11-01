@@ -3,7 +3,7 @@
   import BoardPreview from '$lib/BoardPreview.svelte';
   import ProgressStrip from '$lib/ProgressStrip.svelte';
   import Icon from '$lib/Icon.svelte';
-  import { SearchClient, spinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
+  import { SearchClient, spinsPerBag, probabilityAdjustedSpinsPerBag, workerLimit, MAX_WORKERS } from '$lib/engine';
   import { encodeBuildDocument } from '$lib/exportFormats';
   import { createPiecePlayback } from '$lib/buildDocument';
   import { defaultConfig, type Candidate, type EngineEvent, type RunStatus, type SearchConfig, type SearchSnapshot } from '$lib/types';
@@ -53,17 +53,20 @@
   const piecePlayback = createPiecePlayback();
   $: active = status === 'running' || status === 'loading';
   $: hasSession = status !== 'idle' && status !== 'failed';
-  $: conditionalProbability = (snapshot !== null || hasSession ? runConfig : config).ignore_first_bag_probability;
+  $: displayedConfig = snapshot !== null || hasSession ? runConfig : config;
+  $: conditionalProbability = displayedConfig.ignore_first_bag_probability;
   $: bestRoute = snapshot?.best ?? snapshot?.bestPartial ?? null;
+  $: bagProbabilities = bestRoute?.bagProbabilities ?? [];
   $: candidate = view === 'best' ? bestRoute : snapshot?.current ?? null;
   $: if (client) client.observeCurrent(view === 'current');
   $: frames = candidate?.frames ?? [];
-  $: selectedIndex = frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
+  $: selectedIndex = view === 'current' || frameIndex < 0 ? Math.max(0, frames.length - 1) : Math.min(frameIndex, Math.max(0, frames.length - 1));
   $: frame = frames[selectedIndex];
-  $: boardRows = frame?.rows ?? candidate?.rows ?? [];
+  $: boardRows = view === 'current' ? candidate?.rows ?? [] : frame?.rows ?? candidate?.rows ?? [];
   $: boardColors = piecePlayback(frames, selectedIndex);
-  $: boardSpins = frame?.spins ?? candidate?.spins ?? 0;
-  $: boardPlaced = frame?.placed ?? candidate?.placed ?? 0;
+  $: boardSpins = view === 'current' ? candidate?.spins ?? 0 : frame?.spins ?? candidate?.spins ?? 0;
+  $: boardPlaced = view === 'current' ? candidate?.placed ?? 0 : frame?.placed ?? candidate?.placed ?? 0;
+  $: if (view === 'current') playing = false;
   $: verifying = status === 'running' && snapshot?.phase === 'verifying';
   $: statusLabel = ({
     idle: '탐색 준비',
@@ -85,6 +88,7 @@
   }
 
   function percent(value: number) {
+    if (!Number.isFinite(value)) return '—';
     return (Math.max(0, Math.min(1, value)) * 100).toLocaleString('ko-KR', { maximumFractionDigits: 2 }) + '%';
   }
   function time(ms: number) {
@@ -103,6 +107,9 @@
   }
   function efficiencyLabel(item: Candidate) {
     return spinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function adjustedEfficiencyLabel(item: Candidate) {
+    return probabilityAdjustedSpinsPerBag(item).toLocaleString('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   function evaluationLabel(item: Candidate | null) {
     if (!item || !Number.isFinite(item.fieldQuality)) return '—';
@@ -149,6 +156,12 @@
       if (stored) {
         const values = JSON.parse(stored);
         const merged = { ...defaultConfig, ...values };
+        // The old cumulative floor already implied this floor for every later
+        // bag. Preserve that acceptance range when migrating saved settings.
+        if (values && !Object.prototype.hasOwnProperty.call(values, 'bag_min_success_percent') &&
+            Number.isFinite(values.min_success_percent) && values.min_success_percent > 0 && values.min_success_percent <= 100) {
+          merged.bag_min_success_percent = values.min_success_percent;
+        }
         // A manual count intentionally overrides the browser's processor hint.
         // Preserve it when that hint changes, subject to the application limit.
         if (Number.isInteger(merged.worker_count) && merged.worker_count > 0) {
@@ -162,7 +175,7 @@
       const now = performance.now();
       if (status === 'running') elapsedMs += now - previousTick;
       previousTick = now;
-      if (playing && frames.length > 0) {
+      if (view === 'best' && playing && frames.length > 0) {
         if (selectedIndex >= frames.length - 1) playing = false;
         else frameIndex = selectedIndex + 1;
       }
@@ -201,11 +214,14 @@
   }
   function stop() { playing = false; client.cancel(); }
   function validateConfig(value: SearchConfig) {
-    if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '성공률은 0% 초과, 100% 이하로 입력해 주세요.';
+    if (!Number.isFinite(value.min_success_percent) || value.min_success_percent <= 0 || value.min_success_percent > 100) return '전체 성공률은 0% 초과, 100% 이하로 입력해 주세요.';
+    if (Math.abs(value.min_success_percent * 100 - Math.round(value.min_success_percent * 100)) > 1e-7) return '전체 성공률은 소수 둘째 자리까지 입력해 주세요.';
+    if (!Number.isFinite(value.bag_min_success_percent) || value.bag_min_success_percent <= 0 || value.bag_min_success_percent > 100) return '가방별 성공률은 0% 초과, 100% 이하로 입력해 주세요.';
+    if (Math.abs(value.bag_min_success_percent * 100 - Math.round(value.bag_min_success_percent * 100)) > 1e-7) return '가방별 성공률은 소수 둘째 자리까지 입력해 주세요.';
     if (typeof value.ignore_first_bag_probability !== 'boolean') return '첫 가방 성공률 설정을 다시 선택해 주세요.';
     if (!Number.isFinite(value.first_bag_min_success_percent) || value.first_bag_min_success_percent < 0 || value.first_bag_min_success_percent > 100) return '첫 가방 최소 성공률은 0–100%로 입력해 주세요. 0%는 제한 없음입니다.';
     if (Math.abs(value.first_bag_min_success_percent * 100 - Math.round(value.first_bag_min_success_percent * 100)) > 1e-7) return '첫 가방 성공률은 소수 둘째 자리까지 입력해 주세요.';
-    if (!Number.isInteger(value.piece_goal) || value.piece_goal < 1 || value.piece_goal > 1000) return '목표 미노 수는 1–1,000 사이의 정수로 입력해 주세요.';
+    if (!Number.isInteger(value.piece_goal) || value.piece_goal < 1 || value.piece_goal > 1000) return '미노 제한은 1–1,000 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.max_pieces) || value.max_pieces < 1 || value.max_pieces > 700) return '탐색 상한은 1–700 사이의 정수로 입력해 주세요.';
     if (!Number.isInteger(value.budget_start) || value.budget_start < 0 || value.budget_start > value.max_pieces) return '시작 예산은 자동(0) 또는 탐색 상한 이하로 입력해 주세요.';
     if (!Number.isSafeInteger(value.seed) || value.seed < 1 || value.seed > 4294967295) return '시드는 1–4,294,967,295 사이의 정수로 입력해 주세요.';
@@ -309,7 +325,7 @@
     } catch { selectCopyText(); }
   }
   function togglePlayback() {
-    if (frames.length < 2) return;
+    if (view !== 'best' || frames.length < 2) return;
     if (selectedIndex === frames.length - 1) frameIndex = 0;
     playing = !playing;
   }
@@ -345,14 +361,14 @@
     <section class="board-panel" aria-label="후보 필드">
       <div class="panel-top">
         <div class="view-tabs" role="tablist" aria-label="필드 보기">
-          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} onclick={() => view = 'best'}>최신 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
+          <button role="tab" aria-selected={view === 'best'} class:selected={view === 'best'} onclick={() => view = 'best'}>최선 경로 {#if bestRoute}<span class="tab-dot"></span>{/if}</button>
           <button role="tab" aria-selected={view === 'current'} class:selected={view === 'current'} onclick={() => view = 'current'}>탐색 중</button>
         </div>
         <span class="board-dimensions">10 × 24</span>
       </div>
 
       <div class="board-stage">
-        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최신 경로 필드' : '탐색 중인 후보 필드'} empty={!candidate} /></div>
+        <div class="field-wrap"><BoardPreview rows={boardRows} colors={boardColors} ariaLabel={view === 'best' ? '최선 경로 필드' : '탐색 중인 후보의 최종 필드'} empty={!candidate} /></div>
         <div class="field-summary">
           <div class="field-stat primary"><span>스핀 싱글</span><strong>{boardSpins}<small>/ 40</small></strong><div class="goal-track" aria-hidden="true"><i style={'height:' + boardSpins / 40 * 100 + '%'}></i></div></div>
           <div class="field-stat"><span>배치한 미노</span><strong>{boardPlaced}<small>개</small></strong></div>
@@ -361,13 +377,13 @@
         </div>
       </div>
 
-      <div class="timeline">
+      {#if view === 'best'}<div class="timeline">
         <button class="icon-button" aria-label="이전 미노" disabled={frames.length < 2 || selectedIndex === 0} onclick={previousFrame}><Icon name="back" size={15} /></button>
         <button class="icon-button playback-button" aria-label={playing ? '재생 일시정지' : '미노 재생'} disabled={frames.length < 2} onclick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={14} /></button>
         <input type="range" aria-label="미노 배치 선택" min="0" max={Math.max(0, frames.length - 1)} value={selectedIndex} disabled={frames.length < 2} oninput={(event) => { frameIndex = Number(event.currentTarget.value); playing = false; }} />
         <button class="icon-button" aria-label="다음 미노" disabled={frames.length < 2 || selectedIndex === frames.length - 1} onclick={nextFrame}><Icon name="arrow" size={15} /></button>
         <span class="frame-count">{frame?.placed ?? candidate?.placed ?? 0}<small> / {candidate?.placed ?? 0} 미노</small></span>
-      </div>
+      </div>{/if}
     </section>
 
     <aside class="control-panel">
@@ -376,9 +392,10 @@
         <h2>{status === 'idle' ? '가능성을 탐색하세요.' : status === 'paused' ? '잠시 쉬어가는 중.' : status === 'cancelled' ? '여기까지 탐색했어요.' : status === 'completed' ? '이번 탐색을 마쳤어요.' : status === 'failed' ? '다시 시작할 수 있어요.' : '다음 빌드를 찾는 중.'}</h2>
         <p class="run-description">{status === 'idle' ? '빈 필드에서 40번의 스핀 싱글을 완성할 새로운 구축을 찾습니다.' : status === 'paused' ? '지금까지의 결과는 그대로 유지됩니다.' : status === 'cancelled' || status === 'completed' ? '발견한 후보를 확인하거나 새 탐색을 시작하세요.' : status === 'failed' ? '아래 내용을 확인한 뒤 탐색을 다시 시작해 주세요.' : '발견한 구조와 검증 상황이 실시간으로 갱신됩니다.'}</p>
         <div class="goal-summary">
-          <div><span>{conditionalProbability ? '2가방부터 성공률' : '성공률 기준'}</span><strong>{(hasSession ? runConfig : config).min_success_percent}%{#if (hasSession ? runConfig : config).min_success_percent < 100}<small> 이상</small>{/if}</strong></div>
-          <div><span>개선 목표</span><strong>{(hasSession ? runConfig : config).piece_goal}<small> 미노</small></strong></div>
+          <div><span>전체 성공률{conditionalProbability ? ' · 2가방부터' : ''}</span><strong>{displayedConfig.min_success_percent}%{#if displayedConfig.min_success_percent < 100}<small> 이상</small>{/if}</strong></div>
+          <div><span>미노 제한</span><strong>{displayedConfig.piece_goal}<small> 미노</small></strong></div>
         </div>
+        <p class="bag-floor-summary">가방별 {displayedConfig.bag_min_success_percent}%{displayedConfig.bag_min_success_percent < 100 ? ' 이상' : ''} · 첫 가방 {displayedConfig.first_bag_min_success_percent > 0 ? `${displayedConfig.first_bag_min_success_percent}% 이상` : '제한 없음'}</p>
         <div class="run-actions">
           {#if status === 'running' || status === 'loading'}
             <button class="button primary" onclick={pause} disabled={status === 'loading'}><Icon name="pause" size={16} />일시정지</button>
@@ -406,18 +423,19 @@
       </section>
 
       <section class="best-section" aria-label="현재 최선 결과">
-        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최고 효율 경로'}</h3><div class="result-actions">
+        <div class="section-heading"><h3><Icon name="spark" size={16} />{bestRoute?.complete ? '최선 완주' : '최선 경로'}</h3><div class="result-actions">
           <select bind:value={exportFormat} disabled={exportBusy} aria-label="내보내기 형식"><option value="ctk3">CTK3</option><option value="fumen">Fumen</option></select>
           <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('download')} aria-label="선택한 후보 저장" title="문서 다운로드"><Icon name="download" size={15} /></button>
           <button class="icon-button" disabled={!candidate || exportBusy} onclick={() => exportResult('copy')} aria-label="선택한 후보 복사" title="클립보드 복사"><Icon name="copy" size={15} /></button>
         </div></div>
         {#if bestRoute}
           <button class="best-card" onclick={() => view = 'best'}>
+            {#if !bestRoute.complete}<span class="efficiency-caption">성공률 반영 효율{#if bestRoute.probability < 1}<small>실제 {efficiencyLabel(bestRoute)}스핀/가방</small>{/if}</span>{/if}
             <div>
               {#if bestRoute.complete}
                 <strong>{bestRoute.budgetPieces ?? bestRoute.placed}<span> 미노</span></strong>
               {:else}
-                <strong title="첫 가방을 포함한 전체 배치 기준">{efficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong>
+                <strong title={`실제 ${efficiencyLabel(bestRoute)}스핀/가방에 ${conditionalProbability ? '2가방부터의 ' : ''}전체 성공률을 반영한 값`}>{adjustedEfficiencyLabel(bestRoute)}<span> 스핀/가방</span></strong>
               {/if}
               <span class="best-card-meta">
                 <span class="verified-tag"><Icon name="check" size={12} />{bestRoute.complete ? '완주' : `${bestRoute.bagCount}가방`}</span>
@@ -430,8 +448,18 @@
               <p>{bestRoute.spins}스핀 · {bestRoute.placed}미노 · {coverageLabel(bestRoute)}{conditionalProbability ? ' (2가방부터)' : ''} <Icon name="arrow" size={13} /></p>
             {/if}
           </button>
+          {#if bagProbabilities.length > 0}
+            <section class="bag-chances" aria-label="최선 경로의 가방별 구축률">
+              <h4>가방별 구축률</h4>
+              <ol>
+                {#each bagProbabilities as probability, bag}
+                  <li><span>{bag + 1}가방{#if bag === 0 && conditionalProbability}<small>전체 제외</small>{/if}</span><strong>{percent(probability)}</strong></li>
+                {/each}
+              </ol>
+            </section>
+          {/if}
         {:else}
-          <div class="best-empty"><span class="empty-line"></span><div class="best-empty-heading"><strong>첫 가방을 확인하고 있어요.</strong><span class="field-evaluation">필드 평가 <b>—</b></span></div><p>검증된 스핀 효율이 높은 경로를 표시합니다.</p></div>
+          <div class="best-empty"><span class="empty-line"></span><div class="best-empty-heading"><strong>첫 가방을 확인하고 있어요.</strong><span class="field-evaluation">필드 평가 <b>—</b></span></div><p>전체 성공률을 반영한 스핀 효율로 경로를 비교합니다.</p></div>
         {/if}
         {#if candidate?.complete && !candidate.qualified}
           <div class="secondary-result"><span>완주 후보 · {candidate.verified ? '기준 미달' : '확인 중'}</span><strong>{coverageLabel(candidate)}</strong></div>
@@ -449,9 +477,10 @@
   <form onsubmit={saveSettings}>
     <div class="dialog-heading"><div><p class="eyebrow">SEARCH OPTIONS</p><h2>탐색 설정</h2></div><button class="icon-button" type="button" onclick={() => settings.close()} aria-label="설정 닫기"><Icon name="close" /></button></div>
     <div class="settings-grid">
-      <label><span>최소 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '2가방부터 스핀 전개 성공률' : '전체 스핀 전개 성공률'}</small></label>
-      <label><span>개선 목표 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>목표보다 긴 결과도 보관해요.</small></label>
-      <label class="full-row"><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
+      <label><span>전체 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.min_success_percent} /><small>{draft.ignore_first_bag_probability ? '2가방부터 누적 성공률의 하한' : '첫 가방부터 누적 성공률의 하한'}</small></label>
+      <label><span>가방별 성공률 <small>%</small></span><input type="number" min="0.01" max="100" step="0.01" required bind:value={draft.bag_min_success_percent} /><small>2가방부터 각 가방의 하한 · 첫 가방은 별도 설정</small></label>
+      <label><span>미노 제한 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>탐색 상한 안의 더 긴 결과도 보관해요.</small></label>
+      <label><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
     </div>
     <details class="advanced-options"><summary>추가 설정 <span>첫 가방 · 동시 탐색 · 범위</span></summary><div class="settings-grid">
       <label class="full-row checkbox-setting" title="첫 가방은 별도 최소값으로 확인하고, 전체 성공률은 2가방부터 계산합니다."><span><input type="checkbox" bind:checked={draft.ignore_first_bag_probability} aria-describedby="first-bag-probability-note" />첫 가방 성공률 제외</span><small id="first-bag-probability-note">전체 성공률은 2가방부터 계산해요.</small></label>
@@ -471,8 +500,10 @@
   <div class="dialog-heading"><div><p class="eyebrow">NEYRA</p><h2>새 빌드를 찾는 작은 작업실</h2></div><button class="icon-button" onclick={() => about.close()} aria-label="도움말 닫기"><Icon name="close" /></button></div>
   <p>Neyra는 24행 안에서, 중력 대기 없이 40번의 스핀 싱글을 만드는 빌드를 탐색합니다.</p>
   <p>일반 배치는 홀드 없이 가능한지 확인하며, 홀드와 성공률 기준은 줄을 지우는 전개에 적용합니다.</p>
-  <p>왼쪽은 발견한 경로의 미노별 배치, 오른쪽은 작업 진척도입니다. <strong>최신 경로</strong>는 첫 가방을 포함한 스핀 효율이 같으면 더 깊은 경로를 보여 줍니다. 완주 결과가 나오면 사용 미노 수로 비교합니다.</p>
-  <p>설정한 미노 수는 개선 목표예요. 그보다 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
+  <p><strong>최선 경로</strong>에서는 미노별 배치를 재생할 수 있고, <strong>탐색 중</strong>에서는 후보의 마지막 필드만 보여 줍니다. 오른쪽에서 작업 진척도와 가방별 구축률을 확인할 수 있습니다.</p>
+  <p>전체 성공률과 가방별 성공률을 함께 만족하는 경로를 찾습니다. 첫 가방의 하한과 전체 성공률에서 제외할지는 별도로 정할 수 있습니다.</p>
+  <p>중간 최선 경로는 첫 가방을 포함한 스핀 효율에 전체 성공률을 곱해 비교합니다. 확률을 많이 소모한 경로는 낮게 평가하며, 완주 결과는 조건을 만족하는 사용 미노 수를 우선합니다.</p>
+  <p>미노 제한을 우선해 탐색하며, 탐색 상한 안의 더 긴 빌드도 성공률 기준을 만족하면 결과에 남습니다.</p>
   <div class="dialog-actions"><button class="button primary" onclick={() => about.close()}>알겠어요</button></div>
 </dialog>
 

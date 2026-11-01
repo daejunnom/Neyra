@@ -273,7 +273,7 @@
       if (file.size > 32 * 1024 * 1024) throw new Error('로컬 GA 파일은 최대 32 MiB입니다.');
       const encoded = await file.text(), model = JSON.parse(encoded);
       if (!model || model.schemaVersion !== 'neyra-ga-model-v1' || model.trained !== true || typeof model.modelId !== 'string' ||
-          !Array.isArray(model.weights) || model.weights.length !== 24 || !model.weights.every((value: unknown) => typeof value === 'number' && Number.isFinite(value))) {
+          !Array.isArray(model.weights) || ![24, 256].includes(model.weights.length) || !model.weights.every((value: unknown) => typeof value === 'number' && Number.isFinite(value))) {
         throw new Error('학습된 GA 평가기 JSON이 필요합니다. 체크포인트나 미학습 초기값은 적용하지 않습니다.');
       }
       gaModelJson = encoded; gaModelName = file.name; gaModelId = model.modelId;

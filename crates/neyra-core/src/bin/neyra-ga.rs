@@ -17,7 +17,7 @@ fn required<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str,
     args.get(key).map(String::as_str).ok_or_else(|| format!("Missing --{key}"))
 }
 fn config(args: &HashMap<String, String>) -> Result<GaConfig, String> {
-    args.get("config").map_or(Ok(GaConfig::frontier_defaults()), |p| GaConfig::from_json(&read(p)?))
+    args.get("config").map_or(Ok(GaConfig::physical_defaults()), |p| GaConfig::from_json(&read(p)?))
 }
 fn emit(args: &HashMap<String, String>, value: &str) -> Result<(), String> {
     if let Some(path) = args.get("output") { write(path, value) } else { println!("{value}"); Ok(()) }
@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
     let mut raw = std::env::args().skip(1);
     let command = raw.next().unwrap_or_else(|| "help".into());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
-        println!("neyra-ga initializer [--config FILE] --output MODEL\nneyra-ga train [--config FILE] [--model MODEL | --resume CHECKPOINT] [--seconds N] [--work N] --output MODEL --checkpoint FILE [--report FILE]\nneyra-ga fork --resume CHECKPOINT [--config FILE] --checkpoint NEW_CHECKPOINT [--output SNAPSHOT]\nneyra-ga evaluate --model MODEL [--config FILE] [--seeds 1,2,3 | --seed-start N --episodes N] [--seconds N] [--work N] --output REPORT\nneyra-ga baseline [--config FILE] [--seed N] [--beam-width N] [--search-profile N] [--seconds N] [--work N] --output REPORT\nneyra-ga checkpoint --resume FILE [--work N] --checkpoint FILE [--output SNAPSHOT]\nNew runs default to v3 probability-frontier policy; exact resumed v2 runs retain their original policy. Work units differ between policies; elapsed time and actual query counters are reported. Generated files belong outside the repository.");
+        println!("neyra-ga initializer [--config FILE] --output MODEL\nneyra-ga train [--config FILE] [--model MODEL | --resume CHECKPOINT] [--seconds N] [--work N] --output MODEL --checkpoint FILE [--report FILE]\nneyra-ga fork --resume CHECKPOINT [--config FILE] --checkpoint NEW_CHECKPOINT [--output SNAPSHOT]\nneyra-ga evaluate --model MODEL [--config FILE] [--seeds 1,2,3 | --seed-start N --episodes N] [--seconds N] [--work N] --output REPORT\nneyra-ga baseline [--config FILE] [--seed N] [--beam-width N] [--search-profile N] [--seconds N] [--work N] --output REPORT\nneyra-ga checkpoint --resume FILE [--work N] --checkpoint FILE [--output SNAPSHOT]\nNew runs default to v4 physical-only candidate generation; exact resumed legacy runs retain their original policy. Physical completions have unmeasured random-supply probability. Work units differ between policies; elapsed time and actual query counters are reported. Generated files belong outside the repository.");
         return Ok(());
     }
     let mut args = HashMap::new();

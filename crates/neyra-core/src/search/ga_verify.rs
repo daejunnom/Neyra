@@ -15,6 +15,23 @@ pub(crate) struct Request {
 }
 
 impl Request {
+    /// Canonical identity of one replayed typed plan, without a P7 query.
+    /// Input order may differ while piece-to-logical-target assignments are
+    /// identical. This is identity only, not construction/quiet certification.
+    pub(crate) fn typed_identity(&self)->Result<serde_json::Value,String>{
+        let plan=self.plan()?;
+        let mut targets=plan.targets;targets.sort_by_key(|target|target.piece as u8);
+        let(mut board,mut deleted)=(self.start,0_u32);
+        for placement in &self.placements{
+            let lock=board.apply(placement).ok_or("Invalid typed identity placement")?;
+            deleted=deleted_after(deleted,lock.cleared_rows).ok_or("Typed identity logical row overflow")?;
+            board=lock.board;
+        }
+        Ok(serde_json::json!({"startRows":self.start.rows,"endRows":plan.expected.rows,
+            "startSpins":self.start_spins,"endSpins":plan.expected_spins,"startPieces":self.start_pieces,
+            "targets":targets,"deletedRows":deleted,"terminal":plan.terminal,
+            "reflectionAssumed":false}))
+    }
     pub(super) fn plan(&self) -> Result<Plan, String> {
         if !self.start.is_valid() || self.start_spins >= TARGET_SPINS
             || self.start_pieces % 7 != 0 || self.placements.is_empty()

@@ -15,9 +15,13 @@ use std::cmp::Ordering;
 
 mod evolution;
 mod checkpoint;
+mod policy;
+mod physical;
+mod repair;
 
 pub const LEGACY_SOURCE_POLICY: &str = "neyra-ga-sonic-full-locks-fixed-plan-v2";
 pub const SOURCE_POLICY: &str = "neyra-ga-sonic-full-locks-fixed-plan-v3";
+pub const PHYSICAL_SOURCE_POLICY: &str = "neyra-ga-sonic-physical-v4";
 pub const FEATURE_SCHEMA: &str = "neyra-ga-features-v1";
 pub const FEATURE_COUNT: usize = 24;
 pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
@@ -56,6 +60,8 @@ pub struct GaConfig {
     pub mutation_scale: f64,
     pub elite_count: usize,
     pub tournament_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<physical::Config>,
 }
 
 impl Default for GaConfig {
@@ -66,7 +72,7 @@ impl Default for GaConfig {
             min_success_percent: 100.0, bag_min_success_percent: 100.0,
             risk_min_spins_per_bag: 3, ignore_first_bag_probability: true,
             first_bag_min_success_percent: 80.0, mutation_rate: 0.2,
-            mutation_scale: 0.3, elite_count: 2, tournament_size: 3,
+            mutation_scale: 0.3, elite_count: 2, tournament_size: 3, physical: None,
         }
     }
 }
@@ -81,14 +87,25 @@ impl GaConfig {
             ..Self::default() }
     }
     pub fn is_frontier(&self) -> bool { self.schema_version == "neyra-ga-config-v2" }
+    pub fn is_physical(&self) -> bool { self.schema_version == "neyra-ga-config-v3" }
+    pub fn physical_defaults() -> Self {
+        Self { schema_version: "neyra-ga-config-v3".into(), episodes_per_genome: 4,
+            physical: Some(physical::Config::with_repair_defaults()), ..Self::frontier_defaults() }
+    }
+    pub fn parameter_count(&self) -> usize {
+        if self.physical.as_ref().is_some_and(|p|p.context_features) { policy::CONTEXT_FEATURE_COUNT } else { FEATURE_COUNT }
+    }
+    fn feature_schema(&self) -> &'static str { policy::feature_schema(self.parameter_count()).unwrap() }
     pub fn source_policy(&self) -> &'static str {
-        if self.is_frontier() { SOURCE_POLICY } else { LEGACY_SOURCE_POLICY }
+        if self.is_physical() { PHYSICAL_SOURCE_POLICY } else if self.is_frontier() { SOURCE_POLICY } else { LEGACY_SOURCE_POLICY }
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(self.schema_version.as_str(), "neyra-ga-config-v1" | "neyra-ga-config-v2") {
+        if !matches!(self.schema_version.as_str(), "neyra-ga-config-v1" | "neyra-ga-config-v2" | "neyra-ga-config-v3") {
             return Err("Unknown GA configuration schema".into());
         }
+        if self.is_physical() != self.physical.is_some() { return Err("Physical settings require an explicit v4 experiment".into()); }
+        if let Some(physical) = &self.physical { physical.validate()?; }
         if self.is_frontier() && self.ignore_first_bag_probability {
             return Err("GA probability-frontier experiments include the first bag".into());
         }
@@ -108,7 +125,7 @@ impl GaConfig {
 
     pub fn search_config(&self) -> SearchConfig {
         SearchConfig {
-            probability_frontier: self.is_frontier(),
+            probability_frontier: self.is_frontier() || self.is_physical(),
             min_success_percent: self.min_success_percent,
             bag_min_success_percent: self.bag_min_success_percent,
             risk_min_spins_per_bag: self.risk_min_spins_per_bag,
@@ -124,7 +141,9 @@ impl GaConfig {
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("Invalid GA settings: {e}"))?;
         let defaults = if value.get("schemaVersion").and_then(|v| v.as_str()) == Some("neyra-ga-config-v1") {
             Self::default()
-        } else { Self::frontier_defaults() };
+        } else if value.get("schemaVersion").and_then(|v| v.as_str()) == Some("neyra-ga-config-v2") {
+            Self::frontier_defaults()
+        } else { Self::physical_defaults() };
         let mut merged = serde_json::to_value(defaults).map_err(|e| e.to_string())?;
         let object = value.as_object().ok_or("GA configuration must be an object")?;
         for (key, value) in object { merged[key] = value.clone(); }
@@ -157,10 +176,7 @@ fn weights_digest(weights: &[f64]) -> String {
     digest(&bytes)
 }
 fn validate_weights(weights: &[f64]) -> Result<(), String> {
-    if weights.len() != FEATURE_COUNT || weights.iter().any(|w| !w.is_finite() || w.abs() > 16.0) {
-        return Err("GA weights must contain 24 finite coefficients in [-16, 16]".into());
-    }
-    Ok(())
+    policy::validate_weights(weights)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,7 +204,7 @@ impl GaModel {
     fn new(weights: Vec<f64>, config: GaConfig) -> Self {
         let hash = weights_digest(&weights);
         Self { schema_version: "neyra-ga-model-v1".into(), source_policy: config.source_policy().into(),
-            feature_schema: FEATURE_SCHEMA.into(), feature_names: FEATURE_NAMES.iter().map(|s| (*s).into()).collect(),
+            feature_schema: policy::feature_schema(weights.len()).unwrap().into(), feature_names: policy::feature_names(weights.len()).unwrap(),
             model_id: format!("ga-{}", &hash[..20]), weights_sha256: hash, weights,
             training_state: "untrained-initializer".into(), trained: false, learning_complete: false,
             deployment_ready: false, training_config: config, completed_generations: 0,
@@ -196,7 +212,7 @@ impl GaModel {
     }
     pub fn initializer(config: GaConfig) -> Result<Self, String> {
         config.validate()?;
-        Ok(Self::new(INITIAL_WEIGHTS.to_vec(), config))
+        Ok(Self::new(policy::initializer(config.parameter_count() > FEATURE_COUNT), config))
     }
     pub fn from_json(json: &str) -> Result<Self, String> {
         if json.len() > 32 * 1024 * 1024 { return Err("GA model is too large".into()); }
@@ -207,7 +223,9 @@ impl GaModel {
     pub fn validate(&self) -> Result<(), String> {
         validate_weights(&self.weights)?;
         if self.schema_version != "neyra-ga-model-v1" || self.source_policy != self.training_config.source_policy()
-            || self.feature_schema != FEATURE_SCHEMA || self.feature_names != FEATURE_NAMES
+            || self.weights.len() != self.training_config.parameter_count()
+            || Some(self.feature_schema.as_str()) != policy::feature_schema(self.weights.len())
+            || Some(self.feature_names.clone()) != policy::feature_names(self.weights.len())
             || self.weights_sha256 != weights_digest(&self.weights)
             || self.model_id != format!("ga-{}", &self.weights_sha256[..20])
             || self.learning_complete || self.deployment_ready {
@@ -293,6 +311,8 @@ pub struct EpisodeResult {
     pub input_replay_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier: Option<evolution::FrontierMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<physical::EpisodeMetrics>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -347,6 +367,8 @@ pub struct Episode {
     budget_pieces: Option<u16>,
     #[serde(default, skip_serializing_if = "is_false")]
     frontier_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical: Option<physical::EpisodeMetrics>,
 }
 
 fn is_false(value: &bool) -> bool { !*value }
@@ -358,10 +380,31 @@ impl Episode {
             bag_placements: vec![], placements: vec![], frames: vec![], qualified_frames: vec![],
             qualified_spins: 0, qualified_bags: 0, prefix_live: true, counts: vec![], proofs: vec![],
             assume_reflection: true, verifier: None, query_piece: 0, choice: None,
-            done: false, termination: String::new(), budget_pieces: None, frontier_mode: false }
+            done: false, termination: String::new(), budget_pieces: None, frontier_mode: false, physical: None }
     }
     pub fn for_config(seed: u32, config: &GaConfig) -> Self {
-        let mut episode = Self::new(seed); episode.frontier_mode = config.is_frontier(); episode
+        let mut episode = Self::new(seed); episode.frontier_mode = config.is_frontier();
+        if config.is_physical() { episode.physical = Some(physical::EpisodeMetrics::default()); }
+        episode
+    }
+    /// Return to an independently replayed physical prefix. Reusing a prefix
+    /// is candidate search, not a fresh from-empty policy evaluation.
+    fn from_physical_prefix(seed: u32, config: &GaConfig, prefix: &EpisodeResult) -> Result<Self, String> {
+        if !config.is_physical() || prefix.raw_spins >= 40 || prefix.raw_pieces >= config.max_pieces {
+            return Err("Invalid physical continuation prefix".into());
+        }
+        let mut episode = Self::for_config(seed,config);
+        for placement in &prefix.placements {
+            if episode.used == ALL_PIECES { episode.next_bag_or_finish(config); }
+            if episode.used & placement.pose.piece.bit()!=0 { return Err("Continuation repeats a bag piece".into()); }
+            episode.commit_placement(placement.clone(), &mut Counters::default())?;
+        }
+        if episode.board.rows != prefix.rows || episode.raw_spins != prefix.raw_spins {
+            return Err("Continuation prefix replay mismatch".into());
+        }
+        if episode.used == ALL_PIECES { episode.next_bag_or_finish(config); }
+        episode.physical.as_mut().unwrap().continuation_prefix_pieces = prefix.raw_pieces;
+        Ok(episode)
     }
     pub fn finished(&self) -> bool { self.done }
 
@@ -399,7 +442,7 @@ impl Episode {
             return Ok(());
         }
         if self.used == ALL_PIECES || self.raw_spins >= 40 {
-            if self.prefix_live {
+            if self.prefix_live && self.physical.is_none() {
                 self.verifier = Some(Verifier::new(Request {
                     start: self.bag_start, start_spins: self.bag_start_spins,
                     start_pieces: self.bag_start_pieces, placements: self.bag_placements.clone(),
@@ -420,9 +463,14 @@ impl Episode {
                 let Some(result) = self.board.apply(&placement) else { continue; };
                 if result.lines > 1 || (result.lines == 1 && (!result.spin || piece == Piece::O)) { continue; }
                 counters.legal_candidate_locks += 1;
-                let f = features(&self.board, &result.board, &placement, result.lines);
-                let score = f.iter().zip(weights).map(|(v, w)| v * w).sum::<f64>()
-                    + self.rng.unit() * 1e-9;
+                let score = if let Some(physical) = &config.physical {
+                    policy::score(weights,&self.board,&result.board,&placement,result.lines,
+                        self.used,self.raw_spins,self.raw_pieces,config.max_pieces)
+                        + (self.rng.unit() * 2.0 - 1.0) * physical.action_noise
+                } else {
+                    features(&self.board,&result.board,&placement,result.lines).iter()
+                        .zip(weights).map(|(v,w)|v*w).sum::<f64>() + self.rng.unit()*1e-9
+                };
                 if self.choice.as_ref().is_none_or(|c| score > c.score) {
                     self.choice = Some(Choice { placement, score });
                 }
@@ -432,11 +480,17 @@ impl Episode {
         let Some(choice) = self.choice.take() else {
             self.done = true; self.termination = "no-legal-lock".into(); return Ok(());
         };
-        let placement = choice.placement;
+        self.commit_placement(choice.placement,counters)
+    }
+
+    fn commit_placement(&mut self, placement: Placement, counters: &mut Counters) -> Result<(), String> {
         let replay = self.board.replay(placement.pose.piece, &placement.path).ok_or("Selected GA input replay failed")?;
         counters.replay_queries += 1;
         if replay.pose != placement.pose || replay.spin != placement.spin { return Err("GA replay mismatch".into()); }
         let result = self.board.apply(&replay).ok_or("Selected GA placement failed")?;
+        if result.lines>1 || (result.lines==1 && (!result.spin || placement.pose.piece==Piece::O)) {
+            return Err("Selected GA placement violates Spin Single rules".into());
+        }
         self.board = result.board; self.raw_spins += result.lines; self.raw_pieces += 1;
         self.used |= placement.pose.piece.bit(); self.query_piece = 0;
         self.frames.push(DisplayFrame {
@@ -470,14 +524,14 @@ impl Episode {
             unchecked_suffix_bags: self.raw_pieces.div_ceil(7).saturating_sub(self.proofs.len() as u16),
             termination: if self.done { self.termination.clone() } else { "budget-censored".into() },
             input_replay_verified: true,
-            frontier: None,
+            frontier: None, physical: self.physical.clone(),
         };
         if self.frontier_mode { result.frontier = Some(evolution::FrontierMetrics::from_result(&result)); }
         result
     }
 
     fn validate(&self, config: &GaConfig) -> Result<(), String> {
-        if self.frontier_mode != config.is_frontier()
+        if self.frontier_mode != config.is_frontier() || self.physical.is_some()!=config.is_physical()
             || !self.board.is_valid() || !self.bag_start.is_valid() || self.rng.state == 0
             || self.raw_spins > 40 || self.qualified_spins > self.raw_spins || self.raw_pieces > config.max_pieces
             || self.used > ALL_PIECES || self.query_piece > 7 || self.bag_start_pieces % 7 != 0
@@ -487,6 +541,14 @@ impl Episode {
             || self.counts.len() != usize::from(self.qualified_bags)
             || self.counts.iter().any(|&c| c == 0 || usize::from(c) > P7_COUNT) {
             return Err("Invalid GA episode checkpoint".into());
+        }
+        if let Some(physical)=&self.physical {
+            if physical.continuation_prefix_pieces>self.raw_pieces || self.verifier.is_some()
+                || (physical.repaired && physical.continuation_prefix_pieces==0)
+                || !self.proofs.is_empty() || self.qualified_spins!=0 || self.qualified_bags!=0
+                || !self.counts.is_empty() || self.budget_pieces.is_some() {
+                return Err("Physical-only checkpoint contains unsupported supply proof".into());
+            }
         }
         // Checkpoint import is not an alternate route for manufactured raw
         // evidence: all retained inputs must replay from the empty board.
@@ -544,11 +606,18 @@ impl Episode {
 
 impl EpisodeResult {
     fn audit(&self, config: &GaConfig) -> Result<(), String> {
-        if self.frontier.is_some() != config.is_frontier()
+        if self.frontier.is_some() != config.is_frontier() || self.physical.is_some()!=config.is_physical()
             || self.placements.len() != usize::from(self.raw_pieces) || self.raw_pieces > config.max_pieces
             || self.frames.len() != self.placements.len() || self.raw_spins > 40
             || self.bag_proofs.len() > usize::from(self.raw_pieces.div_ceil(7)) {
             return Err("Invalid retained GA episode bounds".into());
+        }
+        if let Some(physical)=&self.physical {
+            if physical.continuation_prefix_pieces>self.raw_pieces || !self.bag_proofs.is_empty()
+                || (physical.repaired && physical.continuation_prefix_pieces==0)
+                || self.certified40 || self.qualified_spins!=0 || self.qualified_bags!=0 {
+                return Err("A physical candidate cannot contain a supply certificate".into());
+            }
         }
         let (mut board, mut spins, mut used) = (Board::default(), 0_u8, 0_u8);
         for (i, p) in self.placements.iter().enumerate() {
@@ -619,6 +688,16 @@ pub fn score_placement(weights: &[f64], board: &Board, placement: &Placement) ->
     if result.lines > 1 || (result.lines == 1 && (!result.spin || placement.pose.piece == Piece::O)) { return None; }
     Some(features(board, &result.board, placement, result.lines).iter()
         .zip(weights).map(|(f, w)| f * w).sum())
+}
+
+/// Context-aware proposal score. Legality remains owned by the actual input
+/// generator/replay; this value is never a supply probability or proof bound.
+pub fn score_placement_context(weights:&[f64],board:&Board,placement:&Placement,used:u8,
+    spins:u8,placed:u16,max_pieces:u16)->Option<f64>{
+    validate_weights(weights).ok()?;
+    let result=board.apply(placement)?;
+    if result.lines>1 || (result.lines==1 && (!result.spin || placement.pose.piece==Piece::O)){return None;}
+    Some(policy::score(weights,board,&result.board,placement,result.lines,used,spins,placed,max_pieces))
 }
 
 fn features(before: &Board, after: &Board, placement: &Placement, lines: u8) -> [f64; FEATURE_COUNT] {
@@ -704,11 +783,18 @@ struct Evaluation {
     fitness: Fitness, best: Option<EpisodeResult>, seeds: Vec<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     objectives: Option<evolution::Objectives>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical: Option<physical::EvaluationMetrics>,
 }
 impl Evaluation {
-    fn empty() -> Self { Self { fitness: Fitness::default(), best: None, seeds: vec![], objectives: None } }
+    fn empty() -> Self { Self { fitness: Fitness::default(), best: None, seeds: vec![], objectives: None, physical: None } }
     fn add(&mut self, result: EpisodeResult) {
         self.fitness.add(&result); self.seeds.push(result.seed);
+        if result.physical.is_some() {
+            self.physical.get_or_insert_with(physical::EvaluationMetrics::default).add(&result);
+            if self.best.as_ref().is_none_or(|best|physical::compare_result(&result,best).is_gt()) {self.best=Some(result);}
+            return;
+        }
         if result.frontier.is_some() {
             self.objectives.get_or_insert_with(evolution::Objectives::default).add(&result);
             if self.best.as_ref().is_none_or(|best| evolution::compare_result(&result, best).is_gt()) { self.best = Some(result); }
@@ -735,6 +821,10 @@ struct Initialization {
     inherited_weights: Vec<f64>,
     parent_completed_generations: u32,
     parent_checkpoint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inherited_raw_spins: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_selected_model_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -753,6 +843,14 @@ pub struct GenerationSummary {
     pub frontier_probability: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_behaviors: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical40_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_mean_spins: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_min_spins: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_evaluated_episodes: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -767,6 +865,8 @@ struct State {
     frontier: Option<evolution::Archive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     initialization: Option<Initialization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical: Option<physical::Archive>,
 }
 
 pub struct Trainer { state: State, restore_audit_ms: f64 }
@@ -786,19 +886,26 @@ impl Trainer {
     pub fn new(config: GaConfig) -> Result<Self, String> {
         config.validate()?;
         let mut rng = Random::new(config.seed);
-        let mut population = vec![Genome::new(INITIAL_WEIGHTS.to_vec())];
+        let initial = policy::initializer(config.parameter_count()>FEATURE_COUNT);
+        let mut population = vec![Genome::new(initial.clone())];
         while population.len() < config.population_size {
             let scale = if population.len() % 3 == 0 { 2.0 } else { 0.65 };
-            let weights = INITIAL_WEIGHTS.iter().map(|w| (w + rng.normal() * scale).clamp(-16.0, 16.0)).collect();
+            // Expanded models begin with an exactly zero residual. Keeping
+            // the same24 base RNG draws also makes capacity ablations start
+            // from identical base populations and action policies.
+            let weights = initial.iter().enumerate().map(|(i,w)| if i<FEATURE_COUNT {
+                (w + rng.normal()*scale).clamp(-16.0,16.0)
+            } else {*w}).collect();
             population.push(Genome::new(weights));
         }
         let size = config.population_size;
         let frontier = config.is_frontier().then(evolution::Archive::default);
+        let physical = config.is_physical().then(physical::Archive::default);
         Ok(Self { state: State { config, generation: 0, completed_generations: 0, rng,
             population, evaluations: vec![None; size], active_genome_index: 0,
             active_evaluation: Evaluation::empty(), active_episode: None, best: None,
             history: vec![], counters: Counters::default(), cache: vec![], total_evaluated_genomes: 0,
-            complete: false, frontier, initialization: None }, restore_audit_ms: 0.0 })
+            complete: false, frontier, initialization: None, physical }, restore_audit_ms: 0.0 })
     }
 
     /// Explicitly start a new v3 experiment from an existing coefficient
@@ -809,22 +916,48 @@ impl Trainer {
     }
 
     pub fn fork_checkpoint(config: GaConfig, checkpoint_json: &str) -> Result<Self, String> {
-        if !config.is_frontier() { return Err("An explicit GA fork requires the new v3 configuration".into()); }
+        if !config.is_frontier() && !config.is_physical() { return Err("An explicit GA fork requires a new experiment configuration".into()); }
         let previous = Self::from_checkpoint_json(checkpoint_json)?;
-        let mut trainer = Self::inherit_weights(config, previous.champion()?, Some(digest(checkpoint_json.as_bytes())))?;
+        let raw = if config.is_physical() {
+            previous.state.frontier.as_ref().and_then(|a|a.raw.as_ref()).map(|r|(r.genome.clone(),r.result.clone()))
+                .or_else(||previous.state.physical.as_ref().and_then(|a|a.raw.as_ref()).map(|r|r.inherited()))
+        } else {None};
+        let selected=previous.champion()?;
+        let mut source=selected.clone();
+        if let Some((genome,_))=&raw {
+            source=GaModel::new(genome.weights.clone(),previous.state.config.clone());
+            source.completed_generations=previous.state.completed_generations;
+        }
+        let mut trainer = Self::inherit_weights(config, source, Some(digest(checkpoint_json.as_bytes())))?;
+        if let Some((_,result))=raw {
+            let genome=trainer.state.population[0].clone();
+            trainer.state.physical.as_mut().unwrap().import(&trainer.state.config,&genome,&result)?;
+            let initialization=trainer.state.initialization.as_mut().unwrap();
+            initialization.kind="inherited-physical-archive-new-experiment".into();
+            initialization.inherited_raw_spins=Some(result.raw_spins);
+            let selected_weights=policy::upgrade_weights(&selected.weights,trainer.state.config.parameter_count()>FEATURE_COUNT)?;
+            let selected_genome=Genome::new(selected_weights);
+            if selected_genome.model_id!=trainer.state.population[0].model_id {
+                trainer.state.population[1]=selected_genome;
+                initialization.parent_selected_model_id=Some(selected.model_id);
+            }
+        }
         trainer.restore_audit_ms = previous.restore_audit_ms;
         Ok(trainer)
     }
 
     fn inherit_weights(config: GaConfig, model: GaModel, checkpoint_hash: Option<String>) -> Result<Self, String> {
-        if !config.is_frontier() { return Err("Inherited weights require an explicitly new v3 experiment".into()); }
+        if !config.is_frontier() && !config.is_physical() { return Err("Inherited weights require an explicitly new experiment".into()); }
+        let inherited=policy::upgrade_weights(&model.weights,config.parameter_count()>FEATURE_COUNT)?;
         let mut trainer = Self::new(config)?;
-        trainer.state.population[0] = Genome::new(model.weights.clone());
+        trainer.state.population[0] = Genome::new(inherited.clone());
         // Half the population explores around the inherited policy; the rest
         // keeps the fresh initializer/random population for independent search.
         for i in 1..trainer.state.population.len().div_ceil(2) {
             let scale = if i % 3 == 0 { 1.2 } else { 0.35 };
-            let weights = model.weights.iter().map(|w| (w + trainer.state.rng.normal() * scale).clamp(-16.0, 16.0)).collect();
+            let weights = inherited.iter().enumerate().map(|(j,w)| if j<FEATURE_COUNT {
+                (w + trainer.state.rng.normal()*scale).clamp(-16.0,16.0)
+            } else {*w}).collect();
             trainer.state.population[i] = Genome::new(weights);
         }
         trainer.state.initialization = Some(Initialization {
@@ -832,6 +965,8 @@ impl Trainer {
             parent_source_policy: model.source_policy, inherited_weights_sha256: model.weights_sha256,
             inherited_weights: model.weights, parent_completed_generations: model.completed_generations,
             parent_checkpoint_sha256: checkpoint_hash,
+            inherited_raw_spins: None,
+            parent_selected_model_id: None,
         });
         Ok(trainer)
     }
@@ -856,6 +991,26 @@ impl Trainer {
 
     fn advance_one(&mut self) -> Result<(), String> {
         let state = &mut self.state;
+        if let Some(mut repair)=state.physical.as_mut().and_then(|p|p.repair.take()) {
+            let result=repair.advance(&state.config,&mut state.counters)?;
+            let archive=state.physical.as_mut().unwrap();
+            if let Some(result)=result{
+                archive.repair_completed+=1;archive.repair40_count+=u64::from(result.raw_completed40);
+                archive.observe(state.generation,&repair.genome,&result,&state.config,false);
+            }else{archive.repair=Some(repair);}
+            return Ok(());
+        }
+        if let Some(mut continuation)=state.physical.as_mut().and_then(|p|p.continuation.take()) {
+            let previous_pieces=continuation.episode.raw_pieces;
+            continuation.episode.advance(&continuation.genome.weights,&state.config,&mut state.counters)?;
+            let archive=state.physical.as_mut().unwrap();
+            if continuation.episode.raw_pieces!=previous_pieces && archive.needs_observation(continuation.episode.raw_spins,continuation.episode.raw_pieces,false) {
+                archive.observe(state.generation,&continuation.genome,&continuation.episode.observed_result(),&state.config,false);
+            }
+            if continuation.episode.finished(){archive.record_completed(&continuation.episode.result()?,true);}
+            else{archive.continuation=Some(continuation);}
+            return Ok(());
+        }
         if state.active_genome_index >= state.population.len() {
             self.finish_generation(); return Ok(());
         }
@@ -870,7 +1025,9 @@ impl Trainer {
         }
         if state.active_evaluation.seeds.len() >= state.config.episodes_per_genome {
             let evaluation = state.active_evaluation.clone();
-            if state.best.as_ref().is_none_or(|b| if state.config.is_frontier() {
+            if state.best.as_ref().is_none_or(|b| if state.config.is_physical() {
+                physical::compare_evaluation(&evaluation,&b.evaluation).is_gt()
+            } else if state.config.is_frontier() {
                 evolution::compare_evaluation(&evaluation, &b.evaluation).is_gt()
             } else { evaluation.fitness > b.evaluation.fitness }) {
                 state.best = Some(Champion { genome: genome.clone(), evaluation: evaluation.clone() });
@@ -893,7 +1050,13 @@ impl Trainer {
         }
         let episode = state.active_episode.as_mut().unwrap();
         let old_proofs = episode.proofs.len();
+        let old_pieces = episode.raw_pieces;
         episode.advance(&genome.weights, &state.config, &mut state.counters)?;
+        if let Some(archive)=&mut state.physical {
+            if episode.raw_pieces!=old_pieces && archive.needs_observation(episode.raw_spins,episode.raw_pieces,true) {
+                archive.observe(state.generation,genome,&episode.observed_result(),&state.config,false);
+            }
+        }
         if let Some(archive) = &mut state.frontier {
             archive.generation_raw_max = archive.generation_raw_max.max(episode.raw_spins);
             let prefix_changed = old_proofs != episode.proofs.len();
@@ -904,6 +1067,10 @@ impl Trainer {
         if episode.finished() {
             let result = episode.result()?;
             if let Some(archive) = &mut state.frontier { archive.completed(&result); }
+            if let Some(archive)=&mut state.physical {
+                archive.record_completed(&result,false);
+                archive.schedule(state.generation,&state.config,genome,&mut state.rng)?;
+            }
             state.active_evaluation.add(result); state.counters.evaluated_episodes += 1;
             state.active_episode = None;
         }
@@ -917,6 +1084,7 @@ impl Trainer {
     }
 
     fn finish_generation(&mut self) {
+        if self.state.config.is_physical(){physical::finish_generation(&mut self.state);return;}
         if self.state.config.is_frontier() { evolution::finish_generation(&mut self.state); return; }
         let mut ranked: Vec<_> = (0..self.state.population.len()).collect();
         ranked.sort_by(|&a, &b| self.state.evaluations[b].as_ref().unwrap().fitness
@@ -930,6 +1098,7 @@ impl Trainer {
             evaluated_genomes: self.state.population.len(),
             generation_raw_max: None, all_time_raw_max: None, strict_spins: None,
             frontier_spins: None, frontier_probability: None, unique_behaviors: None,
+            physical40_count:None,physical_mean_spins:None,physical_min_spins:None,physical_evaluated_episodes:None,
         });
         if self.state.history.len() > 256 { self.state.history.remove(0); }
         self.state.completed_generations += 1;
@@ -1001,12 +1170,12 @@ impl Trainer {
             "checked":e.verifier.as_ref().map_or(0,Verifier::checked),"qualifiedPrefixLive":e.prefix_live
         }));
         let mut snapshot = serde_json::json!({
-            "schemaVersion":"neyra-ga-snapshot-v1","sourcePolicy":state.config.source_policy(),"featureSchema":FEATURE_SCHEMA,
+            "schemaVersion":"neyra-ga-snapshot-v1","sourcePolicy":state.config.source_policy(),"featureSchema":state.config.feature_schema(),
             "status":if state.complete{"complete"}else{"running"},"generation":state.generation,
             "completedGenerations":state.completed_generations,"populationSize":state.config.population_size,
             "evaluatedGenomes":state.active_genome_index,"totalEvaluatedGenomes":state.total_evaluated_genomes,
             "activeGenomeIndex":state.active_genome_index,"best":best,"current":current,
-            "history":state.history,"counters":state.counters,"featureNames":FEATURE_NAMES,
+            "history":state.history,"counters":state.counters,"featureNames":policy::feature_names(state.config.parameter_count()).unwrap(),
             "restoreAuditMs":self.restore_audit_ms,
             "learningComplete":false,"deploymentReady":false,
             "workDefinition":"One full reachable-lock piece query, selected-input replay, canonical graph/supply slice, or phase transition. Work units differ from legacy search steps.",
@@ -1040,6 +1209,28 @@ impl Trainer {
         } else {
             snapshot["rawArchiveCompleteHistory"] = false.into();
         }
+        if let Some(physical)=&state.physical {
+            snapshot["trainingMode"]="physical-only".into();snapshot["probabilityMeasured"]=false.into();
+            snapshot["parameterCount"]=state.config.parameter_count().into();
+            snapshot["physical"]=physical.snapshot(&state.counters);
+            snapshot["rawArchive"]=physical.raw.as_ref().map(physical::Route::snapshot).unwrap_or(serde_json::Value::Null);
+            snapshot["bestFromEmptyArchive"]=physical.best_from_empty.as_ref().map(physical::Route::snapshot).unwrap_or(serde_json::Value::Null);
+            snapshot["rawArchiveCompleteHistory"]=true.into();
+            if let Some(current)=snapshot["current"].as_object_mut(){current.insert("qualifiedPrefixLive".into(),false.into());}
+            if let Some(best)=snapshot["best"].as_object_mut(){
+                best.insert("probabilityMeasured".into(),false.into());best.insert("probability".into(),serde_json::Value::Null);
+                best.insert("trainingMode".into(),"physical-only".into());
+            }
+            if let Some(c)=&physical.continuation {
+                snapshot["current"]=serde_json::json!({"rawSpins":c.episode.raw_spins,"rawPieces":c.episode.raw_pieces,
+                    "qualifiedSpins":0,"qualifiedBags":0,"rows":c.episode.board.rows,"phase":"returning-to-physical-prefix",
+                    "checked":0,"qualifiedPrefixLive":false,
+                    "continuationPrefixPieces":c.episode.physical.as_ref().map_or(0,|p|p.continuation_prefix_pieces)});
+            }
+            if let Some(repair)=&physical.repair{
+                snapshot["current"]=repair.current_snapshot();
+            }
+        }
         if let Some(initialization) = &state.initialization {
             snapshot["initialization"] = serde_json::to_value(initialization).map_err(|e|e.to_string())?;
         }
@@ -1048,10 +1239,10 @@ impl Trainer {
 
     pub fn checkpoint_json(&self) -> Result<String, String> {
         let mut state = serde_json::to_value(&self.state).map_err(|e| e.to_string())?;
-        if self.state.config.is_frontier() { checkpoint::compact(&mut state)?; }
+        if self.state.config.is_frontier() || self.state.config.is_physical() { checkpoint::compact(&mut state)?; }
         let bytes = serde_json::to_vec(&state).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"schemaVersion":"neyra-ga-checkpoint-v1","sourcePolicy":self.state.config.source_policy(),
-            "featureSchema":FEATURE_SCHEMA,"checksum":digest(&bytes),"state":state}).to_string())
+            "featureSchema":self.state.config.feature_schema(),"checksum":digest(&bytes),"state":state}).to_string())
     }
 
     pub fn from_checkpoint_json(json: &str) -> Result<Self, String> {
@@ -1061,23 +1252,35 @@ impl Trainer {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Envelope { schema_version: String, source_policy: String, feature_schema: String, checksum: String, state: serde_json::Value }
         let e: Envelope = serde_json::from_str(json).map_err(|e| format!("Invalid GA checkpoint: {e}"))?;
-        if e.schema_version != "neyra-ga-checkpoint-v1" || !matches!(e.source_policy.as_str(), SOURCE_POLICY | LEGACY_SOURCE_POLICY) || e.feature_schema != FEATURE_SCHEMA
+        if e.schema_version != "neyra-ga-checkpoint-v1" || !matches!(e.source_policy.as_str(), SOURCE_POLICY | LEGACY_SOURCE_POLICY | PHYSICAL_SOURCE_POLICY)
+            || !matches!(e.feature_schema.as_str(),FEATURE_SCHEMA | policy::CONTEXT_FEATURE_SCHEMA)
             || e.checksum != digest(&serde_json::to_vec(&e.state).map_err(|e| e.to_string())?) {
             return Err("GA checkpoint schema, source policy, or checksum mismatch".into());
         }
         let mut encoded_state = e.state;
-        if e.source_policy == SOURCE_POLICY { checkpoint::expand(&mut encoded_state)?; }
+        if matches!(e.source_policy.as_str(),SOURCE_POLICY | PHYSICAL_SOURCE_POLICY) { checkpoint::expand(&mut encoded_state)?; }
         let state: State = serde_json::from_value(encoded_state).map_err(|e| format!("Invalid GA checkpoint state: {e}"))?;
         state.config.validate()?;
-        if e.source_policy != state.config.source_policy() || state.frontier.is_some()!=state.config.is_frontier() {
+        if e.source_policy != state.config.source_policy() || e.feature_schema!=state.config.feature_schema()
+            || state.frontier.is_some()!=state.config.is_frontier() || state.physical.is_some()!=state.config.is_physical() {
             return Err("GA checkpoint policy/config mismatch; fork explicitly instead of silently migrating".into());
+        }
+        if let Some(physical)=&state.physical {
+            if state.counters.supply_queries!=0 || state.counters.verification_work!=0
+                || state.counters.evaluated_episodes!=physical.fresh_episodes {
+                return Err("Physical-only GA checkpoint contains supply work or mismatched fresh episode totals".into());
+            }
         }
         if let Some(initialization) = &state.initialization {
             validate_weights(&initialization.inherited_weights)?;
-            if !state.config.is_frontier() || initialization.kind != "inherited-weights-new-experiment"
+            if (!state.config.is_frontier() && !state.config.is_physical())
+                || !matches!(initialization.kind.as_str(),"inherited-weights-new-experiment"|"inherited-physical-archive-new-experiment")
                 || initialization.inherited_weights_sha256 != weights_digest(&initialization.inherited_weights)
                 || initialization.parent_model_id != Genome::new(initialization.inherited_weights.clone()).model_id
-                || !matches!(initialization.parent_source_policy.as_str(), SOURCE_POLICY | LEGACY_SOURCE_POLICY)
+                || !matches!(initialization.parent_source_policy.as_str(), SOURCE_POLICY | LEGACY_SOURCE_POLICY | PHYSICAL_SOURCE_POLICY)
+                || initialization.inherited_raw_spins.is_some_and(|n|n>40)
+                || initialization.parent_selected_model_id.as_ref().is_some_and(|id|!id.starts_with("ga-") || id.len()!=23)
+                || (initialization.kind=="inherited-physical-archive-new-experiment" && !state.config.is_physical())
                 || initialization.parent_checkpoint_sha256.as_ref().is_some_and(|h|h.len()!=64) {
                 return Err("Invalid inherited GA initialization provenance".into());
             }
@@ -1093,7 +1296,7 @@ impl Trainer {
         }
         for genome in state.population.iter().chain(state.best.iter().map(|c| &c.genome)) {
             validate_weights(&genome.weights)?;
-            if genome.model_id != Genome::new(genome.weights.clone()).model_id { return Err("GA checkpoint genome digest mismatch".into()); }
+            if genome.weights.len()!=state.config.parameter_count() || genome.model_id != Genome::new(genome.weights.clone()).model_id { return Err("GA checkpoint genome digest mismatch".into()); }
         }
         for (i, evaluation) in state.evaluations.iter().enumerate() {
             if (i < state.active_genome_index) != evaluation.is_some() {
@@ -1121,6 +1324,7 @@ impl Trainer {
         for evaluation in evaluations {
             let n = evaluation.seeds.len() as u32;
             if n as usize > state.config.episodes_per_genome || evaluation.fitness.certified_episodes > n
+                || evaluation.fitness.raw_completed_episodes>n
                 || evaluation.fitness.qualified_spins > n * 40 || evaluation.fitness.raw_spins > n * 40
                 || evaluation.fitness.raw_pieces > n * u32::from(state.config.max_pieces)
                 || evaluation.best.is_none() != (n == 0) {
@@ -1128,6 +1332,17 @@ impl Trainer {
             }
             if evaluation.objectives.is_some() != (state.config.is_frontier() && n>0) {
                 return Err("GA checkpoint objective-version mismatch".into());
+            }
+            if evaluation.physical.is_some()!=(state.config.is_physical() && n>0){return Err("GA physical objective-version mismatch".into());}
+            if let Some(p)=&evaluation.physical {
+                if p.min_spins.is_none_or(|m|m>40 || m>p.max_spins) || p.max_spins>40 || p.completed_cost>n*126
+                    || evaluation.fitness.raw_spins<u32::from(p.min_spins.unwrap_or(0))*n
+                    || evaluation.fitness.raw_spins>u32::from(p.max_spins)*n
+                    || (evaluation.fitness.raw_completed_episodes>0 && p.max_spins<40)
+                    || evaluation.fitness.certified_episodes!=0 || evaluation.fitness.qualified_spins!=0
+                    || evaluation.fitness.failure_quiet_safe!=0 || evaluation.fitness.failure_success!=0 {
+                    return Err("Invalid physical-only GA evaluation totals".into());
+                }
             }
             if let Some(objectives)=&evaluation.objectives {
                 if !objectives.probability_sum.is_finite() || objectives.probability_sum<0.0
@@ -1146,10 +1361,13 @@ impl Trainer {
                 if n == 1 {
                     let mut exact = Fitness::default(); exact.add(best);
                     if exact != evaluation.fitness { return Err("GA checkpoint single-episode fitness mismatch".into()); }
+                    if let Some(p)=&evaluation.physical{let mut exact=physical::EvaluationMetrics::default();exact.add(best);
+                        if exact!=*p{return Err("Physical checkpoint single-episode metrics mismatch".into());}}
                 }
             }
         }
         if let Some(archive)=&state.frontier { archive.audit(&state.config,state.generation,&mut audited)?; }
+        if let Some(archive)=&state.physical { archive.audit(&state.config,state.generation,&mut audited)?; }
         Ok(Self { state, restore_audit_ms: (now_ms() - restore_start).max(0.0) })
     }
 }
@@ -1161,15 +1379,17 @@ pub struct FrozenRunner {
     model: GaModel, config: GaConfig, seeds: Vec<u32>, next_seed: usize,
     episode: Option<Episode>, evaluation: Evaluation, counters: Counters,
     maximum_raw_spins: u8, maximum_qualified_spins: u8,
+    seed_results: Vec<serde_json::Value>,
 }
 impl FrozenRunner {
     pub fn new(model: GaModel, config: GaConfig, seeds: Vec<u32>) -> Result<Self, String> {
         model.validate()?; config.validate()?;
+        if model.weights.len()!=config.parameter_count(){return Err("Frozen model capacity differs from evaluation configuration".into());}
         if seeds.is_empty() || seeds.len() > 65_536 { return Err("Supply 1..65536 frozen evaluation seeds".into()); }
         let mut unique = std::collections::HashSet::new();
         if !seeds.iter().all(|s| unique.insert(*s)) { return Err("Frozen evaluation seeds must be distinct".into()); }
         Ok(Self { model, config, seeds, next_seed: 0, episode: None, evaluation: Evaluation::empty(), counters: Counters::default(),
-            maximum_raw_spins: 0, maximum_qualified_spins: 0 })
+            maximum_raw_spins: 0, maximum_qualified_spins: 0, seed_results: vec![] })
     }
     pub fn finished(&self) -> bool { self.next_seed >= self.seeds.len() && self.episode.is_none() }
     pub fn counters(&self) -> &Counters { &self.counters }
@@ -1183,7 +1403,14 @@ impl FrozenRunner {
             self.maximum_raw_spins = self.maximum_raw_spins.max(episode.raw_spins);
             self.maximum_qualified_spins = self.maximum_qualified_spins.max(episode.qualified_spins);
             if episode.finished() {
-                self.evaluation.add(episode.result()?); self.counters.evaluated_episodes += 1; self.episode = None;
+                let result=episode.result()?;
+                if self.config.is_physical(){
+                    let trace:Vec<_>=result.frames.iter().map(|f|(&f.piece,f.rows,f.placed_cells,f.spins)).collect();
+                    self.seed_results.push(serde_json::json!({"seed":result.seed,"rawSpins":result.raw_spins,
+                        "rawPieces":result.raw_pieces,"rawCompleted40":result.raw_completed40,"termination":result.termination,
+                        "behaviorDigest":digest(&serde_json::to_vec(&trace).unwrap())}));
+                }
+                self.evaluation.add(result); self.counters.evaluated_episodes += 1; self.episode = None;
             }
         }
         self.counters.elapsed_ms += (now_ms() - start).max(0.0);
@@ -1196,14 +1423,20 @@ impl FrozenRunner {
         let mut best_fitness = Fitness::default();
         if let Some(r) = &self.evaluation.best { best_fitness.add(r); }
         let use_current = current.as_ref().is_some_and(|current| self.evaluation.best.as_ref().is_none_or(|best|
-            if self.config.is_frontier() { evolution::compare_result(current,best).is_gt() }
+            if self.config.is_physical(){physical::compare_result(current,best).is_gt()}
+            else if self.config.is_frontier() { evolution::compare_result(current,best).is_gt() }
             else { current_fitness > best_fitness }));
         let best = if use_current { current.as_ref() } else { self.evaluation.best.as_ref() };
         serde_json::json!({"schemaVersion":"neyra-ga-evaluation-v1","sourcePolicy":self.config.source_policy(),"modelSourcePolicy":self.model.source_policy,
             "modelId":self.model.model_id,"weightsSha256":self.model.weights_sha256,
             "config":self.config,"requestedSeeds":self.seeds,"completedSeeds":self.evaluation.seeds,
             "complete":self.finished(),"fitness":self.evaluation.fitness,"best":best,
+            "perSeed":if self.config.is_physical(){Some(&self.seed_results)}else{None},
             "maximumObservedRawSpins":self.maximum_raw_spins,"maximumObservedQualifiedSpins":self.maximum_qualified_spins,
+            "physical":if self.config.is_physical(){Some(serde_json::json!({"fromEmpty40Count":self.evaluation.fitness.raw_completed_episodes,
+                "freshEpisodes":self.evaluation.seeds.len(),"fromEmptyMeanSpins":if self.evaluation.seeds.is_empty(){None}else{Some(f64::from(self.evaluation.fitness.raw_spins)/self.evaluation.seeds.len() as f64)},
+                "fromEmptyMinSpins":self.evaluation.physical.as_ref().and_then(|p|p.min_spins),"fromEmptyMaxSpins":self.evaluation.physical.as_ref().map(|p|p.max_spins),
+                "probabilityMeasured":false,"prefixReturns":0}))}else{None},
             "bestFromUnfinishedEpisode":use_current,
             "counters":self.counters,"unfinishedEpisode":self.episode.as_ref().map(|e|serde_json::json!({
                 "seed":e.seed,"rawSpins":e.raw_spins,"qualifiedSpins":e.qualified_spins,"rawPieces":e.raw_pieces})),

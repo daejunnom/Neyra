@@ -208,7 +208,8 @@ impl Route {
 
     fn audit(&self, config: &GaConfig, audited: &mut std::collections::HashSet<String>) -> Result<(), String> {
         validate_weights(&self.genome.weights)?;
-        if self.genome.model_id != Genome::new(self.genome.weights.clone()).model_id
+        if self.genome.weights.len()!=config.parameter_count()
+            || self.genome.model_id != Genome::new(self.genome.weights.clone()).model_id
             || self.pieces > config.max_pieces || self.success_counts.len() > 18
             || self.success_counts.iter().any(|&c| c == 0 || usize::from(c) > P7_COUNT) {
             return Err("Invalid archived GA genome/counts".into());
@@ -474,7 +475,8 @@ pub(super) fn finish_generation(state:&mut State){
         strict_spins:Some(archive.strict.as_ref().map_or(0,|r|r.spins)),
         frontier_spins:Some(archive.frontier.iter().map(|r|r.spins).max().unwrap_or(0)),
         frontier_probability:archive.frontier.iter().max_by(|a,b|a.spins.cmp(&b.spins).then(compare_chance(&a.success_counts,&b.success_counts))).and_then(|r|r.probability),
-        unique_behaviors:Some(unique.len())});
+        unique_behaviors:Some(unique.len()),physical40_count:None,physical_mean_spins:None,
+        physical_min_spins:None,physical_evaluated_episodes:None});
     if state.history.len()>256{state.history.remove(0);}
     archive.stagnant_generations=if archive.improved_this_generation{0}else{archive.stagnant_generations+1};
     archive.improved_this_generation=false;archive.generation_raw_max=0;

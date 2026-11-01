@@ -37,7 +37,52 @@
   additional computation sharing with matched-work ABBA measurements before
   adopting it; worker-local caches do not imply a global shared search DAG.
 
-## Active probability frontier and learned search — latest 2026-11-01 instruction
+## Physical completion curriculum — latest 2026-11-02 instruction
+
+- New GA learning removes all supply-probability and quiet-coverage checks from
+  rollout fitness, admission and reproduction. It learns to generate actual
+  40 Spin Single candidate paths first. This changes GA only; it does not relax
+  the second-stage search's exact fixed-plan supply or quiet-safe certificates.
+- Keep canonical Sonic Drop/SRS+ reachable locks, actual input replay, no O
+  singles, and one occurrence of each type in every full seven-piece bag.
+  Every placement is still individually legal. A raw 40-spin path is not a
+  random-bag completion certificate or a universal online policy.
+- Use an explicit new policy/configuration for physical-only training. Preserve
+  original v2/v3 checkpoints and their exact resume semantics. A physical fork
+  should retain the best replayable physical record and its weights, not silently
+  inherit a lower-spin probability-selected champion. Audit inherited paths and
+  keep their provenance separate from new evaluations.
+- Retained bag prefixes may be replayed before exploring a new suffix. Keep
+  from-empty policy evaluation, archive continuation success, and imported
+  evidence separate. Replaying a known completion is not a fresh discovery or
+  evidence of stable policy completion. Seeds vary search decisions; they do
+  not create independent random-supply game tasks.
+- Compare the existing 24-parameter policy and a modest context-conditioned
+  expansion under matched budgets. Zero residual expansion must preserve the
+  old policy. Mutation settings must account for dimensionality; adding many
+  weights does not justify multiplying behavioral perturbation unchecked.
+- Probability-unmeasured physical candidates must be labeled as unmeasured,
+  not zero chance, qualified, strict-100%, deployment ready or learning complete.
+  Retain the best physical record even when current-generation results regress.
+- The next curriculum is physical completion, then exact probability-aware
+  search/repair, then optional probability-aware fine-tuning. It is a direction,
+  not evidence that a low-probability physical path can be repaired. Keep
+  failing supplies and actual exact verification results available to later
+  stages without reintroducing their reward into the physical-only GA.
+- Stability requires repeated frozen-policy evaluation and distinct successful
+  candidate evidence under declared budgets. One or two lucky completions or
+  finishing the configured generations do not establish stability. Report
+  physical, random-supply and strict-100% completion separately.
+- Bounded terminal repair is separate from fresh-policy fitness and greedy
+  prefix continuation. Persist its cursors, bound both pending and active
+  frontiers, and replay each returned whole path. Budget exhaustion is unknown,
+  never a proof of physical impossibility. Deduplicate completed candidates by
+  their full typed targets and line-deletion context, not execution order alone.
+- Optional fitting of an actually replayed success trajectory must be labeled
+  separately from GA evolution. Reproducing that same trajectory under many
+  tie/noise seeds does not establish candidate diversity or random-bag success.
+
+## Retained probability frontier and learned search — 2026-11-01 instruction
 
 - The task is a fixed typed bag plan that can be built under random bag order,
   not a solution for one lucky queue. Generate one actual legal mino placement

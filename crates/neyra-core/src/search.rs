@@ -2505,7 +2505,9 @@ impl GenerationJob {
             let quality = if let Some(weights) = &self.ga_weights {
                 // The fitted policy orders actual legal locks. Neither its
                 // score nor the search beam certifies supply or future spins.
-                crate::ga::score_placement(weights, &state.board, placement).unwrap_or(0.0) * 40.0
+                crate::ga::score_placement_context(weights, &state.board, placement,
+                    state.used, state.spins, self.start_pieces + state.targets.len() as u16,
+                    self.hard_piece_cap).unwrap_or(0.0) * 40.0
             } else if self.start_pieces == 0 {
                 // Early floor freedom remains important, but the last four
                 // placements must also retain a useful workspace and roof.
@@ -4982,7 +4984,7 @@ impl SearchSession {
             "deepExploration": "OneOfFourExplorationPhases;EligibleCertifiedDepthAtLeastTwoBags"
         });
         selective_search["fieldModel"] = serde_json::json!(if self.ga_weights.is_some() {
-            "FrozenGa24FeaturePlacementScoreTimes40;PhysicalRulesAndP7ProofIndependent"
+            "FrozenGaPlacementScoreTimes40;OptionalBagAndLocalGeometryContext;PhysicalRulesAndP7ProofIndependent"
         } else if self.evaluator.is_some() {
             "OccupancyOnlyV5;CompletedBoundariesFromBagTwo;FoundationsAndUnfinishedPrefixesStructural"
         } else {

@@ -164,11 +164,23 @@ pub struct CandidateSummary {
     pub ranking_score: f64,
     /// Raw boundary evaluation, separate from bounded internal spin ranking.
     pub field_quality: f64,
+    /// One retained geometric forecast, never verified progress or supply probability.
+    pub forecast_spins: u8,
+    pub forecast_spins_by_bag: [u8; CONTINUATION_BAGS],
+    pub forecast_placements: u8,
     pub frame_count: u16,
     pub frames: Vec<DisplayFrame>,
 }
 
 impl CandidateSummary {
+    fn set_forecast_quality(&mut self, future: &Continuation, quality: f64) {
+        self.field_quality = quality;
+        self.ranking_score = spin_rank(self.spins, quality);
+        self.forecast_spins = future.planned_spins;
+        self.forecast_spins_by_bag = future.planned_bag_spins;
+        self.forecast_placements = future.placements.len() as u8;
+    }
+
     fn for_snapshot(&self, include_frames: bool) -> Self {
         Self {
             id: self.id.clone(),
@@ -192,6 +204,9 @@ impl CandidateSummary {
             cdf: self.cdf.clone(),
             ranking_score: self.ranking_score,
             field_quality: self.field_quality,
+            forecast_spins: self.forecast_spins,
+            forecast_spins_by_bag: self.forecast_spins_by_bag,
+            forecast_placements: self.forecast_placements,
             frame_count: self.frame_count,
             frames: if include_frames {
                 self.frames.clone()
@@ -496,6 +511,19 @@ fn reflected_target(target: &TargetOperation) -> TargetOperation {
 fn root_orbit_direction(target: &TargetOperation) -> std::cmp::Ordering {
     let reflected = reflected_target(target);
     (target.piece, target.cells).cmp(&(reflected.piece, reflected.cells))
+}
+
+fn same_typed_targets(a: &[TargetOperation], b: &[TargetOperation]) -> bool {
+    a.len() == b.len() && a.iter().all(|target| b.iter().any(|other| {
+        target.piece == other.piece && target.cells == other.cells
+    }))
+}
+
+fn same_forecast_context(a: &Plan, b: &Plan) -> bool {
+    a.start == b.start && a.start_spins == b.start_spins && a.start_pieces == b.start_pieces
+        && a.expected == b.expected && a.expected_spins == b.expected_spins
+        && a.terminal == b.terminal && a.assume_reflection == b.assume_reflection
+        && a.debt == b.debt && same_typed_targets(&a.targets, &b.targets)
 }
 
 /// All field, dependency and speculative-future terms share this one budget.
@@ -1087,12 +1115,16 @@ impl VerificationJob {
 }
 
 const CONTINUATION_BAGS: usize = 3;
-const CONTINUATION_SPINS: u8 = 8;
+const CONTINUATION_SPINS: u8 = 6;
 const CONTINUATION_ALTERNATIVES: usize = 3;
 const CONTINUATION_TASKS: usize = 192;
 const CONTINUATION_RESERVED: usize = 24;
 const CONTINUATION_DEEP_WORK: u16 = 128;
-const CONTINUATION_THIRD_BAG_WORK: u16 = 192;
+const CONTINUATION_THIRD_BAG_WORK: u16 = 96;
+const CONTINUATION_FINISH_WORK: u16 = 24;
+const FORECAST_SPIN_STEP: f64 = 120.0;
+const FORECAST_EARLY_LIMIT: f64 = 24.0;
+const FORECAST_FIELD_LIMIT: f64 = 48.0;
 const CONTINUATION_RECIPES: usize = 4;
 const CONTINUATION_PAIR_LIMIT: u8 = 3;
 const CONTINUATION_READY_CAP: f64 = 12.0;
@@ -1103,6 +1135,7 @@ const CONTINUATION_INDEPENDENCE_CAP: f64 = 16.0;
 struct Continuation {
     placements: Vec<Placement>,
     alternatives: Vec<Vec<Placement>>,
+    /// Residual field/preparation value; throughput is a separate bounded tier.
     score: f64,
     /// Best concrete readiness evidence; never a count of alternative slots.
     preparation_score: f64,
@@ -1122,6 +1155,18 @@ struct Continuation {
 }
 
 impl Continuation {
+    fn throughput_priority(&self) -> f64 {
+        let count = self.planned_spins.min(CONTINUATION_SPINS);
+        if count == 0 { return 0.0; }
+        let locks = self.placements.len().min(CONTINUATION_BAGS * 7);
+        let radix = usize::from(CONTINUATION_SPINS) + 1;
+        let front = usize::from(self.planned_bag_spins[0]) * radix
+            + usize::from(self.planned_bag_spins[1]);
+        let early = ((CONTINUATION_BAGS * 7 - locks) * radix * radix + front) as f64
+            / (CONTINUATION_BAGS * 7 * radix * radix) as f64;
+        f64::from(count) * FORECAST_SPIN_STEP + FORECAST_EARLY_LIMIT * early.min(1.0)
+    }
+
     fn ordered_path(&self, variant: u64) -> &[Placement] {
         let index = variant as usize % (self.alternatives.len() + 1);
         if index == 0 { &self.placements } else { &self.alternatives[index - 1] }
@@ -1245,6 +1290,7 @@ struct ContinuationProbe {
     minimum_success: u16,
     profile: u8,
     budget: u16,
+    finish_by: Option<u16>,
 }
 
 impl ContinuationProbe {
@@ -1270,12 +1316,13 @@ impl ContinuationProbe {
             pair_finisher_masks: vec![],
             order_reflected: canonical_reflection(&board, ALL_PIECES, profile),
             minimum_success, profile,
-            budget: if profile == 3 { 96 } else { 64 },
+            budget: if profile == 3 { 96 } else { 64 }, finish_by: None,
         }
     }
 
     fn finished(&self) -> bool {
-        self.work >= self.budget || (self.tasks.is_empty() && self.reserved.is_empty())
+        self.work >= self.budget || self.finish_by.is_some_and(|limit| self.work >= limit)
+            || (self.tasks.is_empty() && self.reserved.is_empty())
     }
 
     fn push(&mut self, task: ProbeTask) {
@@ -1313,7 +1360,8 @@ impl ContinuationProbe {
 
     fn step(&mut self, cache: &mut PhysicsCache) {
         if self.finished() { return; }
-        let task = if self.tasks.is_empty() || (self.work % 4 == 3 && !self.reserved.is_empty()) {
+        let reserve_turn = if self.finish_by.is_some() { self.work % 2 == 1 } else { self.work % 4 == 3 };
+        let task = if self.tasks.is_empty() || (reserve_turn && !self.reserved.is_empty()) {
             self.reserved.pop_front()
         } else { self.tasks.pop_back() };
         let Some(task) = task else { return; };
@@ -1498,14 +1546,10 @@ impl ContinuationProbe {
             obstructed_mass: facts.obstructed_mass,
         });
         let Some(first) = state.first_bag.as_ref().or(current.as_ref()) else { return; };
-        // Distant singles have discounted preparation value only. Immediate
-        // future.spins/debt/access remain a snapshot of the first inventory.
-        let second = state.bag_spins[1];
-        let third = state.bag_spins[2];
-        let score = first.spins as f64 * 60.0 + first.quality
-            + second as f64 * 18.0 + third as f64 * 9.0;
-        let rank = first.spins as f64 + second as f64 * 0.3 + third as f64 * 0.15
-            + 0.45 * first.quality / (120.0 + first.quality.abs());
+        // All coherent singles contribute to the forecast-count priority.
+        // Immediate future.spins/debt/access still describe the first inventory.
+        let score = first.quality;
+        let rank = first.quality;
         let line = ForecastLine {
             continuation: Continuation {
                 placements: state.placements.clone(), alternatives: vec![], score,
@@ -1527,13 +1571,10 @@ impl ContinuationProbe {
                     .all(|(&new, &old)| new == 0 || new == old))
         };
         if self.lines.iter().any(|prior| comparable(prior)
-            && (prior.continuation.planned_spins > line.continuation.planned_spins
-                || (prior.continuation.planned_spins == line.continuation.planned_spins
-                    && prior.rank >= line.rank))) { return; }
+            && !Self::compare_lines(&line, prior).is_gt()) { return; }
         self.lines.retain(|prior| !comparable(prior));
         self.lines.push(line);
-        self.lines.sort_by(|a, b| b.rank.total_cmp(&a.rank).then_with(||
-            b.continuation.planned_bag_spins.cmp(&a.continuation.planned_bag_spins)).then_with(||
+        self.lines.sort_by(|a, b| Self::compare_lines(b, a).then_with(||
             a.continuation.placements.iter().map(|p| canonical_pose_key(p.pose, self.order_reflected))
                 .cmp(b.continuation.placements.iter().map(|p| canonical_pose_key(p.pose, self.order_reflected)))));
         // Reserve one alternative first spin when available. Three nearby
@@ -1545,6 +1586,13 @@ impl ContinuationProbe {
         self.refresh_best();
     }
 
+    fn compare_lines(a: &ForecastLine, b: &ForecastLine) -> std::cmp::Ordering {
+        a.continuation.planned_spins.cmp(&b.continuation.planned_spins)
+            .then_with(|| b.continuation.placements.len().cmp(&a.continuation.placements.len()))
+            .then_with(|| a.continuation.planned_bag_spins.cmp(&b.continuation.planned_bag_spins))
+            .then_with(|| a.rank.total_cmp(&b.rank))
+    }
+
     fn refresh_best(&mut self) {
         self.best = self.lines.first().map(|line| line.continuation.clone()).unwrap_or_default();
         self.best.alternatives = self.lines.iter().skip(1)
@@ -1553,6 +1601,11 @@ impl ContinuationProbe {
         self.best.preparation_score = self.preparation_score;
         self.best.independence_score = self.independence_score;
         self.best.score += self.preparation_score + self.independence_score;
+        if self.best.planned_spins >= CONTINUATION_SPINS && self.finish_by.is_none() {
+            // Finish only a bounded tail for alternate first goals and pending
+            // order checks. Finding six never buys another full deep horizon.
+            self.finish_by = Some(self.work.saturating_add(CONTINUATION_FINISH_WORK));
+        }
     }
 
     fn record_preparation(&mut self, state: &ProbeState) {
@@ -1761,7 +1814,8 @@ impl ContinuationProbe {
         // Every preceding inventory must have yielded two actual singles and
         // consumed all seven labels. Readiness or open air buys no extension.
         if state.inventory == 0 && state.bag + 1 < CONTINUATION_BAGS
-            && state.bag_spins[state.bag] >= 2 {
+            && state.bag_spins[state.bag] >= 2 && state.spins < CONTINUATION_SPINS
+            && self.finish_by.is_none() {
             state.bag += 1;
             state.inventory = ALL_PIECES;
             state.bag_start = board;
@@ -2577,6 +2631,8 @@ struct TreeNode {
     lease_epoch: u64,
     last_selected: u64,
     quality: f64,
+    /// Same composed units without speculative throughput or repayment credit.
+    static_quality: f64,
     last_improved_attempt: u32,
     best_extension_spins: u8,
     best_extension_quality: f64,
@@ -2590,6 +2646,8 @@ struct Archived {
     summary: CandidateSummary,
     certificates: Vec<Rc<BagCertificate>>,
     pending_plan: Option<Plan>,
+    /// Exact forecast context survives eviction of the live boundary node.
+    forecast_debt: CellMask,
 }
 
 struct Random(u64);
@@ -2642,10 +2700,25 @@ fn boundary_quality(board: &Board, debt: &CellMask, future: &Continuation) -> f6
     boundary_quality_from_facts(&BoardFacts::new(board), debt, future)
 }
 
+fn boundary_field_component(raw: f64) -> f64 {
+    FORECAST_FIELD_LIMIT * raw / (120.0 + raw.abs())
+}
+
+fn boundary_quality_parts(facts: &BoardFacts, debt: &CellMask, future: &Continuation) -> (f64, f64) {
+    let charged = mask_count(&facts.penalized_debt(debt));
+    let static_raw = facts.terrain_score_witnessed(future.immediate_anchor.as_deref()) * 2.0
+        - f64::from(charged) * 12.0;
+    let raw = static_raw + future.score + f64::from(charged.min(future.paid)) * 12.0;
+    // A one-count step is 120. All earliness differences are at most 24
+    // and all residual-field differences are strictly below 96. Thus a
+    // larger coherent forecast wins at equal actual spins, before the one
+    // final spin-rank normalization. Forecasts never become actual progress.
+    (future.throughput_priority() + boundary_field_component(raw),
+        boundary_field_component(static_raw))
+}
+
 fn boundary_quality_from_facts(facts: &BoardFacts, debt: &CellMask, future: &Continuation) -> f64 {
-    let unexplained = mask_count(&facts.penalized_debt(debt)).saturating_sub(future.paid);
-    facts.terrain_score_witnessed(future.immediate_anchor.as_deref()) * 2.0 + future.score
-        - unexplained as f64 * 12.0
+    boundary_quality_parts(facts, debt, future).0
 }
 
 fn boundary_obstruction(board: &Board, future: &Continuation) -> u16 {
@@ -2866,8 +2939,10 @@ fn productive_locks(pieces: u16) -> u16 {
     pieces.saturating_sub(7).max(7)
 }
 
-fn efficiency(spins: u8, pieces: u16) -> f64 {
-    f64::from(spins) * 7.0 / f64::from(productive_locks(pieces))
+/// Quality shares the actual-spin numerator before conversion to scheduling
+/// efficiency. At equal depth, it can never outweigh two actual singles.
+fn scheduling_rank(spins: u8, pieces: u16, quality: f64) -> f64 {
+    spin_rank(spins, quality) * 7.0 / f64::from(productive_locks(pieces))
 }
 
 /// Expected spins as a rational with denominator 40 * horizon. Map a user
@@ -3000,7 +3075,7 @@ impl SearchSession {
             allowance: 4,
             lease_epoch: 0,
             last_selected: 0,
-            quality: 0.0,
+            quality: 0.0, static_quality: 0.0,
             last_improved_attempt: 0,
             best_extension_spins: 0,
             best_extension_quality: f64::NEG_INFINITY,
@@ -3455,8 +3530,8 @@ impl SearchSession {
                     // Reuse it instead of reinstating raw-hole penalties or
                     // flooding each waiting board during every comparison.
                     let quality = plan.quality;
-                    efficiency(plan.expected_spins, plan.start_pieces + plan.targets.len() as u16)
-                        + 0.2 * quality / (120.0 + quality.abs())
+                    scheduling_rank(plan.expected_spins,
+                        plan.start_pieces + plan.targets.len() as u16, quality)
                 };
                 priority(a).total_cmp(&priority(b)).then_with(|| b.id.cmp(&a.id))
             }).map(|(index, _)| index)
@@ -3475,8 +3550,7 @@ impl SearchSession {
             .max_by(|&a, &b| {
                 let priority = |i: usize| {
                     let n = &self.tree[i];
-                    efficiency(n.spins, n.pieces)
-                        + 0.2 * n.quality / (120.0 + n.quality.abs())
+                    scheduling_rank(n.spins, n.pieces, n.quality)
                         + 0.002 * self.dispatches.saturating_sub(n.last_selected).min(128) as f64
                         - 0.05 * f64::from(n.attempts)
                 };
@@ -3628,11 +3702,144 @@ impl SearchSession {
 
     fn remember_plan(&mut self, parent: usize, plan: &Plan) -> bool {
         let key = self.plan_key(parent, plan);
-        // Bounded duplicate cache; clearing affects cost, never certificates.
-        if self.seen_plans.len() >= 8192 {
-            self.seen_plans.clear();
+        // Fresh plans need no scan of the live tree. Forecast discovery does
+        // not make a new P7 key; upgrade only an already known exact plan.
+        if self.seen_plans.contains(&key) {
+            self.upgrade_exact_forecast(parent, plan);
+            return false;
         }
+        if self.seen_plans.len() >= 8192 { self.seen_plans.clear(); }
         self.seen_plans.insert(key)
+    }
+
+    fn upgrade_exact_forecast(&mut self, parent: usize, plan: &Plan) -> bool {
+        if plan.terminal { return false; }
+        let mut known = false;
+        for (prior_parent, prior) in &mut self.waiting_plans {
+            if *prior_parent == parent && same_forecast_context(prior, plan) {
+                known = true;
+                if plan.quality > prior.quality {
+                    prior.quality = plan.quality; prior.future = plan.future.clone();
+                }
+            }
+        }
+        if let Some(job) = &mut self.verification {
+            if job.parent == parent && same_forecast_context(&job.plan, plan) {
+                known = true;
+                if plan.quality > job.plan.quality {
+                    job.plan.quality = plan.quality; job.plan.future = plan.future.clone();
+                }
+            }
+        }
+        if let Some(current) = &mut self.current {
+            if current.certificates.len() == self.tree[parent].certificates.len()
+                && current.certificates.iter().zip(&self.tree[parent].certificates)
+                    .all(|(a, b)| Rc::ptr_eq(a, b)) {
+                if let Some(prior) = &mut current.pending_plan {
+                    if same_forecast_context(prior, plan) && plan.quality > prior.quality {
+                        prior.quality = plan.quality; prior.future = plan.future.clone();
+                        current.summary.set_forecast_quality(&plan.future, plan.quality);
+                    }
+                }
+            }
+        }
+        let mut promoted = None;
+        let prefix = &self.tree[parent].certificates;
+        for retained in [&mut self.current, &mut self.best_partial] {
+            let Some(archived) = retained else { continue; };
+            let matches = archived.summary.verified && !archived.summary.complete
+                && archived.forecast_debt == plan.debt
+                && archived.summary.rows == plan.expected.rows
+                && archived.summary.spins == plan.expected_spins
+                && archived.summary.placed == plan.start_pieces + 7
+                && archived.certificates.len() == prefix.len() + 1
+                && archived.certificates.iter().zip(prefix).all(|(a, b)| Rc::ptr_eq(a, b))
+                && (plan.start_pieces == 0 || archived.summary.first_bag_symmetry_assumed == plan.assume_reflection)
+                && archived.certificates.last().is_some_and(|certificate| {
+                    certificate.start_rows == plan.start.rows && certificate.start_spins == plan.start_spins
+                        && certificate.end_rows == plan.expected.rows && certificate.end_spins == plan.expected_spins
+                        && !certificate.terminal && same_typed_targets(&certificate.targets, &plan.targets)
+                });
+            if !matches { continue; }
+            known = true;
+            if plan.quality > archived.summary.field_quality {
+                archived.summary.set_forecast_quality(&plan.future, plan.quality);
+                if archived.summary.qualified && promoted.as_ref().is_none_or(|prior: &Archived| {
+                    better_partial(&archived.summary, &prior.summary)
+                }) { promoted = Some(archived.clone()); }
+            }
+        }
+        if let Some(archived) = promoted {
+            if self.best_partial.as_ref().is_none_or(|prior| {
+                better_partial(&archived.summary, &prior.summary)
+            }) { self.best_partial = Some(archived); }
+        }
+        // The same parent preserves the entire certified prefix and chance
+        // context. Equal occupancy alone must not transfer a different tiling
+        // or a different historical debt ledger into this cache update.
+        let matches: Vec<usize> = self.tree.iter().enumerate().filter_map(|(index, node)| {
+            let certificate = node.certificates.last()?;
+            (node.parent == Some(parent) && node.debt == plan.debt
+                && node.board == plan.expected && node.spins == plan.expected_spins
+                && node.pieces == plan.start_pieces + 7
+                && certificate.start_rows == plan.start.rows
+                && certificate.start_spins == plan.start_spins
+                && certificate.end_rows == plan.expected.rows
+                && certificate.end_spins == plan.expected_spins && !certificate.terminal
+                && (plan.start_pieces == 0 || node.certificates.first()
+                    .is_some_and(|c| c.first_bag_symmetry_assumed) == plan.assume_reflection)
+                && same_typed_targets(&certificate.targets, &plan.targets))
+                .then_some(index)
+        }).collect();
+        for index in matches {
+            known = true;
+            if plan.quality <= self.tree[index].quality { continue; }
+            let facts = BoardFacts::new(&plan.expected);
+            let (quality, static_quality) = boundary_quality_parts(&facts, &plan.debt, &plan.future);
+            let node = &mut self.tree[index];
+            node.future = plan.future.clone(); node.quality = quality; node.static_quality = static_quality;
+            node.obstructed_mass = node.future.obstructed_mass
+                .map_or(facts.obstructed_mass, |mass| facts.obstructed_mass.min(mass));
+            let depth = node.counts.len(); let spins = node.spins as usize;
+            self.best_quality_by_bag[depth][spins] = self.best_quality_by_bag[depth][spins].max(quality);
+            // An improved forecast is not a new successful child. Preserve
+            // attempts, last_improved_attempt, cooldown and existing certificates.
+            let archived = self.archive_boundary(index);
+            if self.current.as_ref().is_some_and(|current| {
+                current.summary.verified && current.summary.id == archived.summary.id
+            }) { self.current = Some(archived.clone()); }
+            if self.best_partial.as_ref().is_none_or(|prior| {
+                better_partial(&archived.summary, &prior.summary)
+            }) { self.best_partial = Some(archived); }
+            self.benchmark_epoch += 1;
+            self.focus = None;
+        }
+        known
+    }
+
+    fn archive_boundary(&self, index: usize) -> Archived {
+        let node = &self.tree[index];
+        let certificate = node.certificates.last().expect("certified boundary");
+        let probability = self.path_probability(&node.counts);
+        let symmetry = node.certificates.first().is_some_and(|c| c.first_bag_symmetry_assumed);
+        Archived {
+            summary: CandidateSummary {
+                id: certificate.id.clone(), rows: node.board.rows, spins: node.spins, placed: node.pieces,
+                probability, lower_probability: probability, upper_probability: probability,
+                first_bag_probability: node.counts.first().map(|c| f64::from(*c) / P7_COUNT as f64),
+                first_bag_symmetry: symmetry, first_bag_symmetry_assumed: symmetry,
+                complete: false, qualified: true, verified: true,
+                checked: certificate.checked, success: certificate.effective_success,
+                failed: certificate.checked - certificate.effective_success,
+                bag_count: node.counts.len() as u16, budget_pieces: None, cdf: vec![],
+                ranking_score: spin_rank(node.spins, node.quality), field_quality: node.quality,
+                forecast_spins: node.future.planned_spins,
+                forecast_spins_by_bag: node.future.planned_bag_spins,
+                forecast_placements: node.future.placements.len() as u8,
+                frame_count: node.frames.len() as u16, frames: node.frames.clone(),
+            },
+            certificates: node.certificates.clone(), pending_plan: None, forecast_debt: node.debt,
+        }
     }
 
     fn select_node(&mut self) -> Option<usize> {
@@ -3662,8 +3869,7 @@ impl SearchSession {
                     // improve a certified child. Real progress resets the age.
                     // paid tracks only the initially charged cavity ledger;
                     // accessible working pockets cannot earn repayment credit.
-                    let speculative = node.future.score.max(0.0)
-                        + f64::from(node.future.paid) * 12.0;
+                    let speculative = (node.quality - node.static_quality).max(0.0);
                     let quality = node.quality - speculative * stale / (stale + 4.0);
                     // Stored cells can pay for later singles. Charging every
                     // prefix lock again here permanently starves deeper setup
@@ -3674,8 +3880,7 @@ impl SearchSession {
                             - ((node.attempts + 1) as f64).log2() * 32.0
                             - bound.saturating_sub(self.active_budget) as f64 * 2.0
                             - bound.saturating_sub(self.config.piece_goal) as f64 * 0.8;
-                    efficiency(node.spins, node.pieces)
-                        + 0.2 * quality / (120.0 + quality.abs())
+                    scheduling_rank(node.spins, node.pieces, quality)
                 };
                 priority(a).total_cmp(&priority(b))
             })
@@ -3712,8 +3917,12 @@ impl SearchSession {
                 if current.pending_plan.as_ref().is_some_and(|plan| {
                     plan.id == 0 && plan.targets == seed.targets && plan.seed_frames == seed.frames
                 }) {
-                    current.summary.ranking_score = seed.score;
-                    current.summary.field_quality = seed.quality;
+                    current.summary.set_forecast_quality(&seed.future, seed.quality);
+                    current.forecast_debt = seed.debt;
+                    if let Some(plan) = &mut current.pending_plan {
+                        plan.quality = seed.quality;
+                        plan.future = seed.future.clone();
+                    }
                     return;
                 }
             }
@@ -3748,10 +3957,13 @@ impl SearchSession {
                 cdf: vec![],
                 ranking_score: seed.score,
                 field_quality: seed.quality,
+                forecast_spins: seed.future.planned_spins,
+                forecast_spins_by_bag: seed.future.planned_bag_spins,
+                forecast_placements: seed.future.placements.len() as u8,
                 frame_count: frames.len() as u16,
                 frames,
             },
-            certificates: parent.certificates.clone(),
+            certificates: parent.certificates.clone(), forecast_debt: seed.debt,
             pending_plan: Some(Plan {
                 id: 0,
                 start: job.start,
@@ -3798,6 +4010,12 @@ impl SearchSession {
                 current.summary.checked = job.checked as u16;
                 current.summary.success = job.coverage_success();
                 current.summary.failed = job.checked as u16 - job.coverage_success();
+                current.summary.set_forecast_quality(&job.plan.future, job.plan.quality);
+                current.forecast_debt = job.plan.debt;
+                if let Some(plan) = &mut current.pending_plan {
+                    plan.quality = job.plan.quality;
+                    plan.future = job.plan.future.clone();
+                }
                 return;
             }
         }
@@ -3827,10 +4045,13 @@ impl SearchSession {
                 cdf: vec![],
                 ranking_score: spin_rank(job.plan.expected_spins, quality),
                 field_quality: quality,
+                forecast_spins: job.plan.future.planned_spins,
+                forecast_spins_by_bag: job.plan.future.planned_bag_spins,
+                forecast_placements: job.plan.future.placements.len() as u8,
                 frame_count: frames.len() as u16,
                 frames,
             },
-            certificates: parent.certificates.clone(),
+            certificates: parent.certificates.clone(), forecast_debt: job.plan.debt,
             pending_plan: Some(job.plan.clone()),
         });
     }
@@ -3899,7 +4120,7 @@ impl SearchSession {
         // Reuse this boundary's immutable geometry facts locally. No shared
         // cache or certificate policy is introduced by the reuse.
         let facts = BoardFacts::new(&job.plan.expected);
-        let quality = boundary_quality_from_facts(&facts, &job.plan.debt, &job.plan.future);
+        let (quality, static_quality) = boundary_quality_parts(&facts, &job.plan.debt, &job.plan.future);
         let obstruction = job.plan.future.obstructed_mass
             .map_or(facts.obstructed_mass, |after| facts.obstructed_mass.min(after));
         let certificate = Rc::new(BagCertificate {
@@ -3951,13 +4172,16 @@ impl SearchSession {
             cdf,
             ranking_score: spin_rank(last.spins, quality),
             field_quality: quality,
+            forecast_spins: job.plan.future.planned_spins,
+            forecast_spins_by_bag: job.plan.future.planned_bag_spins,
+            forecast_placements: job.plan.future.placements.len() as u8,
             frame_count: frames.len() as u16,
             frames: frames.clone(),
         };
         let archived = Archived {
             summary: summary.clone(),
             certificates: certificates.clone(),
-            pending_plan: None,
+            pending_plan: None, forecast_debt: job.plan.debt,
         };
         self.current = Some(archived.clone());
         if qualified {
@@ -4038,7 +4262,7 @@ impl SearchSession {
                     ) },
                     lease_epoch: self.benchmark_epoch,
                     last_selected: self.dispatches,
-                    quality,
+                    quality, static_quality,
                     last_improved_attempt: 0,
                     best_extension_spins: 0,
                     best_extension_quality: f64::NEG_INFINITY,
@@ -4065,6 +4289,7 @@ impl SearchSession {
                 }
             } else {
                 self.duplicates += 1;
+                self.upgrade_exact_forecast(job.parent, &job.plan);
             }
         }
         let reward = if job.plan.terminal && qualified {
@@ -4107,7 +4332,7 @@ impl SearchSession {
             .min_by(|a, b| {
                 let score = |i: usize| {
                     let n = &self.tree[i];
-                    efficiency(n.spins, n.pieces) + 0.2 * n.quality / (120.0 + n.quality.abs())
+                    scheduling_rank(n.spins, n.pieces, n.quality)
                 };
                 let eligible = |i| self.can_expand(i) && self.node_selective_reason(i).is_none();
                 eligible(*a).cmp(&eligible(*b)).then_with(|| score(*a).total_cmp(&score(*b)))
@@ -4210,7 +4435,11 @@ impl SearchSession {
                 "rootGeometryMirror": "ChronologicalTypedTargetOrbit;CanonicalBeforeLaneAssignment;NoMirroredInputProof",
                 "rootGeometryMirrorSkipped": self.mirror_pruned,
                 "continuationTwoBagWorkCap": if self.config.search_profile == 3 { 352 } else { 320 },
-                "continuationThirdBagGate": "TwoSinglesInEachCompletedSevenPieceBag",
+                "continuationThirdBagGate": "TwoSinglesInEachCompletedSevenPieceBag;BelowSixOnly",
+                "continuationFinishTail": CONTINUATION_FINISH_WORK,
+                "forecastPriority": "120*CoherentCount+24*Earliness+48*RawField/(120+AbsRawField)",
+                "forecastCountScope": "OneGeometricWitness;NotVerifiedProgressOrP7",
+                "schedulerQuality": "SpinRankNumeratorTimes7OverProductiveLocks;PublicEfficiencyUnchanged",
         });
         let mut selective_search = serde_json::json!({
                 "spinDelta": SPIN_DELTA, "residueMarginCells": RESIDUE_MARGIN,
@@ -4235,7 +4464,7 @@ impl SearchSession {
                 "continuationAlternatives": CONTINUATION_ALTERNATIVES,
                 "continuationMeaning": "CoherentGeometricPathsOnly;FirstBagGainAndDebtSeparate;NotP7",
                 "continuationTaskLimit": CONTINUATION_TASKS,
-                "continuationWorkCap": if self.config.search_profile == 3 { 544 } else { 512 },
+                "continuationWorkCap": if self.config.search_profile == 3 { 448 } else { 416 },
                 "spinPreparation": spin_preparation,
                 "siblingWindow": "SameParentNextPiece;noLessActualOrOptimisticSpins;supplyMaskSuperset;samePursuit",
                 "equalSpinSiblingQualityMargin": 24,
@@ -4356,7 +4585,8 @@ mod tests {
         let mut a = CandidateSummary {
             id: "119".into(),
             ranking_score: 40.0,
-            field_quality: 0.0,
+            field_quality: 0.0, forecast_spins: 0,
+            forecast_spins_by_bag: [0; CONTINUATION_BAGS], forecast_placements: 0,
             frame_count: 0,
             rows: [0; HEIGHT],
             spins: 40,

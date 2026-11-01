@@ -55,8 +55,12 @@
   terminal plan can contain seven targets while each supply needs fewer locks;
   never prune it using that canonical placement count as its minimum cost.
 - Within the same bag depth, search ranking must preserve the bounded spin contract: field quality
-  can reverse a one-spin difference, never a two-spin difference. Keep raw
-  evaluation separate and normalize once; no bonuses after normalization.
+  can reverse a one-spin difference, never a two-spin difference. Keep composite
+  forecast/terrain quality separate from the actual-spin rank; apply that rank
+  normalization once and add no bonuses afterwards.
+  Normalize scheduling quality in spin units before dividing by productive
+  locks, so its influence does not grow with bag depth. Explicit exploration
+  age/attempt preferences remain scheduling choices, not field evidence.
   Temporary scheduling cooldowns must not change the archived best route.
 - The displayed partial record uses spins/max(7, placed), then more bags and
   more total spins. For two one-bag records with equal spins, higher first-bag
@@ -154,18 +158,38 @@
   and excess towers above a useful roof.
   Root prefixes with no actual spin keep foundation-dependency weighting in
   mixed rounds too; this changes ordering, not their permission to clear.
-- Continuation forecasts may span three bag inventories and seek eight coherent
+- Blend bank occupancy with its connection to the outer wall. An isolated
+  center stack must not receive the same bank preference as outer storage.
+  Keep positive width/depth preferences weak and charge split low body-air
+  channels plus the small separating mass, including edge-open channels.
+  This is a bounded ordering cost, not an impossibility cut. Symmetric workspace
+  alternatives are not simultaneous useful regions: use one goal-aligned
+  workspace for terrain and only their common open core for neutral history.
+  An immediate spin in another pocket cannot unlock this workspace's rewards.
+- Continuation forecasts may span three bag inventories and seek six coherent
   Spin Singles. Consume all seven labels before resetting inventory and its
   bag-local start board, deleted rows and supply mask. Keep at most three
   distinct alternative paths, including piece-to-target assignment; never sum
   their spins, debt payments or supply success. First-forecast-bag spins and
-  obstruction/debt relief stay separate from discounted deeper preparation;
-  second and third bag contributions have separate discounts. Extra horizon
-  work requires actual productive completed inventories, not open space or an
-  unexecuted goal. Keep the base and second-bag work limits bounded.
+  obstruction/debt relief stay separate from the total forecast count. Rank
+  coherent probe lines by total spins, then fewer placements and earlier bag
+  distribution. Once a boundary has been probed, one more predicted spin must
+  outrank every secondary field/efficiency difference at equal actual spins;
+  cap those secondary terms instead of adding unbounded terrain/debt scores.
+  Never treat an unprobed mino prefix as if it already had a six-spin forecast.
+  Extra horizon work requires actual productive completed inventories, not open space or an
+  unexecuted goal. Keep the base and second-bag work limits bounded, and stop
+  deep expansion after reaching six while allowing a short reserved tail for
+  alternatives and independence checks.
   These are bounded geometric move-ordering hints, not P7 certificates or a
   mandatory prefix. Actual progress and public best routes count executed,
   verified bags only. Failure to find a forecast is unknown, not impossibility.
+- Better forecasts may refresh an existing exact plan without repeating P7,
+  only when tiling, boards, actual counts, debt and certificate context match.
+  Preserve its supply proof, actual frames and probability. Carry forecast
+  count, distribution and placement count through compact/full summaries and
+  archive identity. A scheduling cooldown may attenuate the forecast premium
+  over cached static quality, never rewrite the retained record's quality.
 - Keep pending-spin readiness and order independence as separate capped field
   features. Use one best concrete preparation/first-spin witness and one best
   disjoint recipe pair checked in both orders with actual single clears and a

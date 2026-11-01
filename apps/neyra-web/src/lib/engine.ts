@@ -56,6 +56,13 @@ function fieldQuality(candidate: Candidate): number {
   return Number.isFinite(candidate.fieldQuality) ? candidate.fieldQuality : -Infinity;
 }
 
+function sameForecast(a: Candidate, b: Candidate): boolean {
+  const aBags = a.forecastSpinsByBag ?? [];
+  const bBags = b.forecastSpinsByBag ?? [];
+  return a.forecastSpins === b.forecastSpins && a.forecastPlacements === b.forecastPlacements &&
+    aBags.length === bBags.length && aBags.every((spins, bag) => spins === bBags[bag]);
+}
+
 /** Compare the displayed efficiency record without floating-point division. */
 export function betterPartial(a: Candidate, b: Candidate): boolean {
   const aRate = a.spins * countedPieces(b);
@@ -75,7 +82,7 @@ export function betterPartial(a: Candidate, b: Candidate): boolean {
 /** A plan ID alone cannot distinguish an improved record from its old export. */
 function samePartialRecord(a: Candidate, b: Candidate): boolean {
   return a.id === b.id && a.spins === b.spins && a.placed === b.placed && a.bagCount === b.bagCount &&
-    fieldQuality(a) === fieldQuality(b) && a.probability === b.probability &&
+    fieldQuality(a) === fieldQuality(b) && sameForecast(a, b) && a.probability === b.probability &&
     a.firstBagProbability === b.firstBagProbability && a.firstBagSymmetry === b.firstBagSymmetry &&
     a.firstBagSymmetryAssumed === b.firstBagSymmetryAssumed && a.frameCount === b.frameCount &&
     a.rows.length === b.rows.length && a.rows.every((row, y) => row === b.rows[y]);
@@ -84,6 +91,7 @@ function samePartialRecord(a: Candidate, b: Candidate): boolean {
 function partialArchiveKey(item: OwnedCandidate): string {
   const value = item.candidate;
   return JSON.stringify([item.slot.id, value.id, value.spins, value.placed, value.bagCount, fieldQuality(value),
+    value.forecastSpins, value.forecastSpinsByBag, value.forecastPlacements,
     value.probability, value.firstBagProbability, value.firstBagSymmetry, value.firstBagSymmetryAssumed,
     value.frameCount, value.rows]);
 }

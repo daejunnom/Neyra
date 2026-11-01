@@ -54,8 +54,12 @@ export interface Candidate {
   frames: BoardFrame[];
   frameCount: number;
   rankingScore: number;
-  /** Unbounded terrain evaluation, used to break equal-efficiency record ties. */
+  /** Raw forecast/terrain quality before the bounded actual-spin ranking. */
   fieldQuality: number;
+  /** One coherent geometric continuation; never added to actual progress. */
+  forecastSpins?: number;
+  forecastSpinsByBag?: number[];
+  forecastPlacements?: number;
 }
 
 export interface SearchSnapshot {

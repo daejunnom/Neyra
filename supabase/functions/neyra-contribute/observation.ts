@@ -133,7 +133,7 @@ function validateNextBag(label: Obj, board: number[]): void {
       && d.maxGeometricWholeBagSpins === (group.length ? Math.max(...group.map(w => w.spins)) : null));
   }
   const prefix = (raw: unknown, firstBag: boolean): number => {
-    if (raw === null) { requireValue(lookahead.deepestReachedPlacements === 0 && (!firstBag || observed === 0), 'Missing actual prefix witness'); return 0; }
+    if (raw === null || raw === undefined) { requireValue(lookahead.deepestReachedPlacements === 0 && (!firstBag || observed === 0), 'Missing actual prefix witness'); return 0; }
     const hasParent = raw && typeof raw === 'object' && Object.hasOwn(raw, 'reachableParentId');
     const r = obj(raw, ['certifiedParentId', 'completedParentBags', 'additionalPlacements', 'observedSpins', 'targets', 'frames', ...(hasParent ? ['reachableParentId'] : [])]);
     const parentId = r.reachableParentId ?? null, parent = parentId === null ? undefined : byId.get(int(parentId, 1));
@@ -172,8 +172,9 @@ export function cleanObservation(value: unknown) {
     requireValue(/^[1-9]\d{0,6}$/.test(parentSequence) && Number(parentSequence) < sequence, 'Parent must precede child');
   }
   const nextBag = (o.label as Obj)?.schemaVersion === 3;
+  const hasTargetWitness = nextBag && Object.hasOwn(o.label as Obj, 'targetWitness');
   const label = obj(o.label, ['schemaVersion', 'task', 'policy', 'input', 'config', 'targets', 'measured', 'certifiedWitnesses', 'reachableWitness',
-    ...(nextBag ? ['targetHorizonBags', 'targetWitness', 'reachableWholeBagWitnesses'] : [])]);
+    ...(nextBag ? ['targetHorizonBags', 'reachableWholeBagWitnesses', ...(hasTargetWitness ? ['targetWitness'] : [])] : [])]);
   requireValue(nextBag ? label.task === 'naga-next-bag-spin-v3' && label.policy === 'bounded-next-bag-spin-v3' && label.targetHorizonBags === 1
     : label.schemaVersion === 2 && label.task === 'naga-spin-observations-v2' && label.policy === 'neyra-fixed-bag-continuation-v2');
   const input = obj(label.input, ['id', 'rows', 'source']), board = rows(input.rows);

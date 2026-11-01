@@ -140,6 +140,16 @@
   measurement group and select one earliest eligible representative per canonical
   board and policy for fitting. Legacy v2 eligibility remains unchanged. Full
   exports retain evidence; derived training files honor manifest exclusions.
+  Excluded raw aliases in the active corpus without qualifying prior observations
+  cannot impose new split constraints.
+  Keep legacy corpus memberships authoritative. An excluded active canonical
+  owner anchors historical membership only when that board had an observation
+  from its own measurement group, or a legacy NULL measurement slot, no later
+  than its exclusion. Another group's observation does not authorize that owner.
+  Otherwise retain the alias as raw provenance. V3 dataset split selection
+  follows the actual measurement group's durable assignment. Its own observation
+  no later than exclusion also preserves that group's historical membership when
+  another source owns the canonical alias.
 - CPU remains the default. Optional private GPU learning must finish an active
   unit before switching off and retry failed GPU work from retained CPU weights
   and optimizer state. Native training uses epoch boundaries; ORT inference

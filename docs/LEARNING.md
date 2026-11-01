@@ -256,6 +256,19 @@ policy. Eligible physical source occurrences also remain available to fallback
 collection. Legacy v2 selection is unchanged. New snapshots record assignments,
 source occurrences and exclusions explicitly.
 
+Retained raw evidence is not automatically an authoritative split assignment.
+An excluded active-corpus alias without a qualifying prior observation cannot
+quarantine another new source. Legacy-corpus assignments remain authoritative.
+An excluded active canonical owner's assignment remains an anchor only if that
+board had an observation from the owner's own measurement group, or a legacy
+NULL measurement slot, by the time of exclusion. An unrelated group's admission
+does not confer authority on that owner. V3 sampling and counts use the actual
+measurement group's durable split, even when the canonical occupancy alias was
+first stored under an excluded owner's different split. A group's own observation
+by the time of its exclusion preserves its historical membership, including when
+another source owns the canonical alias. Genuine links between distinct
+historical splits still quarantine the whole source run.
+
 The browser dataset has a bounded recent-plus-coverage sample per split, with
 explicit total and selected counts. New observations can therefore enter training
 after the dataset grows beyond the per-session capacity.

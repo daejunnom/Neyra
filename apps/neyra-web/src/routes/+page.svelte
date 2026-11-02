@@ -14,6 +14,8 @@
   let status: RunStatus = 'idle';
   let config = { ...defaultConfig };
   let draft = { ...defaultConfig };
+  type NumericSetting = 'piece_goal' | 'max_pieces' | 'worker_count' | 'seed';
+  let numericDraft = makeNumericDraft(defaultConfig);
   let runConfig = { ...defaultConfig };
   let snapshot: SearchSnapshot | null = null;
   let error = '';
@@ -286,12 +288,31 @@
     if (active || status === 'paused') return;
     gaModelJson = undefined; gaModelName = ''; gaModelId = ''; gaGuideMessage = 'CPU 기본 평가기로 새 탐색을 실행합니다.';
   }
-  function openSettings() { draft = { ...config }; settingsError = ''; settings.showModal(); }
+  function makeNumericDraft(value: SearchConfig): Record<NumericSetting, string> {
+    return { piece_goal: String(value.piece_goal), max_pieces: String(value.max_pieces),
+      worker_count: String(value.worker_count), seed: String(value.seed) };
+  }
+  function draftNumber(value: string) { return value.trim() === '' ? Number.NaN : Number(value); }
+  function editNumber(field: NumericSetting, value: string) {
+    numericDraft[field] = value;
+    settingsError = '';
+  }
+  function commitNumber(field: NumericSetting, input: HTMLInputElement) {
+    const value = draftNumber(numericDraft[field]);
+    if (!Number.isFinite(value)) return;
+    // Keep an empty or partial edit intact; normalize only when the field is committed.
+    numericDraft[field] = String(value);
+    input.value = numericDraft[field];
+  }
+  function openSettings() { draft = { ...config }; numericDraft = makeNumericDraft(config); settingsError = ''; settings.showModal(); }
   function saveSettings(event: SubmitEvent) {
     event.preventDefault();
-    const next = frontierSettings(draft);
+    const next = frontierSettings({ ...draft, piece_goal: draftNumber(numericDraft.piece_goal),
+      max_pieces: draftNumber(numericDraft.max_pieces), worker_count: draftNumber(numericDraft.worker_count),
+      seed: draftNumber(numericDraft.seed) });
     settingsError = validateConfig(next);
     if (settingsError) return;
+    numericDraft = makeNumericDraft(next);
     config = next;
     // Seeds identify this page's actual run. Every fresh entry gets a new one;
     // a manually chosen seed remains available for the lifetime of this tab.
@@ -300,7 +321,8 @@
     settings.close();
   }
   function newSeed() {
-    draft.seed = randomSeed();
+    numericDraft.seed = String(randomSeed());
+    settingsError = '';
   }
   function rejectDocument(message: string) {
     if (!pendingDocument) return;
@@ -573,14 +595,14 @@
     <div class="dialog-heading"><div><p class="eyebrow">SEARCH OPTIONS</p><h2>탐색 설정</h2></div><button class="icon-button" type="button" onclick={() => settings.close()} aria-label="설정 닫기"><Icon name="close" /></button></div>
     <p class="settings-note">고정 계획의 성공률을 첫 가방부터 계산하고 미노 수별 최고 기록을 남깁니다. 일반 배치 안전성은 모든 공급에서 확인합니다.</p>
     <div class="settings-grid">
-      <label><span>미노 제한 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required bind:value={draft.piece_goal} /><small>탐색 상한 안의 더 긴 결과도 보관해요.</small></label>
-      <label><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required bind:value={draft.max_pieces} /></label>
+      <label><span>미노 제한 <small>미노</small></span><input type="number" min="1" max="1000" step="1" required value={numericDraft.piece_goal} oninput={(event) => editNumber('piece_goal', event.currentTarget.value)} onblur={(event) => commitNumber('piece_goal', event.currentTarget)} /><small>탐색 상한 안의 더 긴 결과도 보관해요.</small></label>
+      <label><span>탐색 상한 <small>미노</small></span><input type="number" min="1" max="700" step="1" required value={numericDraft.max_pieces} oninput={(event) => editNumber('max_pieces', event.currentTarget.value)} onblur={(event) => commitNumber('max_pieces', event.currentTarget)} /></label>
     </div>
     <details class="advanced-options"><summary>추가 설정 <span>탐색 폭 · 동시 탐색 · 시드</span></summary>
     <div class="settings-grid">
       <label><span>탐색 폭</span><select bind:value={draft.beam_width}><option value={16}>작게 · 16</option><option value={32}>보통 · 32</option><option value={64}>넓게 · 64</option><option value={128}>아주 넓게 · 128</option></select></label>
-      <label><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required bind:value={draft.worker_count} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
-      <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required bind:value={draft.seed} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div><small>접속할 때마다 무작위로 정해져요. 같은 탐색을 다시 실행하려면 직접 입력하세요.</small></label>
+      <label><span>동시 탐색 수 <small>0 = 전체 자동</small></span><input type="number" min="0" max={MAX_WORKERS} step="1" required value={numericDraft.worker_count} oninput={(event) => editNumber('worker_count', event.currentTarget.value)} onblur={(event) => commitNumber('worker_count', event.currentTarget)} /><small>자동 {availableWorkers}개 · 직접 지정하면 최대 {MAX_WORKERS}개</small></label>
+      <label class="full-row"><span>시드</span><div class="seed-input"><input type="number" min="1" max="4294967295" step="1" required value={numericDraft.seed} oninput={(event) => editNumber('seed', event.currentTarget.value)} onblur={(event) => commitNumber('seed', event.currentTarget)} /><button type="button" class="icon-button" onclick={newSeed} aria-label="새 시드"><Icon name="restart" size={17} /></button></div><small>접속할 때마다 무작위로 정해져요. 같은 탐색을 다시 실행하려면 직접 입력하세요.</small></label>
     </div></details>
     {#if active || status === 'paused'}<p class="settings-note">변경한 설정은 다음 탐색부터 적용됩니다.</p>{/if}
     {#if settingsError}<p class="error-message" role="alert">{settingsError}</p>{/if}

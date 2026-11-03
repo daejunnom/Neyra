@@ -5,7 +5,7 @@
 //! The ordinary search's fixed-plan verifier independently certifies its
 //! prefix. Physical progress after the first rejected bag is auxiliary only.
 
-use crate::physics::{Board, Piece, Placement, HEIGHT, WIDTH};
+use crate::physics::{Board, MovementMode, Piece, Placement, HEIGHT, WIDTH};
 use crate::search::ga_verify::{Proof, Request, Verifier};
 use crate::search::{DisplayFrame, SearchConfig, SearchSession};
 use crate::supply::{ALL_PIECES, P7_COUNT};
@@ -683,8 +683,15 @@ impl EpisodeResult {
 /// Raw geometry/action measurements, normalized by declared board-size
 /// constants. No old terrain evaluator, continuation search or label is used.
 pub fn score_placement(weights: &[f64], board: &Board, placement: &Placement) -> Option<f64> {
+    score_placement_with_mode(weights, board, placement, MovementMode::SonicOnly)
+}
+
+/// The same 24 measured features under an explicit movement category. Only
+/// input legality changes; feature order, normalization and scoring do not.
+pub fn score_placement_with_mode(weights: &[f64], board: &Board, placement: &Placement,
+    mode: MovementMode) -> Option<f64> {
     if weights.len() != FEATURE_COUNT || weights.iter().any(|w| !w.is_finite()) { return None; }
-    let result = board.apply(placement)?;
+    let result = board.apply_with_mode(placement, mode)?;
     if result.lines > 1 || (result.lines == 1 && (!result.spin || placement.pose.piece == Piece::O)) { return None; }
     Some(features(board, &result.board, placement, result.lines).iter()
         .zip(weights).map(|(f, w)| f * w).sum())

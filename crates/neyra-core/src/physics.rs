@@ -9,7 +9,9 @@
 //! Ordered kick attempts come from the generated `srs_plus` module and
 //! Clearra's reviewed official-source SRS+ fixture, including I and O half
 //! turns. See THIRD_PARTY_NOTICES.md for source pins and licenses.
-//! The movement graph deliberately has no one-row down or gravity-wait edge.
+//! The default movement graph has no one-row down or gravity-wait edge.
+//! The opt-in `SoftDrop` profile adds a discrete one-row down input. It does
+//! not model gravity, input timing, lock delay, or measured execution speed.
 
 use crate::srs_plus::kicks;
 use serde::{Deserialize, Serialize};
@@ -106,7 +108,19 @@ pub enum Input {
     Ccw,
     Half,
     Sonic,
+    SoftDrop,
     HardDrop,
+}
+
+/// Independent movement/certificate categories. `SoftDrop` permits ordinary
+/// one-cell descent in addition to every Sonic-only input; it does not disable
+/// the Sonic key. Historical APIs and certificates retain `SonicOnly`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MovementMode {
+    #[default]
+    SonicOnly,
+    SoftDrop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,6 +279,10 @@ impl Board {
                     .shifted(if input == Input::Left { -1 } else { 1 }, 0);
                 self.legal(pose).then_some(State { pose, spin: false })
             }
+            Input::SoftDrop => {
+                let pose = state.pose.shifted(0, -1);
+                self.legal(pose).then_some(State { pose, spin: false })
+            }
             Input::Cw | Input::Ccw | Input::Half => {
                 let pose = self.rotate(state.pose, input)?;
                 Some(State {
@@ -285,7 +303,21 @@ impl Board {
     /// Replays a lock witness. Failed movement inputs are omitted by the
     /// solver; an explicitly supplied failed input makes a witness invalid.
     pub fn replay(&self, piece: Piece, path: &[Input]) -> Option<Placement> {
-        if !self.can_spawn(piece) || path.last() != Some(&Input::HardDrop) {
+        self.replay_with_mode(piece, path, MovementMode::SonicOnly)
+    }
+
+    /// Replays a witness under its declared movement category. Passing the
+    /// explicit category is required for new ordinary soft-drop witnesses.
+    pub fn replay_with_mode(
+        &self,
+        piece: Piece,
+        path: &[Input],
+        mode: MovementMode,
+    ) -> Option<Placement> {
+        if !self.can_spawn(piece)
+            || path.last() != Some(&Input::HardDrop)
+            || (mode == MovementMode::SonicOnly && path.contains(&Input::SoftDrop))
+        {
             return None;
         }
         let mut state = State {
@@ -400,7 +432,13 @@ impl Board {
 
     /// Validates the complete witness before assigning spin evidence.
     pub fn apply(&self, placement: &Placement) -> Option<LockResult> {
-        let replayed = self.replay(placement.pose.piece, &placement.path)?;
+        self.apply_with_mode(placement, MovementMode::SonicOnly)
+    }
+
+    /// Mode-aware counterpart of `apply`; verifies the full input witness
+    /// before assigning any spin or line-clear evidence.
+    pub fn apply_with_mode(&self, placement: &Placement, mode: MovementMode) -> Option<LockResult> {
+        let replayed = self.replay_with_mode(placement.pose.piece, &placement.path, mode)?;
         if replayed.pose != placement.pose || replayed.spin != placement.spin {
             return None;
         }
@@ -415,6 +453,12 @@ impl Board {
         self.lock_candidates(piece, false)
     }
 
+    /// Full forward move enumeration for an explicitly selected category.
+    /// Geometry and spin classes remain distinct, as in `reachable_locks`.
+    pub fn reachable_locks_with_mode(&self, piece: Piece, mode: MovementMode) -> Vec<Placement> {
+        self.lock_candidates_with_mode(piece, false, mode)
+    }
+
     /// Search candidates use one representative for O's identical cell sets.
     /// Explicit rotation/replay and the reference enumerator retain all poses.
     pub(crate) fn search_locks(&self, piece: Piece) -> Vec<Placement> {
@@ -422,10 +466,24 @@ impl Board {
     }
 
     fn lock_candidates(&self, piece: Piece, canonical_o: bool) -> Vec<Placement> {
+        self.lock_candidates_with_mode(piece, canonical_o, MovementMode::SonicOnly)
+    }
+
+    fn lock_candidates_with_mode(
+        &self,
+        piece: Piece,
+        canonical_o: bool,
+        mode: MovementMode,
+    ) -> Vec<Placement> {
         if !self.can_spawn(piece) {
             return Vec::new();
         }
-        let (nodes, _) = self.forward_nodes_with_policy(piece, true, canonical_o);
+        let (nodes, _) = self.forward_nodes_with_policy(
+            piece,
+            true,
+            canonical_o,
+            mode == MovementMode::SoftDrop,
+        );
         nodes
             .iter()
             .enumerate()
@@ -517,7 +575,7 @@ impl Board {
     }
 
     fn forward_nodes(&self, piece: Piece, allow_sonic: bool) -> (Vec<Node>, Vec<usize>) {
-        self.forward_nodes_with_policy(piece, allow_sonic, false)
+        self.forward_nodes_with_policy(piece, allow_sonic, false, false)
     }
 
     fn forward_nodes_with_policy(
@@ -525,6 +583,7 @@ impl Board {
         piece: Piece,
         allow_sonic: bool,
         canonical_o: bool,
+        allow_soft_drop: bool,
     ) -> (Vec<Node>, Vec<usize>) {
         let root = State {
             pose: piece.spawn(),
@@ -545,17 +604,26 @@ impl Board {
             Input::Cw,
             Input::Ccw,
             Input::Half,
+            Input::SoftDrop,
         ];
         // With O spins excluded, these rotations are self-loops after
         // projection to occupied cells. Other pieces keep every rotation.
-        let action_count = if canonical_o && piece == Piece::O {
+        let action_count = if allow_soft_drop {
+            actions.len()
+        } else if canonical_o && piece == Piece::O {
             3
         } else {
-            actions.len()
+            6
         };
         while let Some(parent) = queue.pop_front() {
             for &input in &actions[..action_count] {
                 if !allow_sonic && input == Input::Sonic {
+                    continue;
+                }
+                if !allow_soft_drop && input == Input::SoftDrop {
+                    continue;
+                }
+                if canonical_o && piece == Piece::O && rotation_delta(input).is_some() {
                     continue;
                 }
                 if let Some(state) = self.advance(nodes[parent].state, input) {

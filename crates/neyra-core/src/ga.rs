@@ -697,6 +697,20 @@ pub fn score_placement_with_mode(weights: &[f64], board: &Board, placement: &Pla
         .zip(weights).map(|(f, w)| f * w).sum())
 }
 
+/// Extract the canonical GA24 measurements from a result already obtained by
+/// `Board::apply[_with_mode]`. This performs no movement proof: callers must
+/// retain that canonical replay, including the selected action's witness.
+/// It lets native batched engines avoid a second replay merely to measure the
+/// same afterstate. Feature order, normalization, and floating-point order are
+/// exactly shared with score_placement_with_mode.
+pub fn features_from_replayed_result(board: &Board, placement: &Placement,
+    result: &crate::physics::LockResult) -> Option<[f64; FEATURE_COUNT]> {
+    if result.lines > 1 || (result.lines == 1 && (!result.spin || placement.pose.piece == Piece::O)) {
+        return None;
+    }
+    Some(features(board, &result.board, placement, result.lines))
+}
+
 /// Context-aware proposal score. Legality remains owned by the actual input
 /// generator/replay; this value is never a supply probability or proof bound.
 pub fn score_placement_context(weights:&[f64],board:&Board,placement:&Placement,used:u8,
